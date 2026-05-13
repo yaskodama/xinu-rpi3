@@ -75,6 +75,9 @@ CFLAGS  += -fwrapv
 DEBUG   :=
 CFLAGS  += $(DEBUG)
 
+# XINU sources predate C23; force gnu99 so 'bool' (now a keyword) can stay a typedef.
+CFLAGS  += -std=gnu99
+
 # Set assembler flags common to all platforms.  platformVars can add additional
 # flags if needed.  Do not use the "-Wa," prefix, either here or in
 # platformVars.

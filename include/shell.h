@@ -127,4 +127,28 @@ shellcmd xsh_vlanstat(int, char *[]);
 shellcmd xsh_voip(int, char *[]);
 shellcmd xsh_xweb(int, char *[]);
 
+/* Filesystem commands */
+shellcmd xsh_ls(int, char *[]);
+shellcmd xsh_cd(int, char *[]);
+shellcmd xsh_pwd(int, char *[]);
+shellcmd xsh_mkdir(int, char *[]);
+shellcmd xsh_rmdir(int, char *[]);
+shellcmd xsh_touch(int, char *[]);
+shellcmd xsh_cat(int, char *[]);
+shellcmd xsh_rm(int, char *[]);
+shellcmd xsh_cp(int, char *[]);
+shellcmd xsh_mv(int, char *[]);
+shellcmd xsh_write(int, char *[]);
+shellcmd xsh_mount(int, char *[]);
+shellcmd xsh_umount(int, char *[]);
+shellcmd xsh_mkfs(int, char *[]);
+
+/* Tiny C compiler + program runner */
+shellcmd xsh_cc(int, char *[]);
+shellcmd xsh_run(int, char *[]);
+shellcmd xsh_abclc(int, char *[]);
+shellcmd xsh_rotlines(int, char *[]);
+shellcmd xsh_edit(int, char *[]);
+shellcmd xsh_make(int, char *[]);
+
 #endif                          /* _SHELL_H_ */

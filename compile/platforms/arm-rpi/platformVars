@@ -36,4 +36,5 @@ DEVICES  := ethloop         \
             usb             \
             usbkbd          \
             loopback        \
+            ramdisk         \
             tty

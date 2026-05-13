@@ -38,6 +38,15 @@ C_FILES += minijava.c
 # Files for reading tape archives
 C_FILES += tar.c
 
+# Files for the hierarchical filesystem
+C_FILES += xfs.c
+
+# Tiny C compiler + a.out VM
+C_FILES += cc.c aout.c
+
+# ABCL/c+ -> C translator
+C_FILES += abclc.c
+
 # Add the files to the compile source path
 DIR = ${TOPDIR}/${COMP}
 COMP_SRC += ${C_FILES:%=${DIR}/%}

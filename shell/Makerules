@@ -49,6 +49,23 @@ C_FILES += xsh_usbinfo.c
 # Test commands
 C_FILES += xsh_test.c xsh_testsuite.c
 
+# Filesystem commands
+C_FILES += xsh_ls.c xsh_cd.c xsh_pwd.c xsh_mkdir.c xsh_rmdir.c xsh_touch.c \
+           xsh_cat.c xsh_rm.c xsh_cp.c xsh_mv.c xsh_write.c \
+           xsh_mount.c xsh_umount.c xsh_mkfs.c
+
+# Tiny C compiler + program runner
+C_FILES += xsh_cc.c xsh_run.c
+
+# ABCL/c+ translator
+C_FILES += xsh_abclc.c
+
+# WM overlay demos
+C_FILES += xsh_rotlines.c
+
+# Editor + tiny make
+C_FILES += xsh_edit.c xsh_make.c
+
 S_FILES =
 
 # Add the files to the compile source path

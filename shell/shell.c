@@ -16,13 +16,20 @@
 #include <nvram.h>
 #include <conf.h>
 #include <framebuffer.h>
+#include <aout.h>
 
 const struct centry commandtab[] = {
 #if NETHER
     {"arp", FALSE, xsh_arp},
 #endif
+    {"abclc", TRUE, xsh_abclc},
+    {"cat", FALSE, xsh_cat},
+    {"cc", TRUE, xsh_cc},
+    {"cd", TRUE, xsh_cd},
     {"clear", TRUE, xsh_clear},
+    {"cp", FALSE, xsh_cp},
     {"date", FALSE, xsh_date},
+    {"edit", TRUE, xsh_edit},
 #if USE_TLB
     {"dumptlb", FALSE, xsh_dumptlb},
 #endif
@@ -37,6 +44,8 @@ const struct centry commandtab[] = {
     {"gpiostat", FALSE, xsh_gpiostat},
 #endif
     {"help", FALSE, xsh_help},
+    {"ls", FALSE, xsh_ls},
+    {"make", TRUE, xsh_make},
 #if defined(ETH0) || defined(_XINU_PLATFORM_ARM_RPI_)
     {"kexec", FALSE, xsh_kexec},
 #endif
@@ -46,6 +55,10 @@ const struct centry commandtab[] = {
 #endif
     {"memstat", FALSE, xsh_memstat},
     {"memdump", FALSE, xsh_memdump},
+    {"mkdir", FALSE, xsh_mkdir},
+    {"mkfs", FALSE, xsh_mkfs},
+    {"mount", FALSE, xsh_mount},
+    {"mv", FALSE, xsh_mv},
 #if NETHER
     {"nc", FALSE, xsh_nc},
     {"netdown", FALSE, xsh_netdown},
@@ -59,12 +72,17 @@ const struct centry commandtab[] = {
     {"nvram", FALSE, xsh_nvram},
 #endif
     {"ps", FALSE, xsh_ps},
+    {"pwd", FALSE, xsh_pwd},
 #if NETHER
     {"ping", FALSE, xsh_ping},
     {"pktgen", FALSE, xsh_pktgen},
     {"rdate", FALSE, xsh_rdate},
 #endif
     {"reset", FALSE, xsh_reset},
+    {"rm", FALSE, xsh_rm},
+    {"rmdir", FALSE, xsh_rmdir},
+    {"rotlines", TRUE, xsh_rotlines},
+    {"run", TRUE, xsh_run},
 #if NETHER
     {"route", FALSE, xsh_route},
 #endif
@@ -81,6 +99,9 @@ const struct centry commandtab[] = {
     {"telnetserver", FALSE, xsh_telnetserver},
 #endif
     {"test", FALSE, xsh_test},
+    {"touch", FALSE, xsh_touch},
+    {"umount", FALSE, xsh_umount},
+    {"write", FALSE, xsh_write},
 #if HAVE_TESTSUITE
     {"testsuite", TRUE, xsh_testsuite},
 #endif
@@ -305,9 +326,12 @@ thread shell(int indescrp, int outdescrp, int errdescrp)
             }
         }
 
-        /* Handle command not found */
+        /* Handle command not found.  As a fallback, try to interpret the
+         * first token as an a.out program in the current xfs (so that bare
+         * `a.out` or `/path/to/prog` works after `cc`). */
         if (i >= ncommand)
         {
+            if (SYSERR != aoutRun(tok[0])) continue;
             fprintf(stderr, "%s: command not found\n", tok[0]);
             continue;
         }

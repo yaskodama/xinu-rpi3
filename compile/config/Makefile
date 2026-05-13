@@ -6,8 +6,9 @@ CC      = gcc
 LEX     = flex
 YACC    = bison -y    # Flag enables yacc-compatible filenames
 YFLAGS  = -d
-CFLAGS  =
+CFLAGS  = -Wno-implicit-function-declaration -Wno-implicit-int
 LDFLAGS =
+LDLIBS  =
 
 CONFIG  = config
 OBJECTS = scan.o parse.o config.o

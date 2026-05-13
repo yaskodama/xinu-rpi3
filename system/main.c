@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <thread.h>
 #include <version.h>
+#include <xfs.h>
 
 static void print_os_info(void);
 
@@ -27,6 +28,127 @@ thread main(void)
 
     /* Print information about the operating system  */
     print_os_info();
+
+    /* Initialize xfs and mount RAMDISK0 at "/" */
+    if (OK != xfsBootstrap())
+    {
+        kprintf("WARNING: xfsBootstrap failed\r\n");
+    }
+    else
+    {
+        /* Seed sample C sources so they're available out of the box. */
+        static const char hello_src[] =
+            "#include <stdio.h>\n"
+            "int main(void) {\n"
+            "    printf(\"hello...\\n\");\n"
+            "    return 0;\n"
+            "}\n";
+        static const char sum_src[] =
+            "#include <stdio.h>\n"
+            "int main(void) {\n"
+            "    int i;\n"
+            "    int s;\n"
+            "    s = 0;\n"
+            "    for (i = 1; i <= 10; i = i + 1) {\n"
+            "        s = s + i;\n"
+            "    }\n"
+            "    printf(\"sum 1..10 = %d\\n\", s);\n"
+            "    return 0;\n"
+            "}\n";
+        int fd;
+        xfsMkdir("/home");
+        fd = xfsOpen("/home/hello.c",
+                     XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+        if (fd >= 0)
+        {
+            xfsWrite(fd, hello_src, sizeof(hello_src) - 1);
+            xfsClose(fd);
+        }
+        fd = xfsOpen("/home/sum.c",
+                     XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+        if (fd >= 0)
+        {
+            xfsWrite(fd, sum_src, sizeof(sum_src) - 1);
+            xfsClose(fd);
+        }
+
+        /* ABCL/c+ workspace: /home/abclcp/abclc/PingPong.abcl */
+        static const char pingpong_src[] =
+            "/* PingPong.abcl - two actors bouncing a counter */\n"
+            "class Player {\n"
+            "    var hits;\n"
+            "    method bounce(other, n) {\n"
+            "        if (n > 0) {\n"
+            "            printf(\"Player %d: tick (n=%d) hits=%d\\n\","
+                            " self, n, hits);\n"
+            "            hits = hits + 1;\n"
+            "            send other.bounce(self, n - 1);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "main {\n"
+            "    new Player p1;\n"
+            "    new Player p2;\n"
+            "    send p1.bounce(p2, 6);\n"
+            "}\n";
+        xfsMkdir("/home/abclcp");
+        xfsMkdir("/home/abclcp/abclc");
+        fd = xfsOpen("/home/abclcp/abclc/PingPong.abcl",
+                     XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+        if (fd >= 0)
+        {
+            xfsWrite(fd, pingpong_src, sizeof(pingpong_src) - 1);
+            xfsClose(fd);
+        }
+
+        /* RotLines.abcl: 4 rotating lines on top of the WM */
+        static const char rotlines_src[] =
+            "/* RotLines.abcl - 4 lines rotating on the WM */\n"
+            "class Rotator {\n"
+            "    var angle;\n"
+            "    method spin(n) {\n"
+            "        if (n > 0) {\n"
+            "            wm_line(0, 512, 384,\n"
+            "                    512 + icos(angle) * 320 / 4096,\n"
+            "                    384 + isin(angle) * 320 / 4096,\n"
+            "                    rgb(255, 80, 80));\n"
+            "            wm_line(1, 512, 384,\n"
+            "                    512 + icos(angle + 90) * 320 / 4096,\n"
+            "                    384 + isin(angle + 90) * 320 / 4096,\n"
+            "                    rgb(80, 255, 80));\n"
+            "            wm_line(2, 512, 384,\n"
+            "                    512 + icos(angle + 180) * 320 / 4096,\n"
+            "                    384 + isin(angle + 180) * 320 / 4096,\n"
+            "                    rgb(80, 160, 255));\n"
+            "            wm_line(3, 512, 384,\n"
+            "                    512 + icos(angle + 270) * 320 / 4096,\n"
+            "                    384 + isin(angle + 270) * 320 / 4096,\n"
+            "                    rgb(255, 220, 60));\n"
+            "            sleep_ms(16);\n"
+            "            angle = angle + 3;\n"
+            "            send self.spin(n - 1);\n"
+            "        } else {\n"
+            "            wm_render(0);\n"
+            "        }\n"
+            "    }\n"
+            "    method start(n) {\n"
+            "        wm_render(1);\n"
+            "        send self.spin(n);\n"
+            "    }\n"
+            "}\n"
+            "main {\n"
+            "    new Rotator r;\n"
+            "    send r.start(360);\n"
+            "}\n";
+        fd = xfsOpen("/home/abclcp/abclc/RotLines.abcl",
+                     XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+        if (fd >= 0)
+        {
+            xfsWrite(fd, rotlines_src, sizeof(rotlines_src) - 1);
+            xfsClose(fd);
+        }
+    }
 
     /* Open all ethernet devices */
 #if NETHER
@@ -103,6 +225,23 @@ thread main(void)
     #warning "No TTY for SERIAL1"
   #endif
 #endif /* TTY1 */
+
+    /* Auto-launch the window manager demo on arm-qemu (Versatile PB). */
+#if defined(_XINU_PLATFORM_ARM_QEMU_)
+    {
+        extern thread wm_main(void);
+        tid_typ wm_tid = create((void *)wm_main, INITSTK, INITPRIO, "WM", 0);
+        if (SYSERR == ready(wm_tid, RESCHED_NO))
+            kprintf("WARNING: Failed to create WM thread\r\n");
+    }
+#endif
+
+    /* Note: the bundled bounded-buffer demo (apps/abcl_program.c's
+     * Producer/Consumer/Controller/Buffer) is no longer auto-started at
+     * boot.  Run your own ABCL/c+ programs explicitly with:
+     *     abclc /home/abclcp/abclc/PingPong.abcl
+     *     /home/abclcp/abclc/PingPong
+     */
 
     /* Start shells  */
 #if HAVE_SHELL
