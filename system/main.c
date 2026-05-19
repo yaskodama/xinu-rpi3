@@ -236,12 +236,24 @@ thread main(void)
     }
 #endif
 
-    /* Note: the bundled bounded-buffer demo (apps/abcl_program.c's
-     * Producer/Consumer/Controller/Buffer) is no longer auto-started at
-     * boot.  Run your own ABCL/c+ programs explicitly with:
+    /* Auto-start the bundled AIPL program (apps/abcl_program.c) when
+     * compiled with -DAIPL_AUTOSTART.  Without this define, run an
+     * AIPL/abcl program by hand from xsh:
      *     abclc /home/abclcp/abclc/PingPong.abcl
      *     /home/abclcp/abclc/PingPong
+     *
+     * The autostart path is used by the abclcp-project R1 smoke
+     * harness (QEMU -nographic + serial-stdio + grep on [aipl] start).
      */
+#ifdef AIPL_AUTOSTART
+    {
+        extern thread aipl_main(void);
+        tid_typ aipl_tid = create((void *)aipl_main, 16384, INITPRIO,
+                                  "AIPL", 0);
+        if (SYSERR == ready(aipl_tid, RESCHED_NO))
+            kprintf("WARNING: Failed to create AIPL thread\r\n");
+    }
+#endif
 
     /* Start shells  */
 #if HAVE_SHELL
