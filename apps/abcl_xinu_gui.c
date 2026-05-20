@@ -1530,3 +1530,146 @@ value_t fb_image_solid(int n, value_t *a) {
             x, y, w, h, (unsigned)(c24 & 0xFFFFFFu));
     return v_int(w * h);
 }
+
+/* ============================================================
+ *  F1: distributed checkpoint — local-node snapshot/restore.
+ *
+ *  Phase 1 of distrib: in-process snapshots tagged by string name.
+ *  Each snapshot copies the full value_t fields[MAX_FIELDS] of an
+ *  actor along with its class_id, so a later restore puts the actor
+ *  back in the same logical state regardless of intervening sends.
+ *
+ *  The N3 (multi-Pi cluster) phase will hand snapshot blobs over the
+ *  network — bytes-on-the-wire format is intentionally the value_t
+ *  array for now; promoting it to a portable serialisation is the
+ *  next step.
+ *
+ *  AIPL externs:
+ *    checkpoint_save(self, "tag")     -> slot_id, or -1 on full table
+ *    checkpoint_load(self, "tag")     -> 1 ok / 0 not found
+ *    checkpoint_list()                -> count of live snapshots
+ *    checkpoint_clear()               -> count cleared
+ *
+ *  Serial marker: `[aipl] chkpt op=save|load|clear actor=N tag=… …`
+ * ============================================================ */
+#define MAX_CHKPT 8
+
+/* Field count exposed by the runtime; cached on first save so we
+ * don't have to ask per-slot. */
+extern int abcl_object_field_count(void);
+extern int abcl_object_field_get(int obj_id, int field_idx, value_t *out);
+extern int abcl_object_field_set(int obj_id, int field_idx, value_t v);
+extern int abcl_object_class_id(int obj_id);
+
+typedef struct {
+    int     valid;
+    int     actor_id;
+    int     class_id;
+    int     n_fields;
+    char    tag[32];
+    value_t fields[16];     /* must be ≥ MAX_FIELDS in c_translator.ml */
+} chkpt_slot_t;
+
+static chkpt_slot_t g_chkpt[MAX_CHKPT];
+
+static int chkpt_find(int actor_id, const char *tag) {
+    int i;
+    for (i = 0; i < MAX_CHKPT; i++) {
+        if (g_chkpt[i].valid && g_chkpt[i].actor_id == actor_id) {
+            int j;
+            for (j = 0; tag[j] && g_chkpt[i].tag[j]; j++) {
+                if (tag[j] != g_chkpt[i].tag[j]) goto next;
+            }
+            if (tag[j] == g_chkpt[i].tag[j]) return i;
+        }
+        next: ;
+    }
+    return -1;
+}
+
+static int chkpt_alloc(int actor_id, const char *tag) {
+    int existing = chkpt_find(actor_id, tag);
+    int i;
+    if (existing >= 0) return existing;     /* overwrite same tag */
+    for (i = 0; i < MAX_CHKPT; i++) {
+        if (!g_chkpt[i].valid) return i;
+    }
+    return -1;
+}
+
+value_t checkpoint_save(int n, value_t *a) {
+    int target, slot, n_fields, j, copied;
+    const char *tag;
+    if (n < 2) return v_int(-1);
+    target = (a[0].tag == V_OBJ) ? a[0].obj_id : (int)a[0].i;
+    tag    = (a[1].tag == V_STR && a[1].s) ? a[1].s : "";
+    n_fields = abcl_object_field_count();
+    if (n_fields > 16) n_fields = 16;
+    slot = chkpt_alloc(target, tag);
+    if (slot < 0) {
+        kprintf("[aipl] chkpt op=save actor=%d tag=%s status=table-full\r\n",
+                target, tag);
+        return v_int(-1);
+    }
+    copied = 0;
+    for (j = 0; j < n_fields; j++) {
+        if (abcl_object_field_get(target, j, &g_chkpt[slot].fields[j])) copied++;
+    }
+    if (copied == 0) {
+        kprintf("[aipl] chkpt op=save actor=%d tag=%s status=bad-actor\r\n",
+                target, tag);
+        return v_int(-1);
+    }
+    g_chkpt[slot].valid    = 1;
+    g_chkpt[slot].actor_id = target;
+    g_chkpt[slot].class_id = abcl_object_class_id(target);
+    g_chkpt[slot].n_fields = copied;
+    {
+        int k;
+        for (k = 0; k < 31 && tag[k]; k++) g_chkpt[slot].tag[k] = tag[k];
+        g_chkpt[slot].tag[k] = '\0';
+    }
+    kprintf("[aipl] chkpt op=save actor=%d tag=%s slot=%d "
+            "class=%d fields=%d\r\n",
+            target, tag, slot, g_chkpt[slot].class_id, copied);
+    return v_int(slot);
+}
+
+value_t checkpoint_load(int n, value_t *a) {
+    int target, slot, j, restored;
+    const char *tag;
+    if (n < 2) return v_int(0);
+    target = (a[0].tag == V_OBJ) ? a[0].obj_id : (int)a[0].i;
+    tag    = (a[1].tag == V_STR && a[1].s) ? a[1].s : "";
+    slot   = chkpt_find(target, tag);
+    if (slot < 0) {
+        kprintf("[aipl] chkpt op=load actor=%d tag=%s status=not-found\r\n",
+                target, tag);
+        return v_int(0);
+    }
+    restored = 0;
+    for (j = 0; j < g_chkpt[slot].n_fields; j++) {
+        if (abcl_object_field_set(target, j, g_chkpt[slot].fields[j])) restored++;
+    }
+    kprintf("[aipl] chkpt op=load actor=%d tag=%s slot=%d fields=%d\r\n",
+            target, tag, slot, restored);
+    return v_int(restored > 0 ? 1 : 0);
+}
+
+value_t checkpoint_list(int n, value_t *a) {
+    int i, count = 0;
+    (void)n; (void)a;
+    for (i = 0; i < MAX_CHKPT; i++) if (g_chkpt[i].valid) count++;
+    kprintf("[aipl] chkpt op=list count=%d\r\n", count);
+    return v_int(count);
+}
+
+value_t checkpoint_clear(int n, value_t *a) {
+    int i, cleared = 0;
+    (void)n; (void)a;
+    for (i = 0; i < MAX_CHKPT; i++) {
+        if (g_chkpt[i].valid) { g_chkpt[i].valid = 0; cleared++; }
+    }
+    kprintf("[aipl] chkpt op=clear count=%d\r\n", cleared);
+    return v_int(cleared);
+}
