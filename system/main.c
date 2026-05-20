@@ -234,6 +234,23 @@ thread main(void)
         if (SYSERR == ready(wm_tid, RESCHED_NO))
             kprintf("WARNING: Failed to create WM thread\r\n");
     }
+
+    /* WM-Console device — gives a 2nd xsh shell that renders inside a
+     * window on the LCD.  Add to the shell pool so the shell-spawn
+     * loop below creates one for it. */
+  #if defined(WMCON0) && HAVE_SHELL
+    if (OK == open(WMCON0))
+    {
+        shelldevs[nshells][0] = WMCON0;
+        shelldevs[nshells][1] = WMCON0;
+        shelldevs[nshells][2] = WMCON0;
+        nshells++;
+    }
+    else
+    {
+        kprintf("WARNING: Can't open WMCON0\r\n");
+    }
+  #endif
 #endif
 
     /* Auto-start the bundled AIPL program (apps/abcl_program.c) when

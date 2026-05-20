@@ -761,6 +761,12 @@ static void draw_text_buffer(int x0, int y0, int w_px, int h_px,
     }
 }
 
+/* Console window — renders the wmcon cell grid as a sub-body of a
+ * regular window.  Implementation at the bottom of this file. */
+#include <wmcon.h>
+static int g_console_win_idx = -1;
+static void render_console_body(int x, int y, int w, int h);
+
 static void draw_window(int idx)
 {
     struct window *w = &winlist[idx];
@@ -779,6 +785,8 @@ static void draw_window(int idx)
     if (w->text) {
         draw_text_buffer(w->x, by, w->w, w->h - TITLE_H - 16,
                          w->text, *w->text_len);
+    } else if (g_console_win_idx == idx) {
+        render_console_body(w->x, by, w->w, w->h - TITLE_H - 16);
     } else {
         if (w->body1) draw_string(w->x + 12, by,             w->body1, COL_TEXT);
         if (w->body2) draw_string(w->x + 12, by + CHAR_H + 4, w->body2, COL_TEXT);
@@ -941,7 +949,7 @@ static void input_seed_reset(void)
     g_wm_hist_has_saved = 0;
 }
 
-/* Forward declaration. */
+/* Forward declarations. */
 static void execute_command(char *line, int len);
 
 /* Replace the current command line (everything from cmd_start onwards)
@@ -1631,7 +1639,14 @@ thread wm_main(void)
             "Versatile Platform B.",  COL_BG3);
     wm_add( 580, 240, 424, 240, "Mouse Info",  "(move the mouse)",
             "(L / M / R buttons)",    COL_BG2);
-    wm_add_text(20, 500, 984, 504, "Input",
+    /* Real xsh shell hosted in the WM (WMCON0 device).  60 cols × 16
+     * rows in a wide bottom-mid window — supports `edit`, history,
+     * arrow keys, everything the console xsh has. */
+    wm_add(  20, 500, 984, 290, "Console", NULL, NULL, COL_BG3);
+    g_console_win_idx = nwin - 1;
+    /* Existing mini-shell stays at the very bottom in a slimmed-down
+     * window for quick commands without going through wmcon. */
+    wm_add_text(20, 800, 984, 204, "Input",
                 input_buf, &input_len, COL_BG1);
     bring_to_front(2);
     format_status(0);
@@ -1696,7 +1711,14 @@ thread wm_main(void)
 
         int kc = kbd_drain_char();
         if (kc) {
-            input_append(kc);
+            if (focused == g_console_win_idx && g_console_win_idx >= 0) {
+                /* Convert "\r"-only Enter from the line buffer to "\n"
+                 * so the shell reads a complete line. */
+                if (kc == '\r') wm_console_feed_key('\n');
+                else            wm_console_feed_key(kc);
+            } else {
+                input_append(kc);
+            }
             dirty = 1;
         }
 
@@ -1725,4 +1747,37 @@ thread wm_main(void)
         sleep(16); /* ~60 Hz */
     }
     return OK;
+}
+
+/* ============================================================
+ *  Console window body renderer — paints the wmcon cell grid.
+ * ============================================================ */
+static void render_console_body(int x, int y, int w, int h)
+{
+    int rows, cols;
+    const char *cells;
+    int cur_r, cur_c;
+    int r, c;
+
+    (void)w; (void)h;
+
+    wm_console_get_state(&rows, &cols, &cells, &cur_r, &cur_c);
+
+    for (r = 0; r < rows; r++) {
+        int ry = y + r * CHAR_H;
+        for (c = 0; c < cols; c++) {
+            char ch = cells[r * cols + c];
+            if (ch != ' ') {
+                int rx = x + 8 + c * CHAR_W;
+                draw_char(rx, ry, ch, COL_TEXT);
+            }
+        }
+    }
+
+    /* Caret at (cur_r, cur_c) — small block. */
+    if (cur_r >= 0 && cur_r < rows && cur_c >= 0 && cur_c <= cols) {
+        int cx = x + 8 + cur_c * CHAR_W;
+        int cy = y + cur_r * CHAR_H;
+        fill_rect(cx, cy, FONT_SCALE, CHAR_H, COL_TEXT);
+    }
 }
