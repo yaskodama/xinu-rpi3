@@ -1105,3 +1105,139 @@ value_t fb_get_aa(int n, value_t *a) {
     (void)n; (void)a;
     return v_int(g_fb_aa);
 }
+
+/* fb_fill_rect — P4 needs a filled-rect primitive for the bar-chart.
+   Lives in G1 surface since it is a fundamental drawing primitive. */
+value_t fb_fill_rect(int n, value_t *a) {
+    int x, y, w, h;
+    long c24;
+    if (n < 5) return v_int(0);
+    x = (int)a[0].i; y = (int)a[1].i;
+    w = (int)a[2].i; h = (int)a[3].i;
+    c24 = a[4].i;
+    fill_rect_pub(x, y, w, h, rgb565_from24(c24));
+    kprintf("[aipl] fb_fill_rect x=%d y=%d w=%d h=%d color=0x%06x\r\n",
+            x, y, w, h, (unsigned)(c24 & 0xFFFFFFu));
+    return v_int(1);
+}
+
+/* ============================================================
+ *  P4: SchedulingVisualizer.
+ *
+ *  Background Xinu thread that samples thrtab[] every `period`
+ *  milliseconds, classifies each thread into one of four buckets —
+ *  CURR / READY / SLEEP / RECV — emits a CSV line to the serial
+ *  console, and (if framebuffer drawing is enabled) renders a bar
+ *  chart in the upper-right corner using the G1 fb_fill_rect
+ *  primitive.
+ *
+ *  AIPL externs:
+ *    sched_viz_start(period_ms)   ->  1 ok / 0 already running
+ *    sched_viz_stop()             ->  0
+ *    sched_viz_sample()           ->  combined int (ready<<24|curr<<16|sleep<<8|recv)
+ *
+ *  CSV format: `csv,t=<ms>,ready=N,curr=N,sleep=N,recv=N`
+ * ============================================================ */
+#include <clock.h>
+#include <thread.h>
+
+#define P4_BAR_X        470
+#define P4_BAR_Y        70
+#define P4_BAR_W        18
+#define P4_BAR_H_MAX    96
+#define P4_BAR_GAP      4
+#define P4_SCALE_DEN    8       /* assume up to ~8 threads per bucket */
+
+static volatile int g_viz_running = 0;
+static volatile int g_viz_period  = 500;
+static volatile int g_viz_samples = 0;
+
+static void p4_count_states(int *ready, int *curr, int *slp, int *rcv) {
+    int i;
+    *ready = *curr = *slp = *rcv = 0;
+    for (i = 0; i < NTHREAD; i++) {
+        switch (thrtab[i].state) {
+            case THRCURR:   (*curr)++;   break;
+            case THRREADY:  (*ready)++;  break;
+            case THRSLEEP:  (*slp)++;    break;
+            case THRRECV:
+            case THRWAIT:
+            case THRTMOUT:  (*rcv)++;    break;
+            default: break;
+        }
+    }
+}
+
+static void p4_draw_bars(int ready, int curr, int slp, int rcv) {
+    unsigned short bg     = rgb565(20, 30, 60);
+    unsigned short c_red  = rgb565(50, 200, 50);
+    unsigned short c_cur  = rgb565(255, 100, 100);
+    unsigned short c_slp  = rgb565(100, 130, 220);
+    unsigned short c_rcv  = rgb565(220, 200, 80);
+    int total_w = 4 * P4_BAR_W + 3 * P4_BAR_GAP;
+    int hr, hc, hs, hv;
+    int pitch = P4_BAR_W + P4_BAR_GAP;
+    /* Clear the chart area before drawing. */
+    fill_rect_pub(P4_BAR_X - 2, P4_BAR_Y - 2,
+                  total_w + 4, P4_BAR_H_MAX + 4, bg);
+    hr = (ready * P4_BAR_H_MAX) / P4_SCALE_DEN; if (hr > P4_BAR_H_MAX) hr = P4_BAR_H_MAX;
+    hc = (curr  * P4_BAR_H_MAX) / P4_SCALE_DEN; if (hc > P4_BAR_H_MAX) hc = P4_BAR_H_MAX;
+    hs = (slp   * P4_BAR_H_MAX) / P4_SCALE_DEN; if (hs > P4_BAR_H_MAX) hs = P4_BAR_H_MAX;
+    hv = (rcv   * P4_BAR_H_MAX) / P4_SCALE_DEN; if (hv > P4_BAR_H_MAX) hv = P4_BAR_H_MAX;
+    fill_rect_pub(P4_BAR_X + 0 * pitch, P4_BAR_Y + P4_BAR_H_MAX - hr, P4_BAR_W, hr, c_red);
+    fill_rect_pub(P4_BAR_X + 1 * pitch, P4_BAR_Y + P4_BAR_H_MAX - hc, P4_BAR_W, hc, c_cur);
+    fill_rect_pub(P4_BAR_X + 2 * pitch, P4_BAR_Y + P4_BAR_H_MAX - hs, P4_BAR_W, hs, c_slp);
+    fill_rect_pub(P4_BAR_X + 3 * pitch, P4_BAR_Y + P4_BAR_H_MAX - hv, P4_BAR_W, hv, c_rcv);
+    kprintf("[aipl] p4_bar ready=%d curr=%d sleep=%d recv=%d "
+            "h=(%d,%d,%d,%d)\r\n",
+            ready, curr, slp, rcv, hr, hc, hs, hv);
+}
+
+static thread p4_sched_viz_main(void) {
+    int ready, curr, slp, rcv;
+    while (g_viz_running) {
+        p4_count_states(&ready, &curr, &slp, &rcv);
+        kprintf("csv,t=%d,ready=%d,curr=%d,sleep=%d,recv=%d\r\n",
+                (int)clkticks, ready, curr, slp, rcv);
+        p4_draw_bars(ready, curr, slp, rcv);
+        g_viz_samples++;
+        sleep(g_viz_period);
+    }
+    return OK;
+}
+
+value_t sched_viz_start(int n, value_t *a) {
+    int period;
+    tid_typ tid;
+    if (g_viz_running) return v_int(0);
+    period = (n >= 1) ? (int)a[0].i : 500;
+    if (period < 50) period = 50;
+    g_viz_period  = period;
+    g_viz_samples = 0;
+    g_viz_running = 1;
+    tid = create((void*)p4_sched_viz_main, 4096, INITPRIO,
+                 "aipl-viz", 0);
+    if (tid != SYSERR) {
+        ready(tid, RESCHED_NO);
+        kprintf("[aipl] sched-viz started period=%d\r\n", period);
+        return v_int(1);
+    }
+    g_viz_running = 0;
+    return v_int(0);
+}
+
+value_t sched_viz_stop(int n, value_t *a) {
+    (void)n; (void)a;
+    g_viz_running = 0;
+    kprintf("[aipl] sched-viz stopped samples=%d\r\n", g_viz_samples);
+    return v_int(0);
+}
+
+value_t sched_viz_sample(int n, value_t *a) {
+    int ready, curr, slp, rcv;
+    (void)n; (void)a;
+    p4_count_states(&ready, &curr, &slp, &rcv);
+    /* Pack into a single int — caller can decode if needed. */
+    return v_int(((long)ready << 24) | ((long)curr << 16) |
+                 ((long)slp   <<  8) |  (long)rcv);
+}
