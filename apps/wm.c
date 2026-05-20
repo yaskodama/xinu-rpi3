@@ -1689,11 +1689,22 @@ thread wm_main(void)
                         }
                     }
                 }
+                /* G3: notify AIPL click subscribers (post-WM-handling so
+                   in-flight gestures like drag-start are still recorded). */
+                {
+                    extern void abcl_mouse_dispatch_click(int x, int y, int btn);
+                    abcl_mouse_dispatch_click(cursor_x, cursor_y, btn);
+                }
             }
             if (released & 0x01) {
                 extern void abcl_xinu_gui_handle_release(void);
                 abcl_xinu_gui_handle_release();
                 dragging = 0; drag_target = -1;
+                /* G3: notify AIPL release subscribers. */
+                {
+                    extern void abcl_mouse_dispatch_release(int x, int y, int btn);
+                    abcl_mouse_dispatch_release(cursor_x, cursor_y, btn);
+                }
             }
             if (dragging && drag_target >= 0) {
                 winlist[drag_target].x = cursor_x - drag_off_x;
@@ -1703,6 +1714,12 @@ thread wm_main(void)
             {
                 extern void abcl_xinu_gui_handle_drag(int mx, int my);
                 abcl_xinu_gui_handle_drag(cursor_x, cursor_y);
+            }
+            /* G3: notify AIPL move subscribers — fires every frame that
+               PL050 produced a delta packet (i.e. mouse_drain==1). */
+            if (dx != 0 || dy != 0) {
+                extern void abcl_mouse_dispatch_move(int x, int y, int btn);
+                abcl_mouse_dispatch_move(cursor_x, cursor_y, btn);
             }
 
             last_btn = btn;

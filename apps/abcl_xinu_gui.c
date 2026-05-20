@@ -1299,3 +1299,171 @@ value_t fb_text_size(int n, value_t *a) {
     /* width = chars * (8 * FONT_SCALE)  — WM's CHAR_W = 16. */
     return v_int((long)len * 16);
 }
+
+/* ============================================================
+ *  G3: PL050 mouse → AIPL actor message dispatch.
+ *
+ *  Three subscriber tables (click / move / release).  Each entry is
+ *  (target actor obj_id, method name).  When the WM's main loop
+ *  observes a mouse edge, it calls the corresponding dispatcher,
+ *  which iterates the table and enqueues `method(x, y, buttons)`
+ *  on every registered actor.
+ *
+ *  AIPL externs (all return 1 on success, 0 on bad arg / full table):
+ *    mouse_on_click(self, "method")
+ *    mouse_on_move(self, "method")
+ *    mouse_on_release(self, "method")
+ *    mouse_unsubscribe(self)         — drops `self` from all 3 tables
+ *    mouse_inject(kind, x, y, btn)   — synthesise an event; kind:
+ *                                       0=click, 1=move, 2=release
+ *    mouse_state()                   -> packed int (x<<20)|(y<<8)|btn
+ *
+ *  Serial marker: `[aipl] mouse_event kind=click|move|release x=… y=…
+ *  btn=… subs=…` — emitted once per dispatched event so smokes can
+ *  count without rendering the framebuffer.
+ * ============================================================ */
+#define MAX_MOUSE_SUBS 8
+
+typedef struct {
+    int  valid;
+    int  target;            /* actor obj_id */
+    char method[32];
+} mouse_sub_t;
+
+static mouse_sub_t g_click_subs  [MAX_MOUSE_SUBS];
+static mouse_sub_t g_move_subs   [MAX_MOUSE_SUBS];
+static mouse_sub_t g_release_subs[MAX_MOUSE_SUBS];
+
+static volatile int g_mouse_x   = 0;
+static volatile int g_mouse_y   = 0;
+static volatile int g_mouse_btn = 0;
+
+static int mouse_sub_add(mouse_sub_t *tbl, int target, const char *method) {
+    int i;
+    for (i = 0; i < MAX_MOUSE_SUBS; i++) {
+        if (!tbl[i].valid) {
+            tbl[i].valid  = 1;
+            tbl[i].target = target;
+            copy_str(tbl[i].method, method ? method : "", sizeof tbl[i].method);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int mouse_sub_remove(mouse_sub_t *tbl, int target) {
+    int i, n = 0;
+    for (i = 0; i < MAX_MOUSE_SUBS; i++) {
+        if (tbl[i].valid && tbl[i].target == target) {
+            tbl[i].valid = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int mouse_dispatch(mouse_sub_t *tbl, const char *kind,
+                          int x, int y, int btn) {
+    int i, fired = 0;
+    value_t args[3];
+    args[0] = v_int(x);
+    args[1] = v_int(y);
+    args[2] = v_int(btn);
+    for (i = 0; i < MAX_MOUSE_SUBS; i++) {
+        if (tbl[i].valid) {
+            abcl_enqueue(-1, tbl[i].target, tbl[i].method, 3, args);
+            fired++;
+        }
+    }
+    kprintf("[aipl] mouse_event kind=%s x=%d y=%d btn=%d subs=%d\r\n",
+            kind, x, y, btn, fired);
+    return fired;
+}
+
+/* Public entry points — called from wm.c's main loop. */
+void abcl_mouse_dispatch_click(int x, int y, int btn) {
+    g_mouse_x = x; g_mouse_y = y; g_mouse_btn = btn;
+    mouse_dispatch(g_click_subs, "click", x, y, btn);
+}
+
+void abcl_mouse_dispatch_move(int x, int y, int btn) {
+    g_mouse_x = x; g_mouse_y = y; g_mouse_btn = btn;
+    mouse_dispatch(g_move_subs, "move", x, y, btn);
+}
+
+void abcl_mouse_dispatch_release(int x, int y, int btn) {
+    g_mouse_x = x; g_mouse_y = y; g_mouse_btn = btn;
+    mouse_dispatch(g_release_subs, "release", x, y, btn);
+}
+
+static int unwrap_actor_id(value_t v) {
+    return (v.tag == V_OBJ) ? v.obj_id : (int)v.i;
+}
+
+value_t mouse_on_click(int n, value_t *a) {
+    int target;
+    const char *m;
+    if (n < 2) return v_int(0);
+    target = unwrap_actor_id(a[0]);
+    m      = (a[1].tag == V_STR && a[1].s) ? a[1].s : "";
+    kprintf("[aipl] mouse_on_click target=%d method=%s\r\n", target, m);
+    return v_int(mouse_sub_add(g_click_subs, target, m));
+}
+
+value_t mouse_on_move(int n, value_t *a) {
+    int target;
+    const char *m;
+    if (n < 2) return v_int(0);
+    target = unwrap_actor_id(a[0]);
+    m      = (a[1].tag == V_STR && a[1].s) ? a[1].s : "";
+    kprintf("[aipl] mouse_on_move target=%d method=%s\r\n", target, m);
+    return v_int(mouse_sub_add(g_move_subs, target, m));
+}
+
+value_t mouse_on_release(int n, value_t *a) {
+    int target;
+    const char *m;
+    if (n < 2) return v_int(0);
+    target = unwrap_actor_id(a[0]);
+    m      = (a[1].tag == V_STR && a[1].s) ? a[1].s : "";
+    kprintf("[aipl] mouse_on_release target=%d method=%s\r\n", target, m);
+    return v_int(mouse_sub_add(g_release_subs, target, m));
+}
+
+value_t mouse_unsubscribe(int n, value_t *a) {
+    int target, removed;
+    if (n < 1) return v_int(0);
+    target  = unwrap_actor_id(a[0]);
+    removed = 0;
+    removed += mouse_sub_remove(g_click_subs,   target);
+    removed += mouse_sub_remove(g_move_subs,    target);
+    removed += mouse_sub_remove(g_release_subs, target);
+    kprintf("[aipl] mouse_unsubscribe target=%d removed=%d\r\n",
+            target, removed);
+    return v_int(removed);
+}
+
+value_t mouse_inject(int n, value_t *a) {
+    int kind, x, y, btn;
+    if (n < 4) return v_int(0);
+    kind = (int)a[0].i;
+    x    = (int)a[1].i;
+    y    = (int)a[2].i;
+    btn  = (int)a[3].i;
+    switch (kind) {
+        case 0: abcl_mouse_dispatch_click  (x, y, btn); break;
+        case 1: abcl_mouse_dispatch_move   (x, y, btn); break;
+        case 2: abcl_mouse_dispatch_release(x, y, btn); break;
+        default: return v_int(0);
+    }
+    return v_int(1);
+}
+
+value_t mouse_state(int n, value_t *a) {
+    (void)n; (void)a;
+    /* (x & 0xFFF) << 20 | (y & 0xFFF) << 8 | (btn & 0xFF)
+       Layout chosen so a single AIPL int print is readable. */
+    return v_int(((long)(g_mouse_x & 0xFFF) << 20) |
+                 ((long)(g_mouse_y & 0xFFF) <<  8) |
+                  (long)(g_mouse_btn & 0xFF));
+}
