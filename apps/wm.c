@@ -463,6 +463,7 @@ static const char sc_upper[256] = {
 static int kbd_release_pending;
 static int kbd_extended;
 static int kbd_shift;
+static int kbd_ctrl;          /* PS/2 Ctrl modifier (left or right) */
 
 static void kbd_init(void)
 {
@@ -473,9 +474,23 @@ static void kbd_init(void)
     while (kmi_has_data(KMI_KBD)) (void)KMI_KBD[KMI_DATA];
 }
 
-/* Pull all queued bytes; return last printable char produced (0 if none).
- * If multiple chars arrive in one tick we miss the in-betweens; for an
- * interactive demo at 60 Hz that's fine. */
+/* Pull all queued bytes; return last key produced (0 if none).  Return
+ * values 1..127 are printable ASCII or control characters (Ctrl-A=0x01
+ * through Ctrl-Z=0x1A, Backspace=0x08, Enter=0x0A).  Extended PS/2
+ * scancodes (arrow keys etc.) are remapped to their Emacs/readline
+ * control-char equivalents so the input editor handles both paths
+ * uniformly:
+ *
+ *      Up    -> Ctrl-P (0x10)
+ *      Down  -> Ctrl-N (0x0E)
+ *      Left  -> Ctrl-B (0x02)
+ *      Right -> Ctrl-F (0x06)
+ *      Home  -> Ctrl-A (0x01)
+ *      End   -> Ctrl-E (0x05)
+ *
+ * Ctrl+letter is also detected (left or right Ctrl modifier) so users
+ * who prefer Ctrl-P over the Up arrow get the same code.
+ */
 static int kbd_drain_char(void)
 {
     int last = 0;
@@ -487,18 +502,51 @@ static int kbd_drain_char(void)
         if (kbd_release_pending) {
             if (!kbd_extended && (b == 0x12 || b == 0x59))
                 kbd_shift = 0;
+            if (b == 0x14)
+                kbd_ctrl = 0;     /* L-Ctrl or R-Ctrl release */
             kbd_release_pending = 0;
             kbd_extended = 0;
             continue;
         }
+        /* Shift press */
         if (!kbd_extended && (b == 0x12 || b == 0x59)) {
             kbd_shift = 1;
             continue;
         }
-        if (kbd_extended) { kbd_extended = 0; continue; }
+        /* Ctrl press (left or right) */
+        if (b == 0x14) {
+            kbd_ctrl = 1;
+            kbd_extended = 0;
+            continue;
+        }
+        /* Extended-key press (E0-prefixed): arrows, home, end */
+        if (kbd_extended) {
+            kbd_extended = 0;
+            switch (b) {
+                case 0x75: last = 0x10; break;  /* Up    -> Ctrl-P */
+                case 0x72: last = 0x0E; break;  /* Down  -> Ctrl-N */
+                case 0x6B: last = 0x02; break;  /* Left  -> Ctrl-B */
+                case 0x74: last = 0x06; break;  /* Right -> Ctrl-F */
+                case 0x6C: last = 0x01; break;  /* Home  -> Ctrl-A */
+                case 0x69: last = 0x05; break;  /* End   -> Ctrl-E */
+                default:   break;               /* drop */
+            }
+            continue;
+        }
+        /* Backspace key (Set 2 scancode 0x66) */
+        if (b == 0x66) { last = 0x08; continue; }
 
-        char c = kbd_shift ? sc_upper[b] : sc_lower[b];
-        if (c) last = c;
+        {
+            char c = kbd_shift ? sc_upper[b] : sc_lower[b];
+            if (c) {
+                /* Ctrl + a..z (or A..Z) -> 0x01..0x1A */
+                if (kbd_ctrl) {
+                    if (c >= 'a' && c <= 'z') c = c - ('a' - 1);
+                    else if (c >= 'A' && c <= 'Z') c = c - ('A' - 1);
+                }
+                last = c;
+            }
+        }
     }
     return last;
 }
@@ -641,6 +689,11 @@ static void bring_to_front(int idx)
 
 /* Draw the text buffer with wrap-on-width and \n handling. Show only
  * the lines that fit; on overflow, show the most recent ones. */
+/* When >= 0, render the caret here (offset into the text buffer)
+ * instead of at end-of-text.  Used by the input editor to show the
+ * cursor mid-line during left/right movement. */
+static int g_input_caret = -1;
+
 static void draw_text_buffer(int x0, int y0, int w_px, int h_px,
                              const char *text, int len)
 {
@@ -653,10 +706,14 @@ static void draw_text_buffer(int x0, int y0, int w_px, int h_px,
      * for the last `rows` logical lines. Since the buffer is small
      * (<=2048), do the trivial O(N) pass. */
 
-    /* Step 1: count total lines. */
+    /* Step 1: count total lines + record caret position if overridden. */
     int line = 0, col = 0;
     int i;
+    int caret_l = -1, caret_c = -1;
+    int caret_off = (g_input_caret >= 0 && g_input_caret <= len)
+                    ? g_input_caret : -1;
     for (i = 0; i < len; i++) {
+        if (caret_off == i) { caret_l = line; caret_c = col; }
         char c = text[i];
         if (c == '\n') { line++; col = 0; }
         else {
@@ -664,6 +721,7 @@ static void draw_text_buffer(int x0, int y0, int w_px, int h_px,
             col++;
         }
     }
+    if (caret_off == len) { caret_l = line; caret_c = col; }
     int total_lines = line + 1;
     int first_line = total_lines > rows ? total_lines - rows : 0;
 
@@ -687,12 +745,19 @@ static void draw_text_buffer(int x0, int y0, int w_px, int h_px,
         (void)draw_x; (void)draw_y; (void)rendered_lines;
     }
 
-    /* Step 3: blinking caret at end of text */
-    int caret_line = line - first_line;
-    if (caret_line >= 0 && caret_line < rows) {
-        int cx = x0 + 8 + col * CHAR_W;
-        int cy = y0 + caret_line * CHAR_H;
-        fill_rect(cx, cy, FONT_SCALE, CHAR_H, COL_TEXT);
+    /* Step 3: caret — either at the override offset (mid-line editing)
+     *           or end-of-text (default). */
+    int cret_line, cret_col;
+    if (caret_l >= 0) { cret_line = caret_l; cret_col = caret_c; }
+    else              { cret_line = line;    cret_col = col;    }
+    cret_line -= first_line;
+    if (cret_line >= 0 && cret_line < rows) {
+        int cx = x0 + 8 + cret_col * CHAR_W;
+        int cy = y0 + cret_line * CHAR_H;
+        /* Thicker, visible block when the caret is mid-line. */
+        int w = (g_input_caret >= 0 && caret_l >= 0)
+                ? FONT_SCALE * 2 : FONT_SCALE;
+        fill_rect(cx, cy, w, CHAR_H, COL_TEXT);
     }
 }
 
@@ -822,6 +887,15 @@ static void format_status(unsigned char btn)
 static char input_buf[INPUT_BUF_LEN];
 static int  input_len;
 static int  cmd_start;
+static int  cmd_cursor;            /* offset within current line */
+
+/* History for the WM mini-shell — same data structure as the
+ * console-side readline. */
+#include <shell_readline.h>
+static struct shell_history g_wm_hist;
+static int   g_wm_hist_view = -1;  /* -1 = editing fresh line */
+static char  g_wm_hist_saved[160];
+static int   g_wm_hist_has_saved = 0;
 
 static const char *input_seed =
     "XINU mini-shell.  cwd = /home    Type 'help' for commands.\n"
@@ -849,6 +923,7 @@ static void prompt(void)
 {
     sb_puts("\n$ ");
     cmd_start = input_len;
+    cmd_cursor = 0;
 }
 
 static void input_seed_reset(void)
@@ -860,27 +935,135 @@ static void input_seed_reset(void)
     }
     input_len = i;
     cmd_start = i;
+    cmd_cursor = 0;
+    shell_history_init(&g_wm_hist);
+    g_wm_hist_view = -1;
+    g_wm_hist_has_saved = 0;
 }
 
 /* Forward declaration. */
 static void execute_command(char *line, int len);
 
+/* Replace the current command line (everything from cmd_start onwards)
+ * with `s`, then place the cursor at the end of `s`.  Used by history
+ * navigation and Ctrl-U. */
+static void replace_current_line(const char *s)
+{
+    int i, n = 0;
+    while (s[n]) n++;
+    if (n > 100) n = 100;             /* room left in input_buf */
+    input_len = cmd_start;
+    for (i = 0; i < n && input_len + 1 < INPUT_BUF_LEN; i++) {
+        input_buf[input_len++] = s[i];
+    }
+    cmd_cursor = input_len - cmd_start;
+}
+
 static void input_append(int c)
 {
-    if (c == '\b') {
-        if (input_len > cmd_start) input_len--;
-    } else if (c == '\n') {
-        int line_len = input_len - cmd_start;
-        char line[160];
-        if (line_len > (int)sizeof(line) - 1) line_len = sizeof(line) - 1;
-        int i;
-        for (i = 0; i < line_len; i++) line[i] = input_buf[cmd_start + i];
-        line[line_len] = 0;
-        sb_putc('\n');
-        execute_command(line, line_len);
-        prompt();
-    } else if (c >= 0x20 && c < 0x7F) {
-        sb_putc((char)c);
+    int line_len = input_len - cmd_start;
+    int i;
+
+    switch (c) {
+        case 0x08:                              /* Backspace */
+            if (cmd_cursor > 0) {
+                for (i = cmd_start + cmd_cursor - 1; i < input_len - 1; i++)
+                    input_buf[i] = input_buf[i + 1];
+                input_len--;
+                cmd_cursor--;
+            }
+            return;
+
+        case '\n': {                            /* Enter */
+            char line[160];
+            int  ll = line_len;
+            if (ll > (int)sizeof(line) - 1) ll = sizeof(line) - 1;
+            for (i = 0; i < ll; i++) line[i] = input_buf[cmd_start + i];
+            line[ll] = 0;
+            shell_history_add(&g_wm_hist, line);
+            g_wm_hist_view     = -1;
+            g_wm_hist_has_saved = 0;
+            sb_putc('\n');
+            execute_command(line, ll);
+            prompt();
+            return;
+        }
+
+        case 0x02:                              /* Ctrl-B / Left */
+            if (cmd_cursor > 0) cmd_cursor--;
+            return;
+        case 0x06:                              /* Ctrl-F / Right */
+            if (cmd_cursor < line_len) cmd_cursor++;
+            return;
+        case 0x01:                              /* Ctrl-A / Home */
+            cmd_cursor = 0;
+            return;
+        case 0x05:                              /* Ctrl-E / End */
+            cmd_cursor = line_len;
+            return;
+
+        case 0x0B:                              /* Ctrl-K — kill to end */
+            input_len = cmd_start + cmd_cursor;
+            return;
+        case 0x15:                              /* Ctrl-U — kill to start */
+            if (cmd_cursor > 0) {
+                int tail = line_len - cmd_cursor;
+                for (i = 0; i < tail; i++)
+                    input_buf[cmd_start + i] =
+                        input_buf[cmd_start + cmd_cursor + i];
+                input_len -= cmd_cursor;
+                cmd_cursor = 0;
+            }
+            return;
+
+        case 0x10:                              /* Ctrl-P / Up */
+            if (g_wm_hist_view + 1 < shell_history_size(&g_wm_hist)) {
+                const char *src;
+                if (g_wm_hist_view == -1 && !g_wm_hist_has_saved) {
+                    int sv = line_len;
+                    if (sv >= (int)sizeof(g_wm_hist_saved))
+                        sv = sizeof(g_wm_hist_saved) - 1;
+                    for (i = 0; i < sv; i++)
+                        g_wm_hist_saved[i] = input_buf[cmd_start + i];
+                    g_wm_hist_saved[sv] = 0;
+                    g_wm_hist_has_saved = 1;
+                }
+                g_wm_hist_view++;
+                src = shell_history_at(&g_wm_hist, g_wm_hist_view);
+                if (src) replace_current_line(src);
+            }
+            return;
+
+        case 0x0E:                              /* Ctrl-N / Down */
+            if (g_wm_hist_view > 0) {
+                const char *src;
+                g_wm_hist_view--;
+                src = shell_history_at(&g_wm_hist, g_wm_hist_view);
+                if (src) replace_current_line(src);
+            } else if (g_wm_hist_view == 0) {
+                g_wm_hist_view = -1;
+                if (g_wm_hist_has_saved) replace_current_line(g_wm_hist_saved);
+                else                     replace_current_line("");
+            }
+            return;
+
+        case 0x0C:                              /* Ctrl-L — clear & redraw */
+            input_seed_reset();
+            return;
+
+        default:
+            if (c >= 0x20 && c < 0x7F) {
+                if (input_len + 1 < INPUT_BUF_LEN) {
+                    /* Insert at cursor position; shift the rest of
+                     * the current line right by one byte. */
+                    for (i = input_len; i > cmd_start + cmd_cursor; i--)
+                        input_buf[i] = input_buf[i - 1];
+                    input_buf[cmd_start + cmd_cursor] = (char)c;
+                    input_len++;
+                    cmd_cursor++;
+                }
+            }
+            return;
     }
 }
 
@@ -944,7 +1127,12 @@ static void cmd_help(void)
       "  <name>                     same as `run <name>` if a.out is in cwd\n"
       "system:\n"
       "  ps                         list threads\n"
-      "  halt                       shut the OS down (also: click [Halt] in topbar)");
+      "  halt                       shut the OS down (also: click [Halt] in topbar)\n"
+      "edit keys:\n"
+      "  ^P / Up    prev history       ^N / Down  next history\n"
+      "  ^B / Left  cursor left        ^F / Right cursor right\n"
+      "  ^A / Home  line start         ^E / End   line end\n"
+      "  ^K kill to end   ^U kill to start   ^L clear");
 }
 
 static void cmd_clear(void)
@@ -1517,6 +1705,12 @@ thread wm_main(void)
             extern void abcl_xinu_gui_tick_all(void);
             abcl_xinu_gui_tick_all();
         }
+
+        /* Position the input caret at (cmd_start + cmd_cursor) so the
+         * renderer draws it mid-line during left/right movement.  When
+         * cmd_cursor == line_len this coincides with the natural
+         * end-of-text caret. */
+        g_input_caret = cmd_start + cmd_cursor;
 
         /* 線分は毎フレーム再描画 (アクターがフィールドを更新している) */
         wm_redraw();

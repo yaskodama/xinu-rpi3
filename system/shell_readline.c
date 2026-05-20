@@ -97,20 +97,24 @@ void shell_history_add(struct shell_history *h, const char *line)
 }
 
 /* Number of currently retained history lines. */
-static int hist_size(struct shell_history *h)
+int shell_history_size(struct shell_history *h)
 {
     return (h->count < SHELL_HIST_MAX) ? h->count : SHELL_HIST_MAX;
 }
 
 /* Map an "index-from-newest" (0 = most recent) to a slot. */
-static const char *hist_at(struct shell_history *h, int from_newest)
+const char *shell_history_at(struct shell_history *h, int from_newest)
 {
     int slot;
-    if (from_newest < 0 || from_newest >= hist_size(h)) return NULL;
+    if (from_newest < 0 || from_newest >= shell_history_size(h)) return NULL;
     slot = (h->count - 1 - from_newest) % SHELL_HIST_MAX;
     if (slot < 0) slot += SHELL_HIST_MAX;
     return h->buf[slot];
 }
+
+/* Backwards-compat aliases for the local readline below. */
+#define hist_size shell_history_size
+#define hist_at   shell_history_at
 
 /* ---------- readline ---------- */
 

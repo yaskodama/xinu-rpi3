@@ -31,6 +31,11 @@ struct shell_history {
 void shell_history_init(struct shell_history *h);
 void shell_history_add (struct shell_history *h, const char *line);
 
+/* Helpers used by both the console shell readline and the WM
+ * mini-shell editor. */
+int         shell_history_size(struct shell_history *h);
+const char *shell_history_at  (struct shell_history *h, int from_newest);
+
 /* Read one line from `fd`.  Returns the byte count written to `buf`
  * (including the trailing '\n') on success, EOF on EOF/error.  The
  * caller sees the same shape as the previous cooked read(). */
