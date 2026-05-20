@@ -47,6 +47,9 @@ C_FILES += cc.c aout.c
 # ABCL/c+ -> C translator
 C_FILES += abclc.c
 
+# Shared system_halt() — used by xsh_halt and the WM "[Halt]" button.
+C_FILES += halt.c
+
 # Add the files to the compile source path
 DIR = ${TOPDIR}/${COMP}
 COMP_SRC += ${C_FILES:%=${DIR}/%}

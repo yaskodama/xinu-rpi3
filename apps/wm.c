@@ -720,6 +720,20 @@ static void draw_window(int idx)
     }
 }
 
+/* Halt button in the topbar (top-right).  Click to shut down the OS
+ * cleanly — same code path as `halt` typed at the xsh prompt or in
+ * the WM mini-shell input box. */
+#define HALT_BTN_W   72
+#define HALT_BTN_H   (TOPBAR_H - 4)
+#define HALT_BTN_X   (SCREEN_W - HALT_BTN_W - 4)
+#define HALT_BTN_Y   2
+
+static int in_halt_button(int x, int y)
+{
+    return  x >= HALT_BTN_X && x < HALT_BTN_X + HALT_BTN_W
+         && y >= HALT_BTN_Y && y < HALT_BTN_Y + HALT_BTN_H;
+}
+
 static void wm_redraw(void)
 {
     fill_rect(0, 0, SCREEN_W, SCREEN_H, COL_DESK);
@@ -728,6 +742,21 @@ static void wm_redraw(void)
     draw_string(8, 4,
         "XINU WM  -  arm-qemu (Versatile PB)  -  drag titlebars  -  click body to focus",
         COL_WHITE);
+    /* Halt button at top-right. */
+    {
+        unsigned short btn_bg     = RGB(180,  40,  40);
+        unsigned short btn_border = RGB(255, 220, 220);
+        fill_rect(HALT_BTN_X, HALT_BTN_Y, HALT_BTN_W, HALT_BTN_H, btn_bg);
+        fill_rect(HALT_BTN_X, HALT_BTN_Y, HALT_BTN_W, 1, btn_border);
+        fill_rect(HALT_BTN_X, HALT_BTN_Y + HALT_BTN_H - 1, HALT_BTN_W, 1, btn_border);
+        fill_rect(HALT_BTN_X, HALT_BTN_Y, 1, HALT_BTN_H, btn_border);
+        fill_rect(HALT_BTN_X + HALT_BTN_W - 1, HALT_BTN_Y, 1, HALT_BTN_H, btn_border);
+        /* "[Halt]" — 6 chars × 16px = 96, narrower than HALT_BTN_W=72 with
+         *  smaller FONT_SCALE, so just use "Halt" centred. */
+        draw_string(HALT_BTN_X + (HALT_BTN_W - 4 * 8 * FONT_SCALE) / 2,
+                    HALT_BTN_Y + (HALT_BTN_H - 8 * FONT_SCALE) / 2,
+                    "Halt", COL_WHITE);
+    }
 
     /* Sort window indices by z ascending. */
     int order[MAX_WINDOWS], i, j;
@@ -914,7 +943,8 @@ static void cmd_help(void)
       "  run PATH                   execute a.out (output goes to host terminal)\n"
       "  <name>                     same as `run <name>` if a.out is in cwd\n"
       "system:\n"
-      "  ps                         list threads");
+      "  ps                         list threads\n"
+      "  halt                       shut the OS down (also: click [Halt] in topbar)");
 }
 
 static void cmd_clear(void)
@@ -1356,6 +1386,11 @@ static void execute_command(char *line, int len)
     else if (!strcmp(c, "color"))   cmd_color(argc, argv);
     else if (!strcmp(c, "mouse"))   cmd_mouse();
     else if (!strcmp(c, "bye"))     sb_puts("good bye!");
+    else if (!strcmp(c, "halt")) {
+        extern void system_halt(void);
+        sb_puts("System halt requested.");
+        system_halt();    /* never returns */
+    }
     /* Filesystem + compiler (mirror the console shell). */
     else if (!strcmp(c, "ls"))      cmd_ls(argc, argv);
     else if (!strcmp(c, "pwd"))     cmd_pwd();
@@ -1431,6 +1466,11 @@ thread wm_main(void)
             unsigned char released = ~btn &  last_btn;
 
             if (pressed & 0x01) {
+                /* [Halt] button in the topbar — clean shutdown. */
+                if (in_halt_button(cursor_x, cursor_y)) {
+                    extern void system_halt(void);
+                    system_halt();      /* never returns */
+                }
                 /* ABCL スライダー/ボタンを優先 */
                 extern int abcl_xinu_gui_handle_click(int mx, int my);
                 if (!abcl_xinu_gui_handle_click(cursor_x, cursor_y)) {
