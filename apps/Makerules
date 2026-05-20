@@ -4,7 +4,7 @@
 COMP = apps
 
 # Source files for this component
-C_FILES = date.c rdate.c timeserver.c wm.c abcl_program.c abcl_xinu_gui.c abcl_xinu_net.c abcl_xinu_str.c
+C_FILES = date.c rdate.c timeserver.c wm.c abcl_program.c abcl_xinu_gui.c abcl_xinu_net.c abcl_xinu_str.c abcl_xinu_ceidr.c abcl_xinu_rpc.c
 
 S_FILES =
 

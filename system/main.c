@@ -269,6 +269,16 @@ thread main(void)
                                   "AIPL", 0);
         if (SYSERR == ready(aipl_tid, RESCHED_NO))
             kprintf("WARNING: Failed to create AIPL thread\r\n");
+        /* H1+H3 RemoteRPC: bring up the UART1 host-RPC dispatcher.
+         * It is safe to start before AIPL actors finish booting —
+         * its SEND handler bounds-checks against the current
+         * n_objects, so messages that arrive too early get
+         * "ERR oob id" rather than wandering into uninitialised
+         * memory. */
+        {
+            extern void abcl_rpc_start(void);
+            abcl_rpc_start();
+        }
     }
 #endif
 
