@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <interrupt.h>
 #include <shell.h>
+#include <shell_readline.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@ const struct centry commandtab[] = {
     {"ethstat", FALSE, xsh_ethstat},
 #endif
     {"exit", TRUE, xsh_exit},
+    {"halt", TRUE, xsh_halt},
 #if NFLASH
     {"flashstat", FALSE, xsh_flashstat},
 #endif
@@ -204,27 +206,45 @@ thread shell(int indescrp, int outdescrp, int errdescrp)
         printf(SHELL_START);
     }
 
+    /* Per-shell command history.  Static so the same circular buffer
+     * survives across iterations of the read loop. */
+    static struct shell_history hist;
+    static int hist_ready = 0;
+    char promptbuf[NET_HOSTNM_MAXLEN + 8];
+    if (!hist_ready) { shell_history_init(&hist); hist_ready = 1; }
+    if (NULL != hostptr) {
+        int n = strlen(SHELL_PROMPT);
+        memcpy(promptbuf, SHELL_PROMPT, n);
+        promptbuf[n++] = '@';
+        strncpy(promptbuf + n, hostptr, NET_HOSTNM_MAXLEN);
+        promptbuf[NET_HOSTNM_MAXLEN + n] = 0;
+        n = strlen(promptbuf);
+        promptbuf[n++] = '$'; promptbuf[n++] = ' '; promptbuf[n] = 0;
+    } else {
+        int n = strlen(SHELL_PROMPT);
+        memcpy(promptbuf, SHELL_PROMPT, n);
+        promptbuf[n++] = '$'; promptbuf[n++] = ' '; promptbuf[n] = 0;
+    }
+
     /* Continually receive and handle commands */
     while (TRUE)
     {
-        /* Display prompt */
-        printf(SHELL_PROMPT);
+        /* shell_readline draws its own prompt + does its own raw I/O. */
+        buflen = shell_readline(stdin, buf, SHELL_BUFLEN - 1, &hist,
+                                promptbuf);
 
-        if (NULL != hostptr)
+        /* Record non-empty lines in history (before tokenisation
+         * mutates `buf`).  The trailing '\n' is stripped by the
+         * history-add helper. */
         {
-            printf("@%s$ ", hostptr);
+            char hbuf[SHELL_BUFLEN];
+            int  hi = 0;
+            while (hi < buflen && hi < SHELL_BUFLEN - 1
+                   && buf[hi] != '\n' && buf[hi] != '\r')
+            { hbuf[hi] = buf[hi]; hi++; }
+            hbuf[hi] = 0;
+            shell_history_add(&hist, hbuf);
         }
-        else
-        {
-            printf("$ ");
-        }
-
-        /* Setup proper tty modes for input and output */
-        control(stdin, TTY_CTRL_CLR_IFLAG, TTY_IRAW, NULL);
-        control(stdin, TTY_CTRL_SET_IFLAG, TTY_ECHO, NULL);
-
-        /* Read command */
-        buflen = read(stdin, buf, SHELL_BUFLEN - 1);
 
         /* Check for EOF and exit gracefully if seen */
         if (EOF == buflen)

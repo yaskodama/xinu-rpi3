@@ -50,6 +50,9 @@ C_FILES += abclc.c
 # Shared system_halt() — used by xsh_halt and the WM "[Halt]" button.
 C_FILES += halt.c
 
+# Shell line editor + history (Ctrl-P/N + arrow keys).
+C_FILES += shell_readline.c
+
 # Add the files to the compile source path
 DIR = ${TOPDIR}/${COMP}
 COMP_SRC += ${C_FILES:%=${DIR}/%}
