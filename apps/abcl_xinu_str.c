@@ -247,6 +247,18 @@ value_t array_set(int n_args, value_t *args)
     return args[0];
 }
 
+/* Public read-only view into an array slot.  Returns 1 if `id` is a
+ * live allocation; populates *out_data and *out_len.  Used by G5's
+ * fb_image to walk an AIPL int array without paying per-pixel
+ * bounds-check overhead. */
+int abcl_array_view(int id, long **out_data, int *out_len)
+{
+    if (id < 0 || id >= ARR_SLOTS || !arr_pool[id].in_use) return 0;
+    *out_data = arr_pool[id].data;
+    *out_len  = arr_pool[id].len;
+    return 1;
+}
+
 value_t array_push(int n_args, value_t *args)
 {
     /* Compatibility shim — appends one element if there's room.  Returns

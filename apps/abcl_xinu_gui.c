@@ -1467,3 +1467,66 @@ value_t mouse_state(int n, value_t *a) {
                  ((long)(g_mouse_y & 0xFFF) <<  8) |
                   (long)(g_mouse_btn & 0xFF));
 }
+
+/* ============================================================
+ *  G5: image bitmap blit (callable from AIPL).
+ *
+ *  Source pixel format = 0xRRGGBB long (one AIPL int per pixel),
+ *  packed row-major.  Quantised to BGR565 on write — identical to the
+ *  G1 colour pipeline so existing colours round-trip.
+ *
+ *  AIPL externs:
+ *    fb_image(x, y, w, h, arr)         — blit w*h pixels from int array
+ *    fb_image_solid(x, y, w, h, c24)   — no array; flat colour blit
+ *
+ *  Array source lives in the F4 pool (abcl_xinu_str.c).  Cap is 256
+ *  pixels per array → max 16×16 image; larger images need multiple
+ *  blits or a future F4 capacity bump.  The blit clips against the
+ *  array length, so passing a too-short array is safe — the marker
+ *  reports actual painted count so the smoke can verify.
+ * ============================================================ */
+extern int abcl_array_view(int id, long **out_data, int *out_len);
+
+value_t fb_image(int n, value_t *a) {
+    int x, y, w, h;
+    int arr_id, arr_len = 0;
+    long *arr_data = NULL;
+    int row, col, painted = 0, clipped = 0;
+    if (n < 5) return v_int(0);
+    x = (int)a[0].i; y = (int)a[1].i;
+    w = (int)a[2].i; h = (int)a[3].i;
+    arr_id = (a[4].tag == V_OBJ) ? a[4].obj_id : (int)a[4].i;
+    if (!abcl_array_view(arr_id, &arr_data, &arr_len)) {
+        kprintf("[aipl] fb_image bad arr=%d\r\n", arr_id);
+        return v_int(0);
+    }
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    for (row = 0; row < h; row++) {
+        for (col = 0; col < w; col++) {
+            int idx = row * w + col;
+            if (idx >= arr_len) { clipped++; continue; }
+            put_pixel_pub(x + col, y + row, rgb565_from24(arr_data[idx]));
+            painted++;
+        }
+    }
+    kprintf("[aipl] fb_image x=%d y=%d w=%d h=%d arr=%d "
+            "painted=%d clipped=%d\r\n",
+            x, y, w, h, arr_id, painted, clipped);
+    return v_int(painted);
+}
+
+value_t fb_image_solid(int n, value_t *a) {
+    int x, y, w, h;
+    long c24;
+    if (n < 5) return v_int(0);
+    x = (int)a[0].i; y = (int)a[1].i;
+    w = (int)a[2].i; h = (int)a[3].i;
+    c24 = a[4].i;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    fill_rect_pub(x, y, w, h, rgb565_from24(c24));
+    kprintf("[aipl] fb_image_solid x=%d y=%d w=%d h=%d color=0x%06x\r\n",
+            x, y, w, h, (unsigned)(c24 & 0xFFFFFFu));
+    return v_int(w * h);
+}
