@@ -1241,3 +1241,61 @@ value_t sched_viz_sample(int n, value_t *a) {
     return v_int(((long)ready << 24) | ((long)curr << 16) |
                  ((long)slp   <<  8) |  (long)rcv);
 }
+
+/* ============================================================
+ *  G2: bitmap font text rendering (callable from AIPL).
+ *
+ *  Reuses the WM's 8x8 font (FONT_SCALE=2 → 16x16 px cell) via
+ *  draw_string_pub / draw_char_pub.  Background is transparent —
+ *  callers can pre-fill_rect for an opaque box.
+ *
+ *  AIPL externs (return 1 on success, 0 on bad arg):
+ *    fb_text(x, y, str, color24)
+ *    fb_char(x, y, ch_code, color24)        — ch_code is ASCII int
+ *    fb_text_size(str)                       -> width_px = len * 16
+ *
+ *  CHAR_W / CHAR_H are 16 px on the WM (8 * FONT_SCALE).  G2 inherits
+ *  that — clients lay out grids on 16-px boundaries.
+ * ============================================================ */
+extern void draw_char_pub(int x, int y, char c, unsigned short fg);
+
+value_t fb_text(int n, value_t *a) {
+    int x, y;
+    const char *s;
+    long c24;
+    int len;
+    if (n < 4) return v_int(0);
+    x   = (int)a[0].i;
+    y   = (int)a[1].i;
+    s   = (a[2].tag == V_STR && a[2].s != NULL) ? a[2].s : "";
+    c24 = a[3].i;
+    draw_string_pub(x, y, s, rgb565_from24(c24));
+    len = 0; while (s[len]) len++;
+    kprintf("[aipl] fb_text x=%d y=%d len=%d color=0x%06x str=%s\r\n",
+            x, y, len, (unsigned)(c24 & 0xFFFFFFu), s);
+    return v_int(1);
+}
+
+value_t fb_char(int n, value_t *a) {
+    int x, y, ch;
+    long c24;
+    if (n < 4) return v_int(0);
+    x   = (int)a[0].i;
+    y   = (int)a[1].i;
+    ch  = (int)a[2].i & 0xFF;
+    c24 = a[3].i;
+    draw_char_pub(x, y, (char)ch, rgb565_from24(c24));
+    kprintf("[aipl] fb_char x=%d y=%d ch=0x%02x color=0x%06x\r\n",
+            x, y, ch, (unsigned)(c24 & 0xFFFFFFu));
+    return v_int(1);
+}
+
+value_t fb_text_size(int n, value_t *a) {
+    const char *s;
+    int len;
+    if (n < 1) return v_int(0);
+    s   = (a[0].tag == V_STR && a[0].s != NULL) ? a[0].s : "";
+    len = 0; while (s[len]) len++;
+    /* width = chars * (8 * FONT_SCALE)  — WM's CHAR_W = 16. */
+    return v_int((long)len * 16);
+}

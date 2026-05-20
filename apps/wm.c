@@ -343,6 +343,7 @@ static void draw_string(int x, int y, const char *s, unsigned short fg)
 }
 
 void draw_string_pub(int x, int y, const char *s, unsigned short c) { draw_string(x, y, s, c); }
+void draw_char_pub(int x, int y, char c, unsigned short fg) { draw_char(x, y, c, fg); }
 
 #define CHAR_W (8 * FONT_SCALE)
 #define CHAR_H (8 * FONT_SCALE)
