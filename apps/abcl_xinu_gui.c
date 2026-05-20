@@ -887,3 +887,221 @@ void abcl_xinu_gui_tick_all(void)
         abcl_enqueue(-1, g_tickers[i], "tick", 0, NULL);
     }
 }
+
+/* ============================================================
+ *  G1: framebuffer drawing primitives (callable from AIPL).
+ *
+ *  AIPL externs (all return v_int(1) on success, v_int(0) on bad arg):
+ *    fb_pixel(x, y, color24)
+ *    fb_line(x0, y0, x1, y1, color24)
+ *    fb_circle(cx, cy, r, color24)
+ *    fb_triangle(x0, y0, x1, y1, x2, y2, color24)
+ *    fb_rrect(x, y, w, h, radius, color24)
+ *    fb_dashed_line(x0, y0, x1, y1, color24, dash)
+ *    fb_set_aa(0|1)     -> returns new AA flag
+ *    fb_get_aa()        -> returns current AA flag
+ *
+ *  Color: a single AIPL int packed as 0xRRGGBB.  Quantized to PL110's
+ *  BGR565 layout on the actual framebuffer write.  Serial trace
+ *  carries the full 24-bit value so smokes can verify.
+ *
+ *  AA: a per-runtime flag.  When AA=1 the line drawer also paints a
+ *  1-pixel parallel feather in a 50%-intensity copy of the colour.
+ *  This is not full Wu anti-aliasing (PL110 has no alpha blending),
+ *  but it is observably softer than the crisp Bresenham fallback and
+ *  proves the toggle is wired end-to-end.
+ * ============================================================ */
+/* kprintf is declared by kernel.h (syscall = int) — don't re-declare. */
+
+static int g_fb_aa = 0;
+
+static unsigned short rgb565_from24(long c24) {
+    return rgb565((int)((c24 >> 16) & 0xFF),
+                  (int)((c24 >>  8) & 0xFF),
+                  (int)( c24        & 0xFF));
+}
+
+static unsigned short rgb565_dim50(long c24) {
+    return rgb565((int)(((c24 >> 16) & 0xFF) >> 1),
+                  (int)(((c24 >>  8) & 0xFF) >> 1),
+                  (int)(( c24        & 0xFF) >> 1));
+}
+
+static void fb_line_internal(int x0, int y0, int x1, int y1, long c24) {
+    draw_line(x0, y0, x1, y1, rgb565_from24(c24));
+    if (g_fb_aa) {
+        unsigned short cd = rgb565_dim50(c24);
+        draw_line(x0,     y0 + 1, x1,     y1 + 1, cd);
+        draw_line(x0 + 1, y0,     x1 + 1, y1,     cd);
+    }
+}
+
+value_t fb_pixel(int n, value_t *a) {
+    int x, y; long c24;
+    if (n < 3) return v_int(0);
+    x   = (int)a[0].i;
+    y   = (int)a[1].i;
+    c24 = a[2].i;
+    put_pixel_pub(x, y, rgb565_from24(c24));
+    kprintf("[aipl] fb_pixel x=%d y=%d color=0x%06x\r\n",
+            x, y, (unsigned)(c24 & 0xFFFFFFu));
+    return v_int(1);
+}
+
+value_t fb_line(int n, value_t *a) {
+    int x0, y0, x1, y1; long c24;
+    if (n < 5) return v_int(0);
+    x0  = (int)a[0].i; y0 = (int)a[1].i;
+    x1  = (int)a[2].i; y1 = (int)a[3].i;
+    c24 = a[4].i;
+    fb_line_internal(x0, y0, x1, y1, c24);
+    kprintf("[aipl] fb_line x0=%d y0=%d x1=%d y1=%d color=0x%06x aa=%d\r\n",
+            x0, y0, x1, y1, (unsigned)(c24 & 0xFFFFFFu), g_fb_aa);
+    return v_int(1);
+}
+
+value_t fb_circle(int n, value_t *a) {
+    int cx, cy, r;
+    long c24;
+    unsigned short c;
+    int x, y, err;
+    if (n < 4) return v_int(0);
+    cx  = (int)a[0].i; cy = (int)a[1].i; r = (int)a[2].i;
+    c24 = a[3].i;
+    c   = rgb565_from24(c24);
+    /* Midpoint circle algorithm — paint all 8 octants. */
+    x = r; y = 0; err = 1 - r;
+    while (x >= y) {
+        put_pixel_pub(cx + x, cy + y, c);
+        put_pixel_pub(cx + y, cy + x, c);
+        put_pixel_pub(cx - y, cy + x, c);
+        put_pixel_pub(cx - x, cy + y, c);
+        put_pixel_pub(cx - x, cy - y, c);
+        put_pixel_pub(cx - y, cy - x, c);
+        put_pixel_pub(cx + y, cy - x, c);
+        put_pixel_pub(cx + x, cy - y, c);
+        if (g_fb_aa) {
+            unsigned short cd = rgb565_dim50(c24);
+            put_pixel_pub(cx + x + 1, cy + y,     cd);
+            put_pixel_pub(cx + y,     cy + x + 1, cd);
+            put_pixel_pub(cx - y,     cy + x + 1, cd);
+            put_pixel_pub(cx - x - 1, cy + y,     cd);
+            put_pixel_pub(cx - x - 1, cy - y,     cd);
+            put_pixel_pub(cx - y,     cy - x - 1, cd);
+            put_pixel_pub(cx + y,     cy - x - 1, cd);
+            put_pixel_pub(cx + x + 1, cy - y,     cd);
+        }
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+    kprintf("[aipl] fb_circle cx=%d cy=%d r=%d color=0x%06x aa=%d\r\n",
+            cx, cy, r, (unsigned)(c24 & 0xFFFFFFu), g_fb_aa);
+    return v_int(1);
+}
+
+value_t fb_triangle(int n, value_t *a) {
+    int x0, y0, x1, y1, x2, y2;
+    long c24;
+    if (n < 7) return v_int(0);
+    x0 = (int)a[0].i; y0 = (int)a[1].i;
+    x1 = (int)a[2].i; y1 = (int)a[3].i;
+    x2 = (int)a[4].i; y2 = (int)a[5].i;
+    c24 = a[6].i;
+    fb_line_internal(x0, y0, x1, y1, c24);
+    fb_line_internal(x1, y1, x2, y2, c24);
+    fb_line_internal(x2, y2, x0, y0, c24);
+    kprintf("[aipl] fb_triangle p0=(%d,%d) p1=(%d,%d) p2=(%d,%d) "
+            "color=0x%06x aa=%d\r\n",
+            x0, y0, x1, y1, x2, y2,
+            (unsigned)(c24 & 0xFFFFFFu), g_fb_aa);
+    return v_int(1);
+}
+
+value_t fb_rrect(int n, value_t *a) {
+    int x, y, w, h, r;
+    long c24;
+    unsigned short c;
+    int px, py, err;
+    if (n < 6) return v_int(0);
+    x = (int)a[0].i; y = (int)a[1].i;
+    w = (int)a[2].i; h = (int)a[3].i;
+    r = (int)a[4].i;
+    c24 = a[5].i;
+    if (r < 0)       r = 0;
+    if (r > w / 2)   r = w / 2;
+    if (r > h / 2)   r = h / 2;
+    /* Four straight edges. */
+    fb_line_internal(x + r,     y,           x + w - r - 1, y,             c24);
+    fb_line_internal(x + r,     y + h - 1,   x + w - r - 1, y + h - 1,     c24);
+    fb_line_internal(x,         y + r,       x,             y + h - r - 1, c24);
+    fb_line_internal(x + w - 1, y + r,       x + w - 1,     y + h - r - 1, c24);
+    /* Four corner arcs via midpoint quarter-circle. */
+    c = rgb565_from24(c24);
+    px = r; py = 0; err = 1 - r;
+    while (px >= py) {
+        /* top-right corner (origin cx=x+w-1-r, cy=y+r) */
+        put_pixel_pub(x + w - 1 - r + px, y + r - py,             c);
+        put_pixel_pub(x + w - 1 - r + py, y + r - px,             c);
+        /* top-left  (origin cx=x+r, cy=y+r) */
+        put_pixel_pub(x + r - px,         y + r - py,             c);
+        put_pixel_pub(x + r - py,         y + r - px,             c);
+        /* bottom-right (origin cx=x+w-1-r, cy=y+h-1-r) */
+        put_pixel_pub(x + w - 1 - r + px, y + h - 1 - r + py,     c);
+        put_pixel_pub(x + w - 1 - r + py, y + h - 1 - r + px,     c);
+        /* bottom-left  (origin cx=x+r, cy=y+h-1-r) */
+        put_pixel_pub(x + r - px,         y + h - 1 - r + py,     c);
+        put_pixel_pub(x + r - py,         y + h - 1 - r + px,     c);
+        py++;
+        if (err < 0) err += 2 * py + 1;
+        else { px--; err += 2 * (py - px) + 1; }
+    }
+    kprintf("[aipl] fb_rrect x=%d y=%d w=%d h=%d r=%d color=0x%06x aa=%d\r\n",
+            x, y, w, h, r, (unsigned)(c24 & 0xFFFFFFu), g_fb_aa);
+    return v_int(1);
+}
+
+value_t fb_dashed_line(int n, value_t *a) {
+    int x0, y0, x1, y1;
+    long c24;
+    int dash;
+    unsigned short c;
+    int dx, dy, sx, sy, err, e2, step;
+    if (n < 6) return v_int(0);
+    x0 = (int)a[0].i; y0 = (int)a[1].i;
+    x1 = (int)a[2].i; y1 = (int)a[3].i;
+    c24 = a[4].i;
+    dash = (int)a[5].i;
+    if (dash < 1) dash = 4;
+    c  = rgb565_from24(c24);
+    dx =  (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    dy = -((y1 > y0) ? (y1 - y0) : (y0 - y1));
+    sx = (x0 < x1) ? 1 : -1;
+    sy = (y0 < y1) ? 1 : -1;
+    err = dx + dy; step = 0;
+    for (;;) {
+        if ((step / dash) % 2 == 0) put_pixel_pub(x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+        step++;
+    }
+    kprintf("[aipl] fb_dashed_line color=0x%06x dash=%d\r\n",
+            (unsigned)(c24 & 0xFFFFFFu), dash);
+    return v_int(1);
+}
+
+value_t fb_set_aa(int n, value_t *a) {
+    int on;
+    if (n < 1) return v_int(g_fb_aa);
+    on = a[0].i ? 1 : 0;
+    g_fb_aa = on;
+    kprintf("[aipl] fb_aa=%d\r\n", g_fb_aa);
+    return v_int(g_fb_aa);
+}
+
+value_t fb_get_aa(int n, value_t *a) {
+    (void)n; (void)a;
+    return v_int(g_fb_aa);
+}
