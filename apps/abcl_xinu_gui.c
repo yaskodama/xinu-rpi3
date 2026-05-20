@@ -1673,3 +1673,130 @@ value_t checkpoint_clear(int n, value_t *a) {
     kprintf("[aipl] chkpt op=clear count=%d\r\n", cleared);
     return v_int(cleared);
 }
+
+/* ============================================================
+ *  F2: Last-Writer-Wins cell semantics.
+ *
+ *  Direct port of the browser-abcl spreadsheet's LWW store.  Cells
+ *  are keyed by an int; each cell carries (value, ts).  A write
+ *  commits iff its `ts` is strictly greater than the stored ts; ties
+ *  are rejected.  This matches the spreadsheet's convergence
+ *  guarantee — independent writers eventually agree on the cell with
+ *  the highest ts.
+ *
+ *  AIPL externs:
+ *    lww_write(key, value, ts)   -> 1 accepted / 0 rejected (older)
+ *    lww_read(key)               -> value (0 if absent)
+ *    lww_ts(key)                 -> ts (0 if absent)
+ *    lww_size()                  -> live cell count
+ *    lww_clear()                 -> cleared cell count
+ *    lww_tick()                  -> next Lamport tick (monotonic)
+ *
+ *  Serial marker: `[aipl] lww op=write|reject|clear key=K value=V ts=T`
+ *  — only the writes log; reads stay quiet so the trace remains
+ *  legible at high throughput.
+ * ============================================================ */
+#define MAX_LWW_CELLS 32
+
+typedef struct {
+    int   valid;
+    int   key;
+    long  value;
+    long  ts;
+} lww_cell_t;
+
+static lww_cell_t g_lww[MAX_LWW_CELLS];
+static long       g_lamport = 0;
+
+static int lww_find(int key) {
+    int i;
+    for (i = 0; i < MAX_LWW_CELLS; i++) {
+        if (g_lww[i].valid && g_lww[i].key == key) return i;
+    }
+    return -1;
+}
+
+static int lww_alloc(int key) {
+    int existing = lww_find(key);
+    int i;
+    if (existing >= 0) return existing;
+    for (i = 0; i < MAX_LWW_CELLS; i++) {
+        if (!g_lww[i].valid) return i;
+    }
+    return -1;
+}
+
+value_t lww_write(int n, value_t *a) {
+    int key, slot;
+    long value, ts;
+    if (n < 3) return v_int(0);
+    key   = (int)a[0].i;
+    value = a[1].i;
+    ts    = a[2].i;
+    slot  = lww_find(key);
+    if (slot >= 0 && ts <= g_lww[slot].ts) {
+        kprintf("[aipl] lww op=reject key=%d value=%ld ts=%ld "
+                "stored_ts=%ld\r\n",
+                key, value, ts, g_lww[slot].ts);
+        return v_int(0);
+    }
+    if (slot < 0) {
+        slot = lww_alloc(key);
+        if (slot < 0) {
+            kprintf("[aipl] lww op=reject key=%d ts=%ld status=table-full\r\n",
+                    key, ts);
+            return v_int(0);
+        }
+    }
+    g_lww[slot].valid = 1;
+    g_lww[slot].key   = key;
+    g_lww[slot].value = value;
+    g_lww[slot].ts    = ts;
+    /* Advance the global Lamport clock to the highest observed ts so a
+       subsequent lww_tick() never collides with this writer. */
+    if (ts > g_lamport) g_lamport = ts;
+    kprintf("[aipl] lww op=write key=%d value=%ld ts=%ld slot=%d\r\n",
+            key, value, ts, slot);
+    return v_int(1);
+}
+
+value_t lww_read(int n, value_t *a) {
+    int key, slot;
+    if (n < 1) return v_int(0);
+    key  = (int)a[0].i;
+    slot = lww_find(key);
+    if (slot < 0) return v_int(0);
+    return v_int(g_lww[slot].value);
+}
+
+value_t lww_ts(int n, value_t *a) {
+    int key, slot;
+    if (n < 1) return v_int(0);
+    key  = (int)a[0].i;
+    slot = lww_find(key);
+    if (slot < 0) return v_int(0);
+    return v_int(g_lww[slot].ts);
+}
+
+value_t lww_size(int n, value_t *a) {
+    int i, count = 0;
+    (void)n; (void)a;
+    for (i = 0; i < MAX_LWW_CELLS; i++) if (g_lww[i].valid) count++;
+    return v_int(count);
+}
+
+value_t lww_clear(int n, value_t *a) {
+    int i, cleared = 0;
+    (void)n; (void)a;
+    for (i = 0; i < MAX_LWW_CELLS; i++) {
+        if (g_lww[i].valid) { g_lww[i].valid = 0; cleared++; }
+    }
+    kprintf("[aipl] lww op=clear count=%d\r\n", cleared);
+    return v_int(cleared);
+}
+
+value_t lww_tick(int n, value_t *a) {
+    (void)n; (void)a;
+    g_lamport = g_lamport + 1;
+    return v_int(g_lamport);
+}
