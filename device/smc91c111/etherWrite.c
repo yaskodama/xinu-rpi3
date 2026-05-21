@@ -148,8 +148,16 @@ devcall etherWrite(device *devptr, const void *buf, uint len)
         ulong vic_irq_status = *((volatile ulong *)0x10140000);
         ulong vic_rawintr    = *((volatile ulong *)0x10140008);
         ulong vic_enable     = *((volatile ulong *)0x10140010);
+        /* TX completion never signalled — the packet is stuck in
+         * the chip's TX FIFO and AUTO_RELEASE will not free its
+         * page.  Without explicit recovery, the next allocation
+         * eventually fails or the chip state goes into a state
+         * that triggers an unrelated kernel fault.  MMU_RESET_TX
+         * wipes the entire TX FIFO and frees every TX page; we
+         * lose this packet but keep the chip usable. */
+        smc_write16(chip, SMC_MMU_CMD, MMU_RESET_TX);
         kprintf("[smc91c111] tx never done int=0x%04x "
-                "vic_status=0x%08x raw=0x%08x enable=0x%08x\r\n",
+                "vic_status=0x%08x raw=0x%08x enable=0x%08x (MMU_RESET_TX recovered)\r\n",
                 smc_read16(chip, SMC_INT),
                 (uint)vic_irq_status,
                 (uint)vic_rawintr,
