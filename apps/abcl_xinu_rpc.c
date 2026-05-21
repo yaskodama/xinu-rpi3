@@ -524,16 +524,30 @@ static void handle_spawn(char *toks[], int n_toks)
         return;
     }
 
+    /* Arg syntax:
+     *   <decimal>       → V_INT  (e.g. "4"      → V_INT 4)
+     *   ref:<decimal>   → V_OBJ  (e.g. "ref:2"  → V_OBJ obj_id=2)
+     * The V_OBJ form is what classes whose init() expects an actor
+     * reference (Fork, Mailbox, etc) need — passing V_INT in those
+     * slots is silently dropped by the actor dispatcher, which lets
+     * Philosopher.try_eat spin forever on a `send f_low.acquire(...)`
+     * that never reaches the target Fork. */
     for (i = 2; i < n_toks && n_init < 8; i++) {
-        if (!parse_decimal(toks[i], &a)) {
+        char *tok = toks[i];
+        int is_ref = 0;
+        if (tok[0] == 'r' && tok[1] == 'e' && tok[2] == 'f' && tok[3] == ':') {
+            is_ref = 1;
+            tok = tok + 4;
+        }
+        if (!parse_decimal(tok, &a)) {
             send_err("bad arg");
             return;
         }
-        init_args[n_init].tag    = V_INT;
-        init_args[n_init].i      = a;
+        init_args[n_init].tag    = is_ref ? V_OBJ : V_INT;
+        init_args[n_init].i      = is_ref ? 0 : a;
         init_args[n_init].f      = 0;
         init_args[n_init].s      = 0;
-        init_args[n_init].obj_id = 0;
+        init_args[n_init].obj_id = is_ref ? (int)a : 0;
         n_init++;
     }
 
