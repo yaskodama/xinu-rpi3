@@ -42,4 +42,7 @@ exec qemu-system-arm \
     -M versatilepb -cpu arm1176 -m "$MEM" \
     -kernel xinu.boot \
     -display cocoa,zoom-to-fit=on,zoom-interpolation=on \
+    -semihosting \
+    -net nic,model=smc91c111,macaddr=52:54:00:12:34:56 \
+    -net user,net=10.0.2.0/24,host=10.0.2.2 \
     -serial mon:stdio
