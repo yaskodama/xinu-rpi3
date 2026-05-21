@@ -34,8 +34,10 @@ devcall tcpRead(device *devptr, void *buf, uint len)
     check = stateCheck(tcbptr);
     if (check != OK)
     {
+        /* stateCheck already released the mutex on error.  If we got
+         * here without any buffered bytes, this is the initial state —
+         * just propagate SYSERR. */
         return SYSERR;
-//        return check; 
     }
 
     signal(tcbptr->mutex);
@@ -47,12 +49,20 @@ devcall tcpRead(device *devptr, void *buf, uint len)
         wait(tcbptr->readers);
         wait(tcbptr->mutex);
 
-        /* Return if changed to a state where no data will ever be recvd */
+        /* Return if changed to a state where no data will ever be recvd.
+         * If we have already drained some bytes into `buf` though, give
+         * them to the caller now instead of discarding count as SYSERR —
+         * that is what the typical socket-recv contract expects: a peer
+         * close after a partial read returns the count, EOF (=0) only
+         * on a clean close before any data, and -1 only on real error.*/
         check = stateCheck(tcbptr);
         if (check != OK)
         {
+            if (count > 0)
+            {
+                return count;
+            }
             return SYSERR;
-//            return check; 
         }
 
         /* Read as much as possible from the input buffer 
