@@ -29,6 +29,7 @@ SECTIONS {
 
     . = ALIGN(64);
 
+    _stext = .;     /* Sec3 — start of hashed text+rodata range */
     .text : {
         *(.text .text.*)
         *(.rodata .rodata.*)

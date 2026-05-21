@@ -70,6 +70,14 @@ void nulluser(void)
     /* Platform-specific initialization  */
     platforminit();
 
+    /* Sec3 MeasuredBoot — log a fingerprint of the kernel text+rodata
+     * range before anything else runs.  Pure observation here; future
+     * work will refuse to continue boot on mismatch. */
+    {
+        extern void measured_boot_print(void);
+        measured_boot_print();
+    }
+
     /* General initialization  */
     sysinit();
 
