@@ -1800,3 +1800,39 @@ value_t lww_tick(int n, value_t *a) {
     g_lamport = g_lamport + 1;
     return v_int(g_lamport);
 }
+
+/* ============================================================
+ *  S3 DeadlineHints — AIPL surface for the kernel-side
+ *  setdeadline() syscall (system/setdeadline.c).
+ *
+ *  Usage from AIPL:
+ *      set_deadline(actor_ref, ms)
+ *  where actor_ref is a TAny (typically `self` or `var x = new C()`)
+ *  and ms is the relative deadline in milliseconds (= clock ticks,
+ *  since CLKTICKS_PER_SEC=1000).
+ *
+ *  Returns 1 on success, 0 if the obj_id has no live tid, -1 on
+ *  malformed args.  After dispatch the kernel auto-clears the
+ *  deadline; call set_deadline again before the next urgent slice.
+ * ============================================================ */
+extern int abcl_object_tid(int obj_id);
+extern int setdeadline(int tid, int ticks_from_now);
+
+value_t set_deadline(int n, value_t *a) {
+    int obj_id;
+    int ticks;
+    int tid;
+    int rc;
+    if (n < 2) return v_int(-1);
+    obj_id = (a[0].tag == V_OBJ) ? a[0].obj_id : (int)a[0].i;
+    ticks  = (int)a[1].i;
+    tid    = abcl_object_tid(obj_id);
+    if (tid < 0) {
+        kprintf("[aipl] set_deadline bad obj_id=%d\r\n", obj_id);
+        return v_int(0);
+    }
+    rc = setdeadline((tid_typ)tid, ticks);
+    kprintf("[aipl] set_deadline obj=%d tid=%d ms=%d rc=%d\r\n",
+            obj_id, tid, ticks, rc);
+    return v_int(rc == OK ? 1 : 0);
+}
