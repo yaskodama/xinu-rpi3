@@ -348,6 +348,151 @@ static void handle_ping(void)
 }
 
 /* ============================================================
+ *  LOAD / COMPILE / RUN — dynamic compilation pipeline.
+ *
+ *  Three commands let a host PC ship an AIPL source string to
+ *  Xinu and exercise the in-kernel toolchain end-to-end:
+ *
+ *      LOAD  <name> <byte_count>\n<bytes...>
+ *                  Read byte_count bytes from the UART1 RX stream
+ *                  (no further LF needed in the body) and write
+ *                  them to /home/<name>.abcl in the in-Xinu XFS.
+ *      COMPILE <name>
+ *                  Call abclcTranslate("/home/<name>.abcl",
+ *                                      "/home/<name>.c"), then
+ *                  ccCompile("/home/<name>.c", "/home/<name>")
+ *                  producing the bytecode a.out.
+ *      RUN  <name>
+ *                  Invoke aoutRun("/home/<name>") so the simple
+ *                  sequential VM (system/aout.c) executes the
+ *                  bytecode.  Output reaches UART0 via kprintf.
+ *
+ *  Note: the in-kernel VM is a stack-based sequential interpreter
+ *  (PUSH/ADD/PRINT/etc) — it does NOT support classes, actors,
+ *  or message sends.  AIPL ACTORS still live in the pre-compiled
+ *  kernel image; this dynamic path is for arithmetic / loop /
+ *  print snippets only.
+ * ============================================================ */
+extern int abclcTranslate(const char *src_path, const char *out_path);
+extern int ccCompile(const char *src_path, const char *out_path);
+extern int aoutRun(const char *path);
+
+#define XFS_O_RDWR   0x0003
+#define XFS_O_CREAT  0x0010
+#define XFS_O_TRUNC  0x0020
+extern int xfsOpen (const char *path, int flags);
+extern int xfsClose(int fd);
+extern int xfsWrite(int fd, const void *buf, unsigned int count);
+
+/* Read exactly `n` bytes from UART1 (no framing assumed).  Returns
+ * the actual count read; will block until n bytes have arrived. */
+static int uart1_read_exact(char *buf, int n)
+{
+    int i = 0;
+    while (i < n) {
+        int c = uart1_getc();
+        if (c < 0) continue;
+        buf[i++] = (char)c;
+    }
+    return i;
+}
+
+#define MAX_DYN_NAME    24
+#define MAX_DYN_SOURCE  4096
+
+static char g_dyn_buf[MAX_DYN_SOURCE];
+
+/* Concatenate "/home/" + name + ".abcl" / ".c" / "" (binary) into out. */
+static void dyn_path(char *out, int cap, const char *name, const char *ext)
+{
+    int p = 0;
+    const char *prefix = "/home/";
+    while (prefix[0] && p + 1 < cap) out[p++] = *prefix++;
+    while (*name && p + 1 < cap) out[p++] = *name++;
+    while (*ext  && p + 1 < cap) out[p++] = *ext++;
+    out[p] = '\0';
+}
+
+static void handle_load(char *toks[], int n_toks)
+{
+    long len_l;
+    int  len;
+    char path[64];
+    int  fd, wr;
+    char buf[64];
+    int  pos = 0;
+
+    if (n_toks < 3) { send_err("load needs name and length"); return; }
+    if (!parse_decimal(toks[2], &len_l)) { send_err("bad length"); return; }
+    len = (int)len_l;
+    if (len < 0 || len > MAX_DYN_SOURCE) { send_err("length out of range"); return; }
+
+    /* Pull exactly `len` raw bytes off the UART (no LF framing here). */
+    if (len > 0) uart1_read_exact(g_dyn_buf, len);
+    g_dyn_buf[len < MAX_DYN_SOURCE ? len : MAX_DYN_SOURCE - 1] = '\0';
+
+    dyn_path(path, sizeof path, toks[1], ".abcl");
+    fd = xfsOpen(path, XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+    if (fd < 0) { send_err("xfs open failed"); return; }
+    wr = xfsWrite(fd, g_dyn_buf, (unsigned)len);
+    xfsClose(fd);
+    if (wr != len) { send_err("xfs write short"); return; }
+
+    pos = append_str(buf, pos, sizeof buf, "loaded path=");
+    pos = append_str(buf, pos, sizeof buf, path);
+    pos = append_str(buf, pos, sizeof buf, " bytes=");
+    pos = append_int(buf, pos, sizeof buf, wr);
+    buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
+    send_ok(buf);
+    kprintf("[rpc] LOAD path=%s bytes=%d\r\n", path, wr);
+}
+
+static void handle_compile(char *toks[], int n_toks)
+{
+    char src_abcl[64], src_c[64], out_path[64];
+    int  rc1, rc2;
+    char buf[64];
+    int  pos = 0;
+
+    if (n_toks < 2) { send_err("compile needs name"); return; }
+    dyn_path(src_abcl, sizeof src_abcl, toks[1], ".abcl");
+    dyn_path(src_c,    sizeof src_c,    toks[1], ".c");
+    dyn_path(out_path, sizeof out_path, toks[1], "");
+
+    rc1 = abclcTranslate(src_abcl, src_c);
+    if (rc1 != OK) { send_err("abclc failed"); return; }
+    rc2 = ccCompile(src_c, out_path);
+    if (rc2 != OK) { send_err("cc failed"); return; }
+
+    pos = append_str(buf, pos, sizeof buf, "compiled out=");
+    pos = append_str(buf, pos, sizeof buf, out_path);
+    buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
+    send_ok(buf);
+    kprintf("[rpc] COMPILE %s -> %s\r\n", toks[1], out_path);
+}
+
+static void handle_run(char *toks[], int n_toks)
+{
+    char path[64];
+    int  rc;
+    char buf[64];
+    int  pos = 0;
+
+    if (n_toks < 2) { send_err("run needs name"); return; }
+    dyn_path(path, sizeof path, toks[1], "");
+    rc = aoutRun(path);
+    pos = append_str(buf, pos, sizeof buf, "ran rc=");
+    pos = append_int(buf, pos, sizeof buf, rc);
+    buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
+    if (rc == SYSERR) {
+        send_err("aoutRun returned SYSERR");
+    } else {
+        send_ok(buf);
+    }
+    kprintf("[rpc] RUN %s rc=%d\r\n", path, rc);
+}
+
+/* ============================================================
  *  Dispatcher thread main loop.
  * ============================================================ */
 
@@ -377,6 +522,12 @@ thread rpc_dispatcher_main(void)
             handle_query(toks, n_toks);
         } else if (str_eq_short(toks[0], "LIST")) {
             handle_list();
+        } else if (str_eq_short(toks[0], "LOAD")) {
+            handle_load(toks, n_toks);
+        } else if (str_eq_short(toks[0], "COMPILE")) {
+            handle_compile(toks, n_toks);
+        } else if (str_eq_short(toks[0], "RUN")) {
+            handle_run(toks, n_toks);
         } else {
             send_err("unknown opcode");
             kprintf("[rpc] unknown op=%s\r\n", toks[0]);
