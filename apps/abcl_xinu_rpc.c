@@ -393,6 +393,13 @@ extern int abclcTranslate(const char *src_path, const char *out_path);
 extern int ccCompile(const char *src_path, const char *out_path);
 extern int aoutRun(const char *path);
 
+/* Exposed by c_translator.ml::gen_program_xinu so the SPAWN RPC can
+ * instantiate pre-linked AIPL classes by their string name and start
+ * the actor thread.  Returns the new actor id (= obj_id), or SYSERR
+ * on alloc/spawn failure. */
+extern int  abcl_lookup_class_id(const char *name);
+extern int  create_obj(int class_id, int n_args, value_t *args);
+
 #define XFS_O_RDWR   0x0003
 #define XFS_O_CREAT  0x0010
 #define XFS_O_TRUNC  0x0020
@@ -487,6 +494,62 @@ static void handle_compile(char *toks[], int n_toks)
     kprintf("[rpc] COMPILE %s -> %s\r\n", toks[1], out_path);
 }
 
+/* SPAWN <ClassName> [decimal_arg1 decimal_arg2 ...]
+ *
+ * Instantiate a pre-linked AIPL class by name (e.g. "Fork",
+ * "Philosopher") and start its actor thread.  Reply:
+ *   OK actor_id=<N>      on success
+ *   ERR ...              on failure (unknown class, alloc fail)
+ *
+ * Args are passed as integer value_t's to the class's init() method,
+ * matching the pre-existing create_obj contract used at AIPL_AUTOSTART.
+ */
+static void handle_spawn(char *toks[], int n_toks)
+{
+    int class_id;
+    int new_id;
+    value_t init_args[8];
+    int n_init = 0;
+    long a;
+    int i;
+    char buf[32];
+    int pos;
+
+    if (n_toks < 2) { send_err("spawn needs class name"); return; }
+
+    class_id = abcl_lookup_class_id(toks[1]);
+    if (class_id < 0) {
+        send_err("unknown class");
+        kprintf("[rpc] SPAWN unknown class=%s\r\n", toks[1]);
+        return;
+    }
+
+    for (i = 2; i < n_toks && n_init < 8; i++) {
+        if (!parse_decimal(toks[i], &a)) {
+            send_err("bad arg");
+            return;
+        }
+        init_args[n_init].tag    = V_INT;
+        init_args[n_init].i      = a;
+        init_args[n_init].f      = 0;
+        init_args[n_init].s      = 0;
+        init_args[n_init].obj_id = 0;
+        n_init++;
+    }
+
+    new_id = create_obj(class_id, n_init, init_args);
+    if (new_id < 0) {
+        send_err("create_obj failed");
+        return;
+    }
+    pos = append_str(buf, 0, sizeof buf, "actor_id=");
+    pos = append_int(buf, pos, sizeof buf, new_id);
+    buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
+    send_ok(buf);
+    kprintf("[rpc] SPAWN class=%s id=%d args=%d\r\n",
+            toks[1], new_id, n_init);
+}
+
 static void handle_run(char *toks[], int n_toks)
 {
     char path[64];
@@ -544,6 +607,8 @@ thread rpc_dispatcher_main(void)
             handle_compile(toks, n_toks);
         } else if (str_eq_short(toks[0], "RUN")) {
             handle_run(toks, n_toks);
+        } else if (str_eq_short(toks[0], "SPAWN")) {
+            handle_spawn(toks, n_toks);
         } else {
             send_err("unknown opcode");
             kprintf("[rpc] unknown op=%s\r\n", toks[0]);
