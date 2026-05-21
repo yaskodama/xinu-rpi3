@@ -79,12 +79,19 @@ void nulluser(void)
     /* Spawn the main thread  */
     ready(create(main, INITSTK, INITPRIO, "MAIN", 0), RESCHED_YES);
 
-    /* null thread has nothing else to do but cannot exit  */
+    /* null thread has nothing else to do but cannot exit.
+     * S4 (Xinu_KernelEvolution Round 1): the historic `#ifndef DEBUG`
+     * guard around pause() (= ARM `wfi`) was a foot-gun — any debug
+     * build, or a Makefile that piped a -D flag through the DEBUG
+     * variable, would silently turn the idle loop into a hot spin.
+     * The idle thread does NO useful work, so wfi is always correct;
+     * any pending interrupt (clock tick at minimum) wakes the CPU.
+     * Drops the QEMU host process from ~100% CPU to single digits and
+     * is a prerequisite for power-aware scheduling on real Raspberry
+     * Pi hardware. */
     while (TRUE)
     {
-#ifndef DEBUG
         pause();
-#endif                          /* DEBUG */
     }
 }
 
