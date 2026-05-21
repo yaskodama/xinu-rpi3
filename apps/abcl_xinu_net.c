@@ -56,10 +56,46 @@ static value_t v_int(long n)
     return v;
 }
 
-static int           g_net_up = 0;
-static struct netaddr g_local_ip;
+int           g_net_up = 0;
+struct netaddr g_local_ip;
 static struct netaddr g_local_mask;
 static struct netaddr g_gateway;
+
+/* ---------- abcl_net_autoinit — kernel-side helper -------------------
+ *
+ * Same effect as the AIPL net_init() builtin but callable from C boot
+ * code (system/main.c) so the HTTP listener can come up regardless of
+ * whether the AIPL program calls net_init itself. */
+int abcl_net_autoinit(void)
+{
+    struct netaddr ip, mask, gw;
+    if (g_net_up) {
+        return 1;
+    }
+#ifdef ETH0
+    if (SYSERR == dot2ipv4("10.0.2.15",    &ip)
+     || SYSERR == dot2ipv4("255.255.255.0", &mask)
+     || SYSERR == dot2ipv4("10.0.2.2",      &gw))
+    {
+        kprintf("[abcl_net] autoinit dot2ipv4 failed\r\n");
+        return 0;
+    }
+    if (OK != netUp(ETH0, &ip, &mask, &gw)) {
+        kprintf("[abcl_net] autoinit netUp failed\r\n");
+        return 0;
+    }
+    g_local_ip   = ip;
+    g_local_mask = mask;
+    g_gateway    = gw;
+    g_net_up     = 1;
+    kprintf("[abcl_net] autoinit ok ip=%d.%d.%d.%d gw=%d.%d.%d.%d\r\n",
+            ip.addr[0], ip.addr[1], ip.addr[2], ip.addr[3],
+            gw.addr[0], gw.addr[1], gw.addr[2], gw.addr[3]);
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 /* ---------- net_init ---------- */
 

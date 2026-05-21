@@ -279,6 +279,16 @@ thread main(void)
             extern void abcl_rpc_start(void);
             abcl_rpc_start();
         }
+        /* Auto-start Xinu-side HTTP dashboard on port 80.  We first
+         * bring up the NIC ourselves (kernel-side helper that doesn't
+         * need the AIPL program to call net_init), then spawn the
+         * listener thread. */
+        {
+            extern int  abcl_net_autoinit(void);
+            extern int  abcl_http_start(int port);
+            abcl_net_autoinit();
+            abcl_http_start(80);
+        }
     }
 #endif
 

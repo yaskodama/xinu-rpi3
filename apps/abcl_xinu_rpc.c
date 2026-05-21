@@ -46,6 +46,7 @@ extern void abcl_enqueue(int sender, int receiver, const char *method,
                          int n_args, value_t *args);
 extern int  abcl_n_objects(void);
 extern int  abcl_object_class_id(int obj_id);
+extern const char* abcl_class_name(int class_id);
 extern int  abcl_object_field_get(int obj_id, int field_idx, value_t *out);
 
 /* ============================================================
@@ -334,11 +335,26 @@ static void handle_list(void)
 {
     char buf[32];
     int  pos = 0;
+    int  n   = abcl_n_objects();
+    int  i;
     pos = append_str(buf, pos, sizeof buf, "n_actors=");
-    pos = append_int(buf, pos, sizeof buf, abcl_n_objects());
+    pos = append_int(buf, pos, sizeof buf, n);
     buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
     send_ok(buf);
-    kprintf("[rpc] LIST n=%d\r\n", abcl_n_objects());
+    /* Per-actor lines: "<id> <class_name>\r\n" so host clients can
+     * resolve obj_id → class without a separate QUERY round-trip. */
+    for (i = 0; i < n; i++) {
+        char line[40];
+        int  lp = 0;
+        const char *cname = abcl_class_name(abcl_object_class_id(i));
+        lp = append_int(line, lp, sizeof line, i);
+        lp = append_str(line, lp, sizeof line, " ");
+        lp = append_str(line, lp, sizeof line, cname ? cname : "?");
+        line[lp < (int)sizeof(line) ? lp : (int)sizeof(line) - 1] = '\0';
+        uart1_puts(line);
+        uart1_puts("\r\n");
+    }
+    kprintf("[rpc] LIST n=%d\r\n", n);
 }
 
 static void handle_ping(void)
