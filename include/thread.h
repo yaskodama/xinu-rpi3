@@ -77,6 +77,10 @@ struct thrent
     int basepri;                /**< thread priority (base, set at
                                      create — S1 aging snaps back to
                                      this when the thread is selected) */
+    unsigned long deadline_at;  /**< S3: absolute clkticks deadline.
+                                     0 = no deadline; otherwise the
+                                     thread is dispatched ahead of
+                                     priority order if still in time. */
     void *stkptr;               /**< saved stack pointer                */
     void *stkbase;              /**< base of run time stack             */
     ulong stklen;               /**< stack length in bytes              */
@@ -106,6 +110,9 @@ tid_typ create(void *procaddr, uint ssize, int priority,
                const char *name, int nargs, ...);
 tid_typ gettid(void);
 syscall getprio(tid_typ);
+/* S3 DeadlineHints */
+int setdeadline(tid_typ tid, int ticks_from_now);
+int cleardeadline(tid_typ tid);
 syscall kill(int);
 int ready(tid_typ, bool);
 int resched(void);

@@ -10,7 +10,32 @@
 #include <memory.h>
 
 extern void ctxsw(void *, void *, uchar);
+extern tid_typ getitem(tid_typ);
 int resdefer;                   /* >0 if rescheduling deferred */
+
+/* S3 DeadlineHints: scan thrtab for the THRREADY thread with the
+ * soonest still-in-time deadline.  Returns the tid or -1 if no
+ * deadline thread is currently eligible.  O(NTHREAD) per call, but
+ * NTHREAD is small (~50) and the field is touched only when at
+ * least one deadline_at is non-zero on a hot thread.  We don't
+ * bother short-circuiting: the cost is dominated by the L1 hit
+ * pattern, not the comparisons. */
+static tid_typ s3_pick_deadline(void)
+{
+    int i;
+    tid_typ best = (tid_typ)-1;
+    unsigned long best_d = (unsigned long)-1;
+    for (i = 0; i < NTHREAD; i++) {
+        if (thrtab[i].state != THRREADY) continue;
+        if (thrtab[i].deadline_at == 0) continue;
+        if (thrtab[i].deadline_at < clkticks) continue;  /* missed → ignore */
+        if (thrtab[i].deadline_at < best_d) {
+            best_d = thrtab[i].deadline_at;
+            best   = (tid_typ)i;
+        }
+    }
+    return best;
+}
 
 /**
  * @ingroup threads
@@ -48,8 +73,22 @@ int resched(void)
         insert(thrcurrent, readylist, throld->prio);
     }
 
-    /* get highest priority thread from ready list */
-    thrcurrent = dequeue(readylist);
+    /* S3 DeadlineHints: prefer a still-eligible deadline thread over
+     * the head of the ready queue.  EDF dominates priority — the
+     * deadline says "this slice MUST run before tick D", which is a
+     * stronger commitment than priority.  After dispatch we clear
+     * deadline_at so the thread does not keep cutting in line. */
+    {
+        tid_typ dl_tid = s3_pick_deadline();
+        if (dl_tid != (tid_typ)-1 && dl_tid < (tid_typ)NTHREAD) {
+            (void)getitem(dl_tid);          /* unlink from readylist */
+            thrcurrent = dl_tid;
+            thrtab[dl_tid].deadline_at = 0;
+        } else {
+            /* get highest priority thread from ready list */
+            thrcurrent = dequeue(readylist);
+        }
+    }
     thrnew = &thrtab[thrcurrent];
     thrnew->state = THRCURR;
 

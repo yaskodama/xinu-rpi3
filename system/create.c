@@ -73,6 +73,7 @@ tid_typ create(void *procaddr, uint ssize, int priority,
                                      initial priority so the aging
                                      tick has a value to converge back
                                      to when the thread is dispatched. */
+    thrptr->deadline_at = 0;      /* S3 DeadlineHints: no deadline. */
     thrptr->stkbase = saddr;
     thrptr->stklen = ssize;
     strlcpy(thrptr->name, name, TNMLEN);
