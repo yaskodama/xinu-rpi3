@@ -86,22 +86,27 @@ syscall arpLookup(struct netif *netptr, const struct netaddr *praddr,
         ttl = (entry->expires - clktime) * CLKTICKS_PER_SEC;
         restore(im);
 
+        /* Clear stale messages BEFORE sending the request — the ARP
+         * reply can arrive (and arpNotify can deliver the message)
+         * during arpSendRqst's underlying etherWrite, especially when
+         * the smc91c111 driver runs a long TX completion poll.  If
+         * recvclr ran after arpSendRqst, that message would be
+         * discarded and recvtime would falsely time out. */
+        recvclr();
+
         /* Send an ARP request and wait for response */
         if (SYSERR == arpSendRqst(entry))
         {
             ARP_TRACE("Failed to send request");
             return SYSERR;
         }
-        recvclr();
-        switch (recvtime(ttl))
         {
-        case TIMEOUT:
-        case SYSERR:
-            return SYSERR;
-        case ARP_MSG_RESOLVED:
-        default:
+            message m = recvtime(ttl);
+            if (m == TIMEOUT || m == SYSERR)
+            {
+                return SYSERR;
+            }
             /* Reply received, address resolved, re-attempt lookup */
-            continue;
         }
     }
 
