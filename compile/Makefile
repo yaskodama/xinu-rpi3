@@ -71,6 +71,12 @@ CFLAGS  += -fno-pic
 # behavior.
 CFLAGS  += -fwrapv
 
+# Sec1 StackCanaries (Xinu_KernelEvolution Round 1) — insert a canary
+# in every function with a sufficiently risky stack frame and verify
+# on return.  Stubs for __stack_chk_guard / __stack_chk_fail live in
+# system/stack_canary.c.
+CFLAGS  += -fstack-protector-strong
+
 # DEBUG is used internally by `make debug' to add debugging flags.
 DEBUG   :=
 CFLAGS  += $(DEBUG)
