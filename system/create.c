@@ -74,6 +74,9 @@ tid_typ create(void *procaddr, uint ssize, int priority,
                                      tick has a value to converge back
                                      to when the thread is dispatched. */
     thrptr->deadline_at = 0;      /* S3 DeadlineHints: no deadline. */
+    thrptr->quantum_left = 40;    /* S2 MLFQ: 40ms fresh quantum on
+                                     creation; resched also resets on
+                                     dispatch. */
     thrptr->stkbase = saddr;
     thrptr->stklen = ssize;
     strlcpy(thrptr->name, name, TNMLEN);

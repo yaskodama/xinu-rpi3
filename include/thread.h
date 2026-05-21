@@ -81,6 +81,12 @@ struct thrent
                                      0 = no deadline; otherwise the
                                      thread is dispatched ahead of
                                      priority order if still in time. */
+    int quantum_left;           /**< S2 MLFQ: clkticks remaining in
+                                     the current scheduling quantum.
+                                     Decremented per tick while THRCURR;
+                                     on hit 0 the thread is demoted by
+                                     MLFQ_DEMOTE_STEP (cap basepri-15).
+                                     S1 aging then promotes back. */
     void *stkptr;               /**< saved stack pointer                */
     void *stkbase;              /**< base of run time stack             */
     ulong stklen;               /**< stack length in bytes              */

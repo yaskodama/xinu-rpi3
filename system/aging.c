@@ -75,6 +75,61 @@ static void age_readylist_resort(void)
     }
 }
 
+/* ============================================================
+ *  S2 MLFQ — multi-level feedback via per-thread quantum.
+ *
+ *  Single ready queue (Xinu does not have separate band lists);
+ *  feedback comes from decrementing prio when a thread consumes
+ *  its full quantum without voluntarily blocking.  S1 aging then
+ *  restores prio over time so I/O-bound threads keep interactive
+ *  responsiveness while CPU-bound threads naturally settle into
+ *  a "batch" effective priority.
+ *
+ *  Constants (in clkticks, = ms at CLKTICKS_PER_SEC=1000):
+ *    MLFQ_QUANTUM_MS    40   one slice between feedback decisions
+ *    MLFQ_DEMOTE_STEP   5    prio drop per quantum miss
+ *    MLFQ_MAX_DEMOTE   15    floor = basepri - MLFQ_MAX_DEMOTE
+ *
+ *  S1 (aging) and S2 (MLFQ) share the prio field; S1 nudges +1
+ *  every 100 ticks, S2 demotes -5 every 40 ticks if the current
+ *  thread used its full quantum.  Net: a busy thread loses ~5/40
+ *  per ms and gains ~1/100 per ms when ready, settling around
+ *  prio - 12.5 if it never blocks.
+ * ============================================================ */
+
+#define MLFQ_QUANTUM_MS    40
+#define MLFQ_DEMOTE_STEP   5
+#define MLFQ_MAX_DEMOTE   15
+
+void mlfq_tick(void)
+{
+    int t = (int)thrcurrent;
+    if (t == NULLTHREAD) return;
+    if (t < 0 || t >= NTHREAD) return;
+    if (thrtab[t].state != THRCURR) return;
+    /* Decrement remaining quantum.  When it reaches zero, demote
+     * prio by MLFQ_DEMOTE_STEP (down to the basepri - MAX floor)
+     * and reset the quantum for the next slice. */
+    thrtab[t].quantum_left--;
+    if (thrtab[t].quantum_left <= 0) {
+        int floor_prio = thrtab[t].basepri - MLFQ_MAX_DEMOTE;
+        if (thrtab[t].prio > floor_prio) {
+            thrtab[t].prio -= MLFQ_DEMOTE_STEP;
+            if (thrtab[t].prio < floor_prio) thrtab[t].prio = floor_prio;
+        }
+        thrtab[t].quantum_left = MLFQ_QUANTUM_MS;
+    }
+}
+
+/* Reset quantum on dispatch — called from resched.c after a thread
+ * becomes THRCURR.  Keeps every new slice starting with the full
+ * MLFQ_QUANTUM_MS budget regardless of how the thread arrived. */
+void mlfq_reset_quantum(int tid)
+{
+    if (tid < 0 || tid >= NTHREAD) return;
+    thrtab[tid].quantum_left = MLFQ_QUANTUM_MS;
+}
+
 /* Public entry point — called from clkhandler() once per tick. */
 void aging_tick(void)
 {

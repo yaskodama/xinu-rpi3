@@ -11,6 +11,7 @@
 
 extern void ctxsw(void *, void *, uchar);
 extern tid_typ getitem(tid_typ);
+extern void mlfq_reset_quantum(int tid);  /* S2 MLFQ — system/aging.c */
 int resdefer;                   /* >0 if rescheduling deferred */
 
 /* S3 DeadlineHints: scan thrtab for the THRREADY thread with the
@@ -97,6 +98,12 @@ int resched(void)
      * waiting is "consumed" on selection.  Pure book-keeping — the
      * thread already has the CPU at this point. */
     thrnew->prio = thrnew->basepri;
+
+    /* S2 MLFQ: fresh quantum for the new slice.  If the thread
+     * voluntarily blocks before the quantum expires it keeps the
+     * boost; if it spins, clkhandler's mlfq_tick will demote
+     * prio after MLFQ_QUANTUM_MS ticks. */
+    mlfq_reset_quantum((int)thrcurrent);
 
     /* change address space identifier to thread id */
     asid = thrcurrent & 0xff;

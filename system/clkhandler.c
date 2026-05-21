@@ -14,6 +14,7 @@
 void wakeup(void);
 int resched(void);
 void aging_tick(void);    /* S1 PriorityAging — system/aging.c */
+void mlfq_tick(void);     /* S2 MLFQ — same file */
 
 /**
  * @ingroup timer
@@ -33,6 +34,11 @@ interrupt clkhandler(void)
     /* S1: nudge per-thread aging counter; sweeps ready threads every
      * 100ms.  Cheap — bounded by NTHREAD insertion-sort. */
     aging_tick();
+    /* S2 MLFQ: count the running thread's quantum down by 1 each
+     * tick; on exhaustion demote its prio.  Single-thread cost is
+     * a decrement + a compare; the demotion path runs once per
+     * 40ms per CPU-bound thread. */
+    mlfq_tick();
 
     /* Update global second counter. */
     if (CLKTICKS_PER_SEC == clkticks)
