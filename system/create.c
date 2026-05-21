@@ -69,6 +69,10 @@ tid_typ create(void *procaddr, uint ssize, int priority,
 
     thrptr->state = THRSUSP;
     thrptr->prio = priority;
+    thrptr->basepri = priority;   /* S1 PriorityAging: snapshot the
+                                     initial priority so the aging
+                                     tick has a value to converge back
+                                     to when the thread is dispatched. */
     thrptr->stkbase = saddr;
     thrptr->stklen = ssize;
     strlcpy(thrptr->name, name, TNMLEN);

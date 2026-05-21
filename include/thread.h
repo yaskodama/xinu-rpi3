@@ -73,7 +73,10 @@
 struct thrent
 {
     uchar state;                /**< thread state: THRCURR, etc.        */
-    int prio;                   /**< thread priority                    */
+    int prio;                   /**< thread priority (effective)        */
+    int basepri;                /**< thread priority (base, set at
+                                     create — S1 aging snaps back to
+                                     this when the thread is selected) */
     void *stkptr;               /**< saved stack pointer                */
     void *stkbase;              /**< base of run time stack             */
     ulong stklen;               /**< stack length in bytes              */

@@ -53,6 +53,12 @@ int resched(void)
     thrnew = &thrtab[thrcurrent];
     thrnew->state = THRCURR;
 
+    /* S1 PriorityAging: snap the dispatched thread's effective prio
+     * back to its base, so any aging boost it accumulated while
+     * waiting is "consumed" on selection.  Pure book-keeping — the
+     * thread already has the CPU at this point. */
+    thrnew->prio = thrnew->basepri;
+
     /* change address space identifier to thread id */
     asid = thrcurrent & 0xff;
     ctxsw(&throld->stkptr, &thrnew->stkptr, asid);

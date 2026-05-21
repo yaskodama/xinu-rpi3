@@ -13,6 +13,7 @@
 
 void wakeup(void);
 int resched(void);
+void aging_tick(void);    /* S1 PriorityAging — system/aging.c */
 
 /**
  * @ingroup timer
@@ -28,6 +29,10 @@ interrupt clkhandler(void)
 
     /* Another clock tick passes. */
     clkticks++;
+
+    /* S1: nudge per-thread aging counter; sweeps ready threads every
+     * 100ms.  Cheap — bounded by NTHREAD insertion-sort. */
+    aging_tick();
 
     /* Update global second counter. */
     if (CLKTICKS_PER_SEC == clkticks)
