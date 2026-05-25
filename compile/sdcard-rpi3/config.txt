@@ -22,3 +22,7 @@ dtoverlay=disable-bt
 init_uart_clock=48000000
 
 disable_splash=1
+
+# Force HDMI output even if the monitor isn't detected at boot (e.g. plugged
+# in late, or EDID not read), so the Xinu framebuffer is actually displayed.
+hdmi_force_hotplug=1
