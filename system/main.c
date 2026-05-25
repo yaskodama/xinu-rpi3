@@ -150,8 +150,9 @@ thread main(void)
         }
     }
 
-    /* Open all ethernet devices */
-#if NETHER
+    /* Open all ethernet devices.  Skipped on Pi3: ETH0 is the smsc9512 USB
+     * NIC and USB is disabled on arm-rpi3, so opening it would fail/hang. */
+#if NETHER && !defined(_XINU_PLATFORM_ARM_RPI3_)
     {
         uint i;
 
@@ -185,8 +186,9 @@ thread main(void)
   #warning "No TTY for SERIAL0"
 #endif
 
-    /* Set up the second TTY (TTY1) if possible  */
-#if defined(TTY1)
+    /* Set up the second TTY (TTY1) if possible.  Skipped on Pi3: TTY1 maps to
+     * KBDMON0 (USB keyboard), and USB is disabled on arm-rpi3. */
+#if defined(TTY1) && !defined(_XINU_PLATFORM_ARM_RPI3_)
   #if defined(KBDMON0)
     /* Associate TTY1 with keyboard and use framebuffer output  */
     if (OK == open(TTY1, KBDMON0))

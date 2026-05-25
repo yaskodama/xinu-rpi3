@@ -213,7 +213,12 @@ static int sysinit(void)
 #endif
 
 #ifdef WITH_USB
+#ifndef _XINU_PLATFORM_ARM_RPI3_
     usbinit();
+#endif                          /* The Synopsys DWC USB host (usb_dwc_hcd.c)
+                                 * is BCM2835/Pi1-specific and faults on the
+                                 * Pi3 (BCM2837); USB is not needed for the
+                                 * serial console / xsh, so skip it there. */
 #endif
 
 #if NVRAM

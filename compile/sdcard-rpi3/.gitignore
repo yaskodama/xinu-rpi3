@@ -1,0 +1,9 @@
+# Broadcom firmware blobs (download from github.com/raspberrypi/firmware/boot)
+bootcode.bin
+start.elf
+fixup.dat
+# Device tree + overlay (also from the firmware repo)
+*.dtb
+overlays/
+# Built kernel image (objcopy -O binary of compile/xinu.boot)
+kernel.img

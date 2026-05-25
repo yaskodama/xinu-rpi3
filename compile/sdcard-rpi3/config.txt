@@ -1,0 +1,24 @@
+# Raspberry Pi 3 (BCM2837) — Embedded Xinu, arm-rpi3 port
+# Normal-boot kernel: prints a one-shot PL011 marker in start.S, then boots
+# Xinu to the xsh$ console (the in-tree console driver also uses PL011).
+
+arm_64bit=0
+kernel=kernel.img
+kernel_address=0x8000
+
+enable_uart=1
+# Make the GPU firmware itself log its boot over the UART at 115200. This
+# gives a known-good reference stream to confirm the serial path/baud,
+# independent of our kernel.
+uart_2ndstage=1
+
+# Route PL011 (UART0) to GPIO14/15 instead of the Bluetooth modem. Needs
+# the device tree + overlays/disable-bt.dtbo present on this card.
+dtoverlay=disable-bt
+
+# The Pi3 firmware ignores low init_uart_clock values; the PL011 reference
+# clock is 48 MHz. The start.S marker (and the rpi3 pl011.h override) compute
+# the baud divisor for 48 MHz -> 115200 8N1.
+init_uart_clock=48000000
+
+disable_splash=1

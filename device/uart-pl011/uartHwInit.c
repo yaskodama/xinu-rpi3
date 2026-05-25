@@ -94,8 +94,18 @@ devcall uartHwInit(device *devptr)
 
     /* Set the UART's baud rate.  This is done by writing to separate "integer
      * baud rate divisor" and "fractional baud rate divisor" registers.  */
+#ifndef _XINU_PLATFORM_ARM_RPI3_
+    /* Pi1 (arm-rpi): the PL011 reference clock is 3 MHz, so the pl011.h
+     * macros compute the correct 115200 divisor. */
     regptr->ibrd = PL011_BAUD_INT(115200);
     regptr->fbrd = PL011_BAUD_FRAC(115200);
+#else
+    /* Pi3 (arm-rpi3): the GPU firmware already configured the PL011 for
+     * 115200 with its own (non-3 MHz) reference clock; leave IBRD/FBRD
+     * untouched so we inherit that correct divisor.  The pl011.h 3 MHz macro
+     * would otherwise garble the console.  (The subsequent LCRH write below
+     * latches these inherited divisor values.) */
+#endif
 
     /* Write the appropriate values to the UART's "line control register" to set
      * it to an 8 bit word length, with parity bit and FIFOs disabled.  */
