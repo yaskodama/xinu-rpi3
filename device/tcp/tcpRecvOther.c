@@ -54,6 +54,15 @@ int tcpRecvOther(struct packet *pkt, struct tcb *tcbptr)
             tcpTimerPurge(tcbptr, TCP_EVT_RXT);
             if (TCP_PASSIVE == tcbptr->opentype)
             {
+                /* A passive socket reverts to LISTEN to accept the next
+                 * client.  Forget the peer that just reset, otherwise the
+                 * socket stays bound to that dead 4-tuple: tcpDemux() only
+                 * matches a fresh SYN as a wildcard listener when
+                 * remotept==0 && remoteip.type==NULL, so without this reset
+                 * later connections from a different source port never match
+                 * and the server's open(TCP_PASSIVE) blocks forever. */
+                tcbptr->remotept = 0;
+                tcbptr->remoteip.type = NULL;
                 tcbptr->state = TCP_LISTEN;
                 return OK;
             }
