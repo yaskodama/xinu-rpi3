@@ -47,7 +47,10 @@ devcall telnetWrite(device *devptr, void *buf, uint len)
         if (tntptr->ostart >= TELNET_OBLEN - 1)
         {
             if (SYSERR == telnetFlush(devptr))
+            {
+                signal(tntptr->osem);   /* don't leak the output semaphore */
                 return SYSERR;
+            }
         }
 
         switch (ch)
@@ -59,6 +62,7 @@ devcall telnetWrite(device *devptr, void *buf, uint len)
 
             if (SYSERR == telnetFlush(devptr))
             {
+                signal(tntptr->osem);   /* don't leak the output semaphore */
                 return SYSERR;
             }
             break;

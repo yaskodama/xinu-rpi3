@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <device.h>
+#include <semaphore.h>
 #include <telnet.h>
 #include <tty.h>
 
@@ -35,7 +36,17 @@ devcall telnetControl(device *devptr, int func, long arg1, long arg2)
     switch (func)
     {
     case TELNET_CTRL_FLUSH:
+        /* Hold the output semaphore so this flush (called periodically by the
+         * telnet server thread) is mutually exclusive with telnetWrite().
+         * Without it, a command running in a child thread that streams a lot of
+         * output (e.g. `help`) races with this flush over tntptr->out/ostart,
+         * corrupting/losing the data — which is why telnet command output never
+         * reached the client while the (short, race-free) prompt did.
+         * telnetWrite() calls telnetFlush() directly while already holding the
+         * semaphore, so this separate path does not deadlock. */
+        wait(tntptr->osem);
         telnetFlush(devptr);
+        signal(tntptr->osem);
         return OK;
     case TELNET_CTRL_CLRFLAG:
         /* arg1 is the flag we are clearing */
