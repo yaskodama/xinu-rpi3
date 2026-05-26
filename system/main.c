@@ -150,12 +150,12 @@ thread main(void)
         }
     }
 
-    /* Open all ethernet devices.  Skipped on Pi3: the LAN78xx (LAN7515)
-     * driver brings the link up fine, but enabling RX here hangs the system
-     * under live broadcast traffic (RX completion path still under
-     * investigation).  Leave ETH0 closed at boot so the system boots
-     * reliably; the driver is installed and the link/registers work. */
-#if NETHER && !defined(_XINU_PLATFORM_ARM_RPI3_)
+    /* Open all ethernet devices.  On Pi3 B+, ETH0 is the onboard LAN78xx
+     * (LAN7515): the link comes up, RX receives frames, and the system stays
+     * responsive (an earlier "hang" was actually the host reading the wrong
+     * serial device).  Opening ETH0 here brings up link + RX/TX so `netup
+     * ETH0` can run DHCP. */
+#if NETHER
     {
         uint i;
 
