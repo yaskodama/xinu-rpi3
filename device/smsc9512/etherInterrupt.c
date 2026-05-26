@@ -15,6 +15,7 @@
 /* Embedded Xinu, Copyright (C) 2013.  All rights reserved. */
 
 #include "smsc9512.h"
+#include "lan78xx.h"
 #include <bufpool.h>
 #include <ether.h>
 #include <string.h>
@@ -60,12 +61,86 @@ void smsc9512_tx_complete(struct usb_xfer_request *req)
  * @param req
  *      USB bulk IN transfer request that has completed.
  */
+/* Buffer one received ethernet frame (already stripped of its hardware RX
+ * header and trailing CRC) into the ethptr->in queue and wake etherRead().
+ * 'frame' points at the MAC destination address, 'frame_length' is the payload
+ * length to deliver. */
+static void
+eth_rx_buffer_frame(struct ether *ethptr, struct usb_xfer_request *req,
+                    const uint8_t *frame, uint32_t frame_length)
+{
+    struct ethPktBuffer *pkt;
+
+    if (ethptr->icount == ETH_IBLEN)
+    {
+        usb_dev_debug(req->dev, "ETH: Tallying overrun\n");
+        ethptr->ovrrun++;
+        return;
+    }
+    pkt = bufget(ethptr->inPool);
+    pkt->buf = pkt->data = (uint8_t*)(pkt + 1);
+    pkt->length = frame_length;
+    memcpy(pkt->buf, frame, pkt->length);
+    ethptr->in[(ethptr->istart + ethptr->icount) % ETH_IBLEN] = pkt;
+    ethptr->icount++;
+    usb_dev_debug(req->dev, "ETH: Receiving packet (length=%u, icount=%u)\n",
+                  pkt->length, ethptr->icount);
+    /* This may wake up a thread in etherRead().  */
+    signal(ethptr->isema);
+}
+
+/* Parse a completed LAN78xx bulk-IN transfer, which may contain multiple
+ * frames.  Each frame is prefixed by a 10-byte RX header
+ * (RX_CMD_A u32 | RX_CMD_B u32 | RX_CMD_C u16) and each (header+frame) is padded
+ * up to a 4-byte boundary before the next one.  FCS is stripped by hardware, so
+ * the RX_CMD_A length already excludes the CRC. */
+static void
+lan78xx_rx_complete_parse(struct ether *ethptr, struct usb_xfer_request *req)
+{
+    const uint8_t *data, *edata;
+    uint32_t rx_cmd_a;
+    uint32_t frame_length;
+
+    for (data = req->recvbuf, edata = req->recvbuf + req->actual_size;
+         data + LAN78XX_RX_OVERHEAD + ETH_HDR_LEN <= edata;
+         data += ((LAN78XX_RX_OVERHEAD + frame_length + 3) & ~3))
+    {
+        rx_cmd_a = data[0] | data[1] << 8 | data[2] << 16 | data[3] << 24;
+        frame_length = rx_cmd_a & LAN78XX_RX_CMD_A_LEN_MASK;
+
+        if ((rx_cmd_a & LAN78XX_RX_CMD_A_ERR) ||
+            (LAN78XX_RX_OVERHEAD + frame_length > (uint32_t)(edata - data)) ||
+            (frame_length > ETH_MAX_PKT_LEN) ||
+            (frame_length < ETH_HDR_LEN))
+        {
+            usb_dev_debug(req->dev, "LAN78xx: Tallying rx error "
+                          "(rx_cmd_a=0x%08x, frame_length=%u)\n",
+                          rx_cmd_a, frame_length);
+            ethptr->errors++;
+            /* If the length is bogus we can't reliably find the next frame. */
+            if (frame_length < ETH_HDR_LEN ||
+                LAN78XX_RX_OVERHEAD + frame_length > (uint32_t)(edata - data))
+            {
+                break;
+            }
+            continue;
+        }
+        /* FCS already stripped (MAC_RX FCS_STRIP set), so deliver as-is. */
+        eth_rx_buffer_frame(ethptr, req, data + LAN78XX_RX_OVERHEAD,
+                            frame_length);
+    }
+}
+
 void smsc9512_rx_complete(struct usb_xfer_request *req)
 {
     struct ether *ethptr = req->private;
 
     ethptr->rxirq++;
-    if (req->status == USB_STATUS_SUCCESS)
+    if (req->status == USB_STATUS_SUCCESS && ethptr->chiptype == ETH_CHIP_LAN78XX)
+    {
+        lan78xx_rx_complete_parse(ethptr, req);
+    }
+    else if (req->status == USB_STATUS_SUCCESS)
     {
         const uint8_t *data, *edata;
         uint32_t recv_status;
@@ -98,31 +173,11 @@ void smsc9512_rx_complete(struct usb_xfer_request *req)
                               recv_status, frame_length);
                 ethptr->errors++;
             }
-            else if (ethptr->icount == ETH_IBLEN)
-            {
-                /* No space to buffer another received packet.  */
-                usb_dev_debug(req->dev, "SMSC9512: Tallying overrun\n");
-                ethptr->ovrrun++;
-            }
             else
             {
-                /* Buffer the received packet.  */
-
-                struct ethPktBuffer *pkt;
-
-                pkt = bufget(ethptr->inPool);
-                pkt->buf = pkt->data = (uint8_t*)(pkt + 1);
-                pkt->length = frame_length - ETH_CRC_LEN;
-                memcpy(pkt->buf, data + SMSC9512_RX_OVERHEAD, pkt->length);
-                ethptr->in[(ethptr->istart + ethptr->icount) % ETH_IBLEN] = pkt;
-                ethptr->icount++;
-
-                usb_dev_debug(req->dev, "SMSC9512: Receiving "
-                              "packet (length=%u, icount=%u)\n",
-                              pkt->length, ethptr->icount);
-
-                /* This may wake up a thread in etherRead().  */
-                signal(ethptr->isema);
+                /* Buffer the received packet (minus the trailing CRC). */
+                eth_rx_buffer_frame(ethptr, req, data + SMSC9512_RX_OVERHEAD,
+                                    frame_length - ETH_CRC_LEN);
             }
         }
     }

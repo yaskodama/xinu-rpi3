@@ -6,6 +6,7 @@
 /* Embedded Xinu, Copyright (C) 2013.  All rights reserved. */
 
 #include "smsc9512.h"
+#include "lan78xx.h"
 #include <bufpool.h>
 #include <ether.h>
 #include <stdlib.h>
@@ -69,10 +70,20 @@ devcall etherOpen(device *devptr)
      * actually communicate with the device hardware.  */
     udev = ethptr->csr;
 
-    /* Set MAC address */
-    if (smsc9512_set_mac_address(udev, ethptr->devAddress) != USB_STATUS_SUCCESS)
+    /* Set MAC address (chip-specific register layout). */
+    if (ethptr->chiptype == ETH_CHIP_LAN78XX)
     {
-        goto out_free_in_pool;
+        if (lan78xx_set_mac_address(udev, ethptr->devAddress) != USB_STATUS_SUCCESS)
+        {
+            goto out_free_in_pool;
+        }
+    }
+    else
+    {
+        if (smsc9512_set_mac_address(udev, ethptr->devAddress) != USB_STATUS_SUCCESS)
+        {
+            goto out_free_in_pool;
+        }
     }
 
     /* Initialize the Tx requests.  */
@@ -121,11 +132,23 @@ devcall etherOpen(device *devptr)
      * restoring interrupts, the Rx transfers can complete at any time due to
      * incoming packets.  */
     udev->last_error = USB_STATUS_SUCCESS;
-    smsc9512_set_reg_bits(udev, MAC_CR, MAC_CR_TXEN | MAC_CR_RXEN);
-    smsc9512_write_reg(udev, TX_CFG, TX_CFG_ON);
-    if (udev->last_error != USB_STATUS_SUCCESS)
+    if (ethptr->chiptype == ETH_CHIP_LAN78XX)
     {
-        goto out_free_in_pool;
+        /* LAN78xx: PHY autoneg + link wait + enable RX/TX/FIFOs, with serial
+         * diagnostics at each step.  */
+        if (lan78xx_open(udev) != USB_STATUS_SUCCESS)
+        {
+            goto out_free_in_pool;
+        }
+    }
+    else
+    {
+        smsc9512_set_reg_bits(udev, MAC_CR, MAC_CR_TXEN | MAC_CR_RXEN);
+        smsc9512_write_reg(udev, TX_CFG, TX_CFG_ON);
+        if (udev->last_error != USB_STATUS_SUCCESS)
+        {
+            goto out_free_in_pool;
+        }
     }
 
     /* Success!  Set the device to ETH_STATE_UP. */

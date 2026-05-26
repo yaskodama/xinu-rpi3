@@ -150,10 +150,11 @@ thread main(void)
         }
     }
 
-    /* Open all ethernet devices.  Skipped on Pi3: ETH0 is the smsc9512 driver,
-     * but the Pi3 B+ has a LAN7515 (different VID/PID) so it never attaches;
-     * etherOpen() would then block forever in smsc9512_wait_device_attached(),
-     * stalling the main thread before the shells are set up. */
+    /* Open all ethernet devices.  Skipped on Pi3: the LAN78xx (LAN7515)
+     * driver brings the link up fine, but enabling RX here hangs the system
+     * under live broadcast traffic (RX completion path still under
+     * investigation).  Leave ETH0 closed at boot so the system boots
+     * reliably; the driver is installed and the link/registers work. */
 #if NETHER && !defined(_XINU_PLATFORM_ARM_RPI3_)
     {
         uint i;

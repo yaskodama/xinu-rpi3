@@ -4,6 +4,7 @@
 /* Embedded Xinu, Copyright (C) 2013.  All rights reserved. */
 
 #include "smsc9512.h"
+#include "lan78xx.h"
 #include <bufpool.h>
 #include <ether.h>
 #include <interrupt.h>
@@ -30,21 +31,32 @@ devcall etherWrite(device *devptr, const void *buf, uint len)
     req = bufget(ethptr->outPool);
 
     /* Copy the packet's data into the buffer, but also include two words at the
-     * beginning that contain device-specific flags.  These two fields are
-     * required, although we essentially just use them to tell the hardware we
-     * are transmitting one (1) packet with no extra bells and whistles.  */
+     * beginning that contain device-specific flags.  Both the LAN9512 and the
+     * LAN78xx prepend an 8-byte two-word command header, but the bitfields
+     * differ, so we branch on the chip type.  */
     sendbuf = req->sendbuf;
-    tx_cmd_a = len | TX_CMD_A_FIRST_SEG | TX_CMD_A_LAST_SEG;
+    if (ethptr->chiptype == ETH_CHIP_LAN78XX)
+    {
+        /* LAN78xx TX_CMD_A = frame_len (bits 0..19) | FCS request; TX_CMD_B=0. */
+        tx_cmd_a = (len & LAN78XX_TX_CMD_A_LEN_MASK) | LAN78XX_TX_CMD_A_FCS;
+        tx_cmd_b = 0;
+    }
+    else
+    {
+        /* LAN9512: single packet, first+last segment, byte length in cmd B. */
+        tx_cmd_a = len | TX_CMD_A_FIRST_SEG | TX_CMD_A_LAST_SEG;
+        tx_cmd_b = len;
+    }
     sendbuf[0] = (tx_cmd_a >> 0)  & 0xff;
     sendbuf[1] = (tx_cmd_a >> 8)  & 0xff;
     sendbuf[2] = (tx_cmd_a >> 16) & 0xff;
     sendbuf[3] = (tx_cmd_a >> 24) & 0xff;
-    tx_cmd_b = len;
     sendbuf[4] = (tx_cmd_b >> 0)  & 0xff;
     sendbuf[5] = (tx_cmd_b >> 8)  & 0xff;
     sendbuf[6] = (tx_cmd_b >> 16) & 0xff;
     sendbuf[7] = (tx_cmd_b >> 24) & 0xff;
     STATIC_ASSERT(SMSC9512_TX_OVERHEAD == 8);
+    STATIC_ASSERT(LAN78XX_TX_OVERHEAD == 8);
     memcpy(sendbuf + SMSC9512_TX_OVERHEAD, buf, len);
 
     /* Set total size of the data to send over the USB.  */

@@ -48,6 +48,13 @@
 #define ETH_STATE_DOWN       1
 #define ETH_STATE_UP         2
 
+/* Ethernet chip types for the smsc9512/lan78xx USB driver.  Stored in
+ * struct ether.chiptype so that etherOpen/Read/Write/Interrupt can branch
+ * between the old LAN9512 (USB adapter) and the LAN78xx (Pi 3 B+ onboard NIC),
+ * which share the USB plumbing but differ in register map and framing.  */
+#define ETH_CHIP_SMSC9512    0   /**< SMSC/Microchip LAN9512/9514 (PID 0xEC00) */
+#define ETH_CHIP_LAN78XX     1   /**< Microchip LAN78xx/LAN7800 (PID 0x7800)   */
+
 /* ETH control codes */
 #define ETH_CTRL_CLEAR_STATS 1  /**< Clear Ethernet Statistics          */
 #define ETH_CTRL_SET_MAC     2  /**< Set the MAC for this device        */
@@ -75,6 +82,7 @@ struct ethPktBuffer
 struct ether
 {
     uchar state;                /**< ETH_STATE_*above                   */
+    ushort chiptype;            /**< ETH_CHIP_* : smsc9512 vs lan78xx    */
     device *phy;                /**< physical eth device for Tx DMA     */
 
     /* Pointers to associated structures */

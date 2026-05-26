@@ -25,14 +25,19 @@ shellcmd xsh_win(int nargs, char *args[])
     /* Make sure the on-screen shell window exists (idempotent). */
     gwin_shell_window_open();
 
-    /* Open the window-console output device. */
+    /* Open the window-console device. */
     open(GWINCON0);
 
-    /* Spawn an interactive shell: input from the USB keyboard (KBDMON0),
-     * stdout + stderr into the window (GWINCON0).  Cortex-A53 frames are
-     * large and the render chain is deep, so use a big (64 KB) stack. */
+    /* Spawn an interactive shell with ALL three streams on GWINCON0 so the
+     * whole shell — prompt, keypress echo, command output — stays inside the
+     * window.  GWINCON0's getc/read are wired to usbKbdGetc/usbKbdRead (it
+     * reads the USB keyboard), and its putc to gwinconPutc (it writes the
+     * window's text ring).  Using KBDMON0 for stdin instead would echo
+     * keystrokes through fbPutc onto the whole framebuffer, outside the
+     * window.  Cortex-A53 frames are large + the render chain is deep, so
+     * use a big (64 KB) stack. */
     ready(create((void *)shell, 65536, INITPRIO, "winsh", 3,
-                 KBDMON0, GWINCON0, GWINCON0), RESCHED_YES);
+                 GWINCON0, GWINCON0, GWINCON0), RESCHED_YES);
 
     return 0;
 }

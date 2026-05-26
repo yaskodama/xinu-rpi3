@@ -6,6 +6,7 @@
 /* Embedded Xinu, Copyright (C) 2013.  All rights reserved. */
 
 #include "smsc9512.h"
+#include "lan78xx.h"
 #include <clock.h>
 #include <ether.h>
 #include <memory.h>
@@ -33,13 +34,18 @@ static usb_status_t
 smsc9512_bind_device(struct usb_device *udev)
 {
     struct ether *ethptr;
+    bool is_lan78xx;
 
-    /* Check if this is actually a SMSC LAN9512 by checking the USB device's
-     * standard device descriptor, which the USB core already read into memory.
-     * Also check to make sure the expected endpoints for sending/receiving
-     * packets are present and that the device is operating at high speed.  */
+    /* Check if this is actually one of the supported Microchip/SMSC USB
+     * Ethernet chips by checking the USB device's standard device descriptor,
+     * which the USB core already read into memory.  We accept both the old SMSC
+     * LAN9512 (PID 0xEC00, USB adapter) and the LAN78xx/LAN7800 (PID 0x7800,
+     * Raspberry Pi 3 B+ onboard NIC).  Also check that the expected endpoints
+     * for sending/receiving packets are present and that the device is
+     * operating at high speed.  */
     if (udev->descriptor.idVendor != SMSC9512_VENDOR_ID ||
-        udev->descriptor.idProduct != SMSC9512_PRODUCT_ID ||
+        (udev->descriptor.idProduct != SMSC9512_PRODUCT_ID &&
+         udev->descriptor.idProduct != LAN78XX_PRODUCT_ID) ||
         udev->interfaces[0]->bNumEndpoints < 2 ||
         (udev->endpoints[0][0]->bmAttributes & 0x3) != USB_TRANSFER_TYPE_BULK ||
         (udev->endpoints[0][1]->bmAttributes & 0x3) != USB_TRANSFER_TYPE_BULK ||
@@ -49,6 +55,11 @@ smsc9512_bind_device(struct usb_device *udev)
     {
         return USB_STATUS_DEVICE_UNSUPPORTED;
     }
+
+    is_lan78xx = (udev->descriptor.idProduct == LAN78XX_PRODUCT_ID);
+    kprintf("[ether] bind: VID=%04x PID=%04x -> %s\r\n",
+            udev->descriptor.idVendor, udev->descriptor.idProduct,
+            is_lan78xx ? "LAN78xx (rpi3 onboard)" : "SMSC LAN9512");
 
     /* Make sure this driver isn't already bound to a SMSC LAN9512.
      * TODO: Support multiple devices of this type concurrently.  */
@@ -72,27 +83,46 @@ smsc9512_bind_device(struct usb_device *udev)
 
     udev->last_error = USB_STATUS_SUCCESS;
 
-    /* Resetting the SMSC LAN9512 via its registers should not be necessary
-     * because the USB code already performed a reset on the USB port it's
-     * attached to.  */
+    /* Record the chip type so etherOpen/Read/Write/Interrupt can branch
+     * between the LAN9512 and LAN78xx register maps and framing.  */
+    ethptr->chiptype = is_lan78xx ? ETH_CHIP_LAN78XX : ETH_CHIP_SMSC9512;
 
-    /* Set MAC address.  */
-    smsc9512_set_mac_address(udev, ethptr->devAddress);
-
-    /* Allow multiple Ethernet frames to be received in a single USB transfer.
-     * Also set a couple flags of unknown function.  */
-    smsc9512_set_reg_bits(udev, HW_CFG, HW_CFG_MEF | HW_CFG_BIR | HW_CFG_BCE);
-
-    /* Set the maximum USB (not networking!) packets per USB Rx transfer.
-     * Required when HW_CFG_MEF was set.  */
-    smsc9512_write_reg(udev, BURST_CAP,
-                       SMSC9512_DEFAULT_HS_BURST_CAP_SIZE / SMSC9512_HS_USB_PKT_SIZE);
-
-    /* Check for error and return.  */
-    if (udev->last_error != USB_STATUS_SUCCESS)
+    if (is_lan78xx)
     {
-        return udev->last_error;
+        /* LAN78xx-specific bring-up (reset, MAC, filtering, FIFOs) with
+         * serial diagnostics.  Rx/Tx are not enabled here; that happens in
+         * etherOpen() -> lan78xx_open().  */
+        usb_status_t status = lan78xx_bind(udev, ethptr->devAddress);
+        if (status != USB_STATUS_SUCCESS)
+        {
+            return status;
+        }
     }
+    else
+    {
+        /* Resetting the SMSC LAN9512 via its registers should not be necessary
+         * because the USB code already performed a reset on the USB port it's
+         * attached to.  */
+
+        /* Set MAC address.  */
+        smsc9512_set_mac_address(udev, ethptr->devAddress);
+
+        /* Allow multiple Ethernet frames to be received in a single USB
+         * transfer.  Also set a couple flags of unknown function.  */
+        smsc9512_set_reg_bits(udev, HW_CFG, HW_CFG_MEF | HW_CFG_BIR | HW_CFG_BCE);
+
+        /* Set the maximum USB (not networking!) packets per USB Rx transfer.
+         * Required when HW_CFG_MEF was set.  */
+        smsc9512_write_reg(udev, BURST_CAP,
+                           SMSC9512_DEFAULT_HS_BURST_CAP_SIZE / SMSC9512_HS_USB_PKT_SIZE);
+
+        /* Check for error and return.  */
+        if (udev->last_error != USB_STATUS_SUCCESS)
+        {
+            return udev->last_error;
+        }
+    }
+
     ethptr->csr = udev;
     udev->driver_private = ethptr;
     signal(smsc9512_attached[ethptr - ethertab]);
@@ -123,7 +153,7 @@ smsc9512_unbind_device(struct usb_device *udev)
  * driver model, which is static.
  */
 static const struct usb_device_driver smsc9512_driver = {
-    .name          = "SMSC LAN9512 USB Ethernet Adapter Driver",
+    .name          = "SMSC LAN9512 / Microchip LAN78xx USB Ethernet Driver",
     .bind_device   = smsc9512_bind_device,
     .unbind_device = smsc9512_unbind_device,
 };
