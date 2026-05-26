@@ -186,6 +186,13 @@ thread main(void)
      * enumeration can't block boot, notably the CONSOLE shell created below. */
     ready(create((void *)eth_open_all, 65536, INITPRIO, "ethopen", 0),
           RESCHED_NO);
+    /* Auto-start: wait for ETH0, bring up the static IP, and launch the
+     * web->AIPL-actor bridge (apps/webactor.c) — no manual netup/webactor. */
+    {
+        extern thread webactor_autostart(void);
+        ready(create((void *)webactor_autostart, 8192, INITPRIO, "webauto", 0),
+              RESCHED_NO);
+    }
 #endif /* NETHER */
 
     /* Set up the first TTY (CONSOLE)  */

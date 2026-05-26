@@ -20,6 +20,7 @@
 #include <device.h>
 #include <ether.h>
 #include <network.h>
+#include <ipv4.h>
 #include <tcp.h>
 #include <string.h>
 #include <stdio.h>
@@ -31,6 +32,11 @@ extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 
 #define WEBACTOR_PORT 8080
 #define WEB_BUFSZ     1024
+
+/* Static network config used by the boot auto-start (webactor_autostart). */
+#define WEBACTOR_IP   "192.168.3.50"
+#define WEBACTOR_MASK "255.255.255.0"
+#define WEBACTOR_GW   "192.168.3.1"
 
 static int web_receiver_id = -1;
 
@@ -148,4 +154,49 @@ int webactor_start(void)
     }
     ready(tid, RESCHED_NO);
     return web_receiver_id;
+}
+
+/* Boot auto-start: wait for ETH0 to come up (it is opened asynchronously by
+ * main.c's eth_open_all thread), bring the interface up with a static IP, then
+ * start the web server + WebReceiver actor.  Spawned from main.c so the whole
+ * Mac-actor -> AIPL-actor path is live right after boot, with no manual
+ * `netup` / `webactor` commands. */
+thread webactor_autostart(void)
+{
+    struct netaddr ip, mask, gw;
+    int i;
+
+    /* Wait (up to ~30 s) for eth_open_all to finish opening ETH0. */
+    for (i = 0; i < 60; i++)
+    {
+        if (ethertab[0].state == ETH_STATE_UP)
+        {
+            break;
+        }
+        sleep(500);
+    }
+    if (ethertab[0].state != ETH_STATE_UP)
+    {
+        kprintf("[webactor] autostart: ETH0 never came up\r\n");
+        return SYSERR;
+    }
+
+    if (SYSERR == dot2ipv4(WEBACTOR_IP, &ip) ||
+        SYSERR == dot2ipv4(WEBACTOR_MASK, &mask) ||
+        SYSERR == dot2ipv4(WEBACTOR_GW, &gw))
+    {
+        kprintf("[webactor] autostart: bad static IP config\r\n");
+        return SYSERR;
+    }
+
+    if (SYSERR == netUp((ethertab[0].dev)->num, &ip, &mask, &gw))
+    {
+        kprintf("[webactor] autostart: netUp failed\r\n");
+        return SYSERR;
+    }
+    kprintf("[webactor] autostart: netUp %s/%s gw %s\r\n",
+            WEBACTOR_IP, WEBACTOR_MASK, WEBACTOR_GW);
+
+    webactor_start();
+    return OK;
 }
