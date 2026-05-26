@@ -70,6 +70,7 @@
 
 /* USB_CFG0 bits */
 #define LAN78XX_USB_CFG_BIR     0x00000040  /**< BIT6: Bulk-In emptY Response (ZLP, paced by BULK_IN_DLY) */
+#define LAN78XX_USB_CFG_BCE     0x00000020  /**< BIT5: Burst Cap Enable (honour BURST_CAP); Linux + smsc9512 both set it */
 
 /* PMT_CTL bits */
 #define LAN78XX_PMT_CTL_PHY_RST 0x00000010  /**< BIT4: PHY reset             */
@@ -141,9 +142,16 @@
 #define LAN78XX_HS_USB_PKT_SIZE    512
 #define LAN78XX_DEFAULT_HS_BURST_CAP_SIZE  (16 * 1024 + 5 * LAN78XX_HS_USB_PKT_SIZE)
 
-/* FIFO sizes, in units of 512 bytes, per the Linux lan78xx driver. */
-#define LAN78XX_FCT_RX_FIFO_END_VAL  0x27   /**< 10 KB */
-#define LAN78XX_FCT_TX_FIFO_END_VAL  0x11   /**< 4 KB  */
+/* On-chip RX/TX FIFO sizes (both 12 KB), per the Linux lan78xx driver. */
+#define LAN78XX_MAX_RX_FIFO_SIZE     (12 * 1024)
+#define LAN78XX_MAX_TX_FIFO_SIZE     (12 * 1024)
+/* FCT FIFO end markers, in units of 512 bytes: (size - 512) / 512.  This MUST
+ * match the physical FIFO size; the previous values (0x27 RX / 0x11 TX) set the
+ * RX end marker past the 12 KB RX RAM, so under load / full-MTU frames the RX
+ * FIFO wrapped and corrupted frames (errors > transfers, large-frame loss, and
+ * eventually a device wedge).  (12*1024 - 512)/512 = 0x17, as Linux uses. */
+#define LAN78XX_FCT_RX_FIFO_END_VAL  ((LAN78XX_MAX_RX_FIFO_SIZE - 512) / 512)
+#define LAN78XX_FCT_TX_FIFO_END_VAL  ((LAN78XX_MAX_TX_FIFO_SIZE - 512) / 512)
 #define LAN78XX_BULK_IN_DLY_VAL      0x0800
 /* BURST_CAP: max USB packets batched per bulk-IN.  MUST be non-zero when
  * HW_CFG_MEF is set, else the device returns empty bulk-IN responses back to

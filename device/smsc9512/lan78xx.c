@@ -296,12 +296,16 @@ lan78xx_bind(struct usb_device *udev, const uint8_t *macaddr)
      * callback re-submits immediately, so it spins and starves the system
      * (the serial shell goes dead the moment ETH0 is opened). */
     lan78xx_set_reg_bits(udev, LAN78XX_HW_CFG, LAN78XX_HW_CFG_MEF);
-    lan78xx_set_reg_bits(udev, LAN78XX_USB_CFG0, LAN78XX_USB_CFG_BIR);
+    /* BIR = empty-response ZLP (paced by BULK_IN_DLY); BCE = honour BURST_CAP.
+     * Linux lan78xx and the proven smsc9512 path both enable BCE — without it
+     * the device ignores BURST_CAP, leaving the bulk-IN burst size unbounded. */
+    lan78xx_set_reg_bits(udev, LAN78XX_USB_CFG0,
+                         LAN78XX_USB_CFG_BIR | LAN78XX_USB_CFG_BCE);
     lan78xx_write_reg(udev, LAN78XX_BURST_CAP, LAN78XX_BURST_CAP_VAL);
     lan78xx_write_reg(udev, LAN78XX_BULK_IN_DLY, LAN78XX_BULK_IN_DLY_VAL);
     lan78xx_write_reg(udev, LAN78XX_FCT_RX_FIFO_END, LAN78XX_FCT_RX_FIFO_END_VAL);
     lan78xx_write_reg(udev, LAN78XX_FCT_TX_FIFO_END, LAN78XX_FCT_TX_FIFO_END_VAL);
-    kprintf("[lan78xx] MEF+BIR set, FIFO/burst configured (burst_cap=%02x "
+    kprintf("[lan78xx] MEF+BIR+BCE set, FIFO/burst configured (burst_cap=%02x "
             "rx_fifo_end=%02x tx_fifo_end=%02x bulk_in_dly=%04x)\r\n",
             LAN78XX_BURST_CAP_VAL, LAN78XX_FCT_RX_FIFO_END_VAL,
             LAN78XX_FCT_TX_FIFO_END_VAL, LAN78XX_BULK_IN_DLY_VAL);
