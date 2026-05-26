@@ -130,6 +130,7 @@ shellcmd xsh_usbinfo(int, char *[]);
 shellcmd xsh_user(int, char *[]);
 shellcmd xsh_vlanstat(int, char *[]);
 shellcmd xsh_voip(int, char *[]);
+shellcmd xsh_win(int, char *[]);
 shellcmd xsh_xweb(int, char *[]);
 
 /* Filesystem commands */

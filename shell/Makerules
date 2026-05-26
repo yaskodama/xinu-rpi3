@@ -63,6 +63,9 @@ C_FILES += xsh_abclc.c
 # WM overlay demos
 C_FILES += xsh_rotlines.c
 
+# Windowed shell command (arm-rpi3 HDMI desktop)
+C_FILES += xsh_win.c
+
 # Editor + tiny make
 C_FILES += xsh_edit.c xsh_make.c
 

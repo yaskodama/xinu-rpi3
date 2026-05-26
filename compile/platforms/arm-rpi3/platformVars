@@ -41,6 +41,8 @@ DEVICES  := ethloop         \
             udp             \
             usb             \
             usbkbd          \
+            usbmouse        \
+            gwincon         \
             loopback        \
             ramdisk         \
             tty

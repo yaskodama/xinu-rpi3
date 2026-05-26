@@ -188,9 +188,11 @@ thread main(void)
   #warning "No TTY for SERIAL0"
 #endif
 
-    /* Set up the second TTY (TTY1) if possible.  On Pi3, TTY1 maps to KBDMON0
-     * (USB keyboard) with framebuffer/HDMI output; USB enumeration now works. */
-#if defined(TTY1)
+    /* Set up the second TTY (TTY1) if possible.  Skipped on Pi3: the window
+     * manager (gwm_main) now owns the HDMI framebuffer and repaints it every
+     * frame, so a TTY1/KBDMON0 shell writing to the same framebuffer would
+     * just fight it.  The USB keyboard is routed into the WM instead. */
+#if defined(TTY1) && !defined(_XINU_PLATFORM_ARM_RPI3_)
   #if defined(KBDMON0)
     /* Associate TTY1 with keyboard and use framebuffer output  */
     if (OK == open(TTY1, KBDMON0))
@@ -315,6 +317,18 @@ thread main(void)
                 kprintf("WARNING: Failed to create %s", name);
             }
         }
+    }
+#endif
+
+    /* Auto-launch the ported Pi5 window manager on arm-rpi3.  Renders
+     * the desktop + windows + soft keyboard on the HDMI framebuffer
+     * (already brought up by screenInit() at boot).  Generous stack:
+     * the framebuffer render chain is deep on Cortex-A53. */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    {
+        extern thread gwm_main(void);
+        ready(create((void *)gwm_main, 65536, INITPRIO, "GWM", 0),
+              RESCHED_NO);
     }
 #endif
 

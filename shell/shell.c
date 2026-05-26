@@ -103,6 +103,7 @@ const struct centry commandtab[] = {
     {"test", FALSE, xsh_test},
     {"touch", FALSE, xsh_touch},
     {"umount", FALSE, xsh_umount},
+    {"win", FALSE, xsh_win},
     {"write", FALSE, xsh_write},
 #if HAVE_TESTSUITE
     {"testsuite", TRUE, xsh_testsuite},
