@@ -286,25 +286,37 @@ lan78xx_bind(struct usb_device *udev, const uint8_t *macaddr)
             macaddr[0], macaddr[1], macaddr[2],
             macaddr[3], macaddr[4], macaddr[5]);
 
-    /* Step 6: Rx burst + bulk-in delay + FIFO end markers.
-     * (Step 5 / HW_CFG MEF left at post-reset default per the spec note.) */
-    lan78xx_write_reg(udev, LAN78XX_BURST_CAP, 0x00);
+    /* Step 5: HW_CFG Multiple-Ethernet-Frames + USB_CFG Bulk-In Response, and
+     * Step 6: Rx burst cap + bulk-in delay + FIFO end markers.
+     *
+     * This mirrors the proven-working smsc9512 path (which sets HW_CFG_MEF |
+     * HW_CFG_BIR and a non-zero BURST_CAP).  CRITICAL: BURST_CAP must be the
+     * burst-buffer size in USB packets (NOT 0).  With MEF set and BURST_CAP=0
+     * the device emits empty bulk-IN responses back-to-back; our RX completion
+     * callback re-submits immediately, so it spins and starves the system
+     * (the serial shell goes dead the moment ETH0 is opened). */
+    lan78xx_set_reg_bits(udev, LAN78XX_HW_CFG, LAN78XX_HW_CFG_MEF);
+    lan78xx_set_reg_bits(udev, LAN78XX_USB_CFG0, LAN78XX_USB_CFG_BIR);
+    lan78xx_write_reg(udev, LAN78XX_BURST_CAP, LAN78XX_BURST_CAP_VAL);
     lan78xx_write_reg(udev, LAN78XX_BULK_IN_DLY, LAN78XX_BULK_IN_DLY_VAL);
     lan78xx_write_reg(udev, LAN78XX_FCT_RX_FIFO_END, LAN78XX_FCT_RX_FIFO_END_VAL);
     lan78xx_write_reg(udev, LAN78XX_FCT_TX_FIFO_END, LAN78XX_FCT_TX_FIFO_END_VAL);
-    kprintf("[lan78xx] FIFO/burst configured (rx_fifo_end=%02x tx_fifo_end=%02x "
-            "bulk_in_dly=%04x)\r\n",
-            LAN78XX_FCT_RX_FIFO_END_VAL, LAN78XX_FCT_TX_FIFO_END_VAL,
-            LAN78XX_BULK_IN_DLY_VAL);
+    kprintf("[lan78xx] MEF+BIR set, FIFO/burst configured (burst_cap=%02x "
+            "rx_fifo_end=%02x tx_fifo_end=%02x bulk_in_dly=%04x)\r\n",
+            LAN78XX_BURST_CAP_VAL, LAN78XX_FCT_RX_FIFO_END_VAL,
+            LAN78XX_FCT_TX_FIFO_END_VAL, LAN78XX_BULK_IN_DLY_VAL);
 
-    /* Step 7: receive filter = broadcast + perfect (our MAC) + unicast. */
+    /* Step 7: receive filter = broadcast + perfect-DA (our own MAC via MAF[0]).
+     * UCAST_EN (accept ALL unicast) makes the RX path handle every host's
+     * traffic, which on a busy network degrades the serial console; and it did
+     * NOT fix ping anyway (the problem is in network-input processing, not the
+     * RX filter).  Keep it off; DA_PERFECT + MAF[0] receives our own unicast. */
     lan78xx_write_reg(udev, LAN78XX_RFE_CTL,
                       LAN78XX_RFE_CTL_BCAST_EN |
-                      LAN78XX_RFE_CTL_DA_PERFECT |
-                      LAN78XX_RFE_CTL_UCAST_EN);
+                      LAN78XX_RFE_CTL_DA_PERFECT);
     v = 0;
     lan78xx_read_reg(udev, LAN78XX_RFE_CTL, &v);
-    kprintf("[lan78xx] RFE_CTL=%08x (bcast+perfect+ucast)\r\n", v);
+    kprintf("[lan78xx] RFE_CTL=%08x (bcast+perfect)\r\n", v);
 
     /* Step 8: MAC_CR auto duplex + auto speed. */
     lan78xx_set_reg_bits(udev, LAN78XX_MAC_CR,

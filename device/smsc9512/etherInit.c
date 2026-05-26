@@ -162,6 +162,21 @@ static void
 randomEthAddr(uchar addr[ETH_ADDR_LEN])
 {
     uint i;
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    /* The LAN7515 on the Pi 3 B+ has no EEPROM, and Xinu does not read the
+     * board serial here (platform.serial_* are 0), so the fallback below would
+     * seed srand() with clkcount() and pick a DIFFERENT MAC every boot.  That
+     * invalidates the peer's ARP cache after every reboot and makes the device
+     * unreachable until the peer re-ARPs.  Use a fixed MAC (real Pi OUI
+     * b8:27:eb) so the address is stable across boots. */
+    static const uchar fixed_mac[ETH_ADDR_LEN] =
+        {0xb8, 0x27, 0xeb, 0xc0, 0xff, 0xee};
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+    {
+        addr[i] = fixed_mac[i];
+    }
+    return;
+#endif
     if (platform.serial_low != 0 && platform.serial_high != 0)
     {
         /* Use value generated from platform's serial number.  The problem here

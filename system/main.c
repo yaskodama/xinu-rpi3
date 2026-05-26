@@ -14,6 +14,32 @@
 
 static void print_os_info(void);
 
+#if NETHER
+/* Open all ethernet devices.  Runs in its own thread (spawned from main())
+ * because etherOpen() -> smsc9512_wait_device_attached() waits with NO timeout
+ * for the USB ethernet to enumerate; doing it inline in main() blocks the rest
+ * of boot (including the CONSOLE serial shell) whenever USB enumeration is slow,
+ * which looks like a hang partway through the banner.  Needs a large stack:
+ * lan78xx_open()'s bring-up chain (USB control transfers + MII polling) is deep
+ * and overflowed an 8 KB stack. */
+static void eth_open_all(void)
+{
+    uint i;
+
+    for (i = 0; i < NETHER; i++)
+    {
+        if (SYSERR == open(ethertab[i].dev->num))
+        {
+            kprintf("WARNING: Failed to open %s\r\n", ethertab[i].dev->name);
+        }
+        else
+        {
+            kprintf("[eth] %s opened\r\n", ethertab[i].dev->name);
+        }
+    }
+}
+#endif /* NETHER */
+
 /**
  * Main thread.  You can modify this routine to customize what Embedded Xinu
  * does when it starts up.  The default is designed to do something reasonable
@@ -156,18 +182,10 @@ thread main(void)
      * serial device).  Opening ETH0 here brings up link + RX/TX so `netup
      * ETH0` can run DHCP. */
 #if NETHER
-    {
-        uint i;
-
-        for (i = 0; i < NETHER; i++)
-        {
-            if (SYSERR == open(ethertab[i].dev->num))
-            {
-                kprintf("WARNING: Failed to open %s\r\n",
-                        ethertab[i].dev->name);
-            }
-        }
-    }
+    /* Bring ethernet up in a background thread (64 KB stack) so a slow USB
+     * enumeration can't block boot, notably the CONSOLE shell created below. */
+    ready(create((void *)eth_open_all, 65536, INITPRIO, "ethopen", 0),
+          RESCHED_NO);
 #endif /* NETHER */
 
     /* Set up the first TTY (CONSOLE)  */

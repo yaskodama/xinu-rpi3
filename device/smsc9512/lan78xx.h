@@ -56,11 +56,20 @@
 #define LAN78XX_RX_ADDRL        0x11C   /**< MAC bytes 0-3 */
 #define LAN78XX_MII_ACC         0x120
 #define LAN78XX_MII_DATA        0x124
-#define LAN78XX_MAF_HI_0        0x150   /**< Address-Filter 0 hi (AF_EN | hi16) */
-#define LAN78XX_MAF_LO_0        0x154   /**< Address-Filter 0 lo (MAC lo 32)    */
+/* MAC Address Filter perfect-filter table.  Per the LAN78xx datasheet / Linux
+ * lan78xx driver, MAF_BASE=0x400 and entry n is at 0x400+8n (HI) / 0x404+8n
+ * (LO).  Entry 0 holds our own MAC for the RFE DA_PERFECT filter.  (The earlier
+ * 0x150/0x154 were wrong registers, so MAF[0] was never programmed and every
+ * unicast addressed to us was dropped — only broadcast got through.) */
+#define LAN78XX_MAF_HI_0        0x400   /**< Address-Filter 0 hi (AF_EN | hi16) */
+#define LAN78XX_MAF_LO_0        0x404   /**< Address-Filter 0 lo (MAC lo 32)    */
 
 /* HW_CFG bits */
 #define LAN78XX_HW_CFG_LRST     0x00000002  /**< BIT1: lite reset            */
+#define LAN78XX_HW_CFG_MEF      0x00000010  /**< BIT4: Multiple Ethernet Frames per bulk-IN */
+
+/* USB_CFG0 bits */
+#define LAN78XX_USB_CFG_BIR     0x00000040  /**< BIT6: Bulk-In emptY Response (ZLP, paced by BULK_IN_DLY) */
 
 /* PMT_CTL bits */
 #define LAN78XX_PMT_CTL_PHY_RST 0x00000010  /**< BIT4: PHY reset             */
@@ -136,6 +145,11 @@
 #define LAN78XX_FCT_RX_FIFO_END_VAL  0x27   /**< 10 KB */
 #define LAN78XX_FCT_TX_FIFO_END_VAL  0x11   /**< 4 KB  */
 #define LAN78XX_BULK_IN_DLY_VAL      0x0800
+/* BURST_CAP: max USB packets batched per bulk-IN.  MUST be non-zero when
+ * HW_CFG_MEF is set, else the device returns empty bulk-IN responses back to
+ * back and the (immediately re-submitting) RX completion callback spins,
+ * starving the whole system.  = burst buffer size / HS packet size. */
+#define LAN78XX_BURST_CAP_VAL  (LAN78XX_DEFAULT_HS_BURST_CAP_SIZE / LAN78XX_HS_USB_PKT_SIZE)
 
 /** Max ethernet frame the MAC will accept (incl. header + VLAN + FCS slack). */
 #define LAN78XX_MAX_FRAME_SIZE       1522
