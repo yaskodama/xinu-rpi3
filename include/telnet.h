@@ -14,14 +14,18 @@
 #include <thread.h>
 #include <network.h>
 
-/* Testing macros */
-//#define TRACE_TELNET CONSOLE
+/* Testing macros.  Define TRACE_TELNET to trace telnet activity to the serial
+ * console via kprintf (polled, safe from any context). */
+//#define TRACE_TELNET 1
 #ifdef TRACE_TELNET
-#include <stdio.h>
+/* Use kprintf (polled, safe from any context, no UART semaphore) so tracing
+ * does not perturb the telnet/tty path it is observing.  Goes to the serial
+ * console. */
+extern int kprintf(const char *, ...);
 #define TELNET_TRACE(...)     { \
-		fprintf(TRACE_TELNET, "%s:%d (%d) ", __FILE__, __LINE__, gettid()); \
-		fprintf(TRACE_TELNET, __VA_ARGS__); \
-		fprintf(TRACE_TELNET, "\n"); }
+		kprintf("[tn t%d] ", gettid()); \
+		kprintf(__VA_ARGS__); \
+		kprintf("\r\n"); }
 #else
 #define TELNET_TRACE(...)
 #endif
