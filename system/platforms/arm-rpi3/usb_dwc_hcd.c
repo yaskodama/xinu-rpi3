@@ -1094,7 +1094,17 @@ defer_xfer_thread(struct usb_xfer_request *req)
     uint interval_ms;
     uint chan;
 
-    if (req->dev->speed == USB_SPEED_HIGH)
+    if (!usb_is_interrupt_request(req))
+    {
+        /* Bulk/control endpoints have no polling interval, so a NAK'd transfer
+         * should be retried promptly to keep RX latency low.  The periodic
+         * formula below is only meaningful for interrupt endpoints; for a bulk
+         * endpoint bInterval is 0 and (1 << (0 - 1)) is undefined behaviour
+         * that yielded a huge interval here, so the ethernet bulk-IN was being
+         * deferred for many seconds — the cause of the ~10 s ping RTT. */
+        interval_ms = 1;
+    }
+    else if (req->dev->speed == USB_SPEED_HIGH)
     {
         interval_ms = (1 << (req->endpoint_desc->bInterval - 1)) /
                               USB_UFRAMES_PER_MS;
