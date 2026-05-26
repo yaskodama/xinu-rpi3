@@ -38,7 +38,9 @@ extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 #define WEBACTOR_MASK "255.255.255.0"
 #define WEBACTOR_GW   "192.168.3.1"
 
-static int web_receiver_id = -1;
+static int     web_receiver_id = -1;
+static tid_typ web_server_tid   = BADTID;  /* running server thread, or BADTID */
+static short   web_cur_tcpdev   = -1;      /* TCP dev the server is parked on  */
 
 /* Pull the message out of the HTTP request: the body after the blank line if
  * present (POST), otherwise the path after "GET /".  Result is NUL-terminated.
@@ -114,15 +116,76 @@ thread webactor_server(void)
             sleep(100);
             continue;
         }
+        web_cur_tcpdev = (short)tcpdev;   /* so webactor_stop() can free it */
         /* TCP_PASSIVE blocks until a client connects */
         if (open(tcpdev, host, NULL, WEBACTOR_PORT, NULL, TCP_PASSIVE) < 0)
         {
             close(tcpdev);
+            web_cur_tcpdev = -1;
             sleep(100);
             continue;
         }
 
-        n = read(tcpdev, reqbuf, WEB_BUFSZ - 1);
+        /* Read the whole HTTP request.  Xinu's tcpRead() blocks until it has
+         * the full requested length (or the peer closes) — see the
+         * `while (count < len)` loop in device/tcp/tcpRead.c — so a single
+         * read(.., WEB_BUFSZ-1) deadlocks: the client sends a short request
+         * and then waits for the response without closing, so the rest of the
+         * 1023 bytes never arrive.  Read byte-by-byte until the request is
+         * complete: the blank line after the headers, plus any Content-Length
+         * body. */
+        n = 0;
+        {
+            int header_end = -1, content_len = 0, have_cl = 0;
+            while (n < WEB_BUFSZ - 1)
+            {
+                if (read(tcpdev, reqbuf + n, 1) <= 0)
+                {
+                    break;                  /* peer closed / error */
+                }
+                n++;
+                reqbuf[n] = '\0';
+                if (header_end < 0)
+                {
+                    char *p = strstr(reqbuf, "\r\n\r\n");
+                    if (NULL != p)
+                    {
+                        char *cl;
+                        header_end = (int)(p - reqbuf) + 4;
+                        cl = strstr(reqbuf, "Content-Length:");
+                        if (NULL == cl)
+                        {
+                            cl = strstr(reqbuf, "content-length:");
+                        }
+                        if (NULL != cl)
+                        {
+                            cl += 15;
+                            while (' ' == *cl)
+                            {
+                                cl++;
+                            }
+                            while (*cl >= '0' && *cl <= '9')
+                            {
+                                content_len = content_len * 10 + (*cl - '0');
+                                cl++;
+                            }
+                            have_cl = 1;
+                        }
+                    }
+                }
+                if (header_end >= 0)
+                {
+                    if (!have_cl || content_len <= 0)
+                    {
+                        break;              /* no body (e.g. GET) */
+                    }
+                    if (n >= header_end + content_len)
+                    {
+                        break;              /* full body received */
+                    }
+                }
+            }
+        }
         if (n > 0)
         {
             reqbuf[n] = '\0';
@@ -136,22 +199,43 @@ thread webactor_server(void)
             write(tcpdev, (void *)resp, sizeof(resp) - 1);
         }
         close(tcpdev);
+        web_cur_tcpdev = -1;
     }
     return OK;
 }
 
-/* Register the AIPL WebReceiver actor and spawn the HTTP server thread.
- * Returns the AIPL actor id, or SYSERR. */
+/* Stop a running server: kill the server thread and free the TCP device it was
+ * parked on, so the port is released for a clean restart.  Safe to call when no
+ * server is running. */
+void webactor_stop(void)
+{
+    if (BADTID != web_server_tid)
+    {
+        kill(web_server_tid);
+        web_server_tid = BADTID;
+    }
+    if (web_cur_tcpdev >= 0)
+    {
+        close(web_cur_tcpdev);
+        web_cur_tcpdev = -1;
+    }
+}
+
+/* Register the AIPL WebReceiver actor and spawn the HTTP server thread.  If a
+ * server is already running it is stopped first, so calling this again acts as
+ * a restart.  Returns the AIPL actor id, or SYSERR. */
 int webactor_start(void)
 {
     tid_typ tid;
 
+    webactor_stop();                /* drop any previous (possibly stuck) server */
     web_receiver_id = abcl_web_init();
     tid = create((void *)webactor_server, 8192, INITPRIO, "webactor", 0);
     if (SYSERR == tid)
     {
         return SYSERR;
     }
+    web_server_tid = tid;
     ready(tid, RESCHED_NO);
     return web_receiver_id;
 }
