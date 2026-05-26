@@ -988,7 +988,13 @@ dwc_channel_start_xfer(uint chan, struct usb_xfer_request *req)
     if (IS_WORD_ALIGNED(data))
     {
         /* Can DMA directly from source or to destination if word-aligned.  */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+        /* The DWC DMA engine sees VideoCore bus addresses; with the D-cache
+         * off the uncached 0xC0000000 alias points at the same RAM. */
+        chanptr->dma_address = (uint32_t)data + 0xC0000000;
+#else
         chanptr->dma_address = (uint32_t)data;
+#endif
     }
     else
     {
@@ -996,7 +1002,11 @@ dwc_channel_start_xfer(uint chan, struct usb_xfer_request *req)
          * destination is not word-aligned.  If the attempted transfer size
          * overflows this alternate buffer, cap it to the greatest number of
          * whole packets that fit.  */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+        chanptr->dma_address = (uint32_t)aligned_bufs[chan] + 0xC0000000;
+#else
         chanptr->dma_address = (uint32_t)aligned_bufs[chan];
+#endif
         if (transfer.size > sizeof(aligned_bufs[chan]))
         {
             transfer.size = sizeof(aligned_bufs[chan]) -

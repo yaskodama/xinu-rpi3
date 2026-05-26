@@ -8,7 +8,11 @@
 
 #include <arm.h>     /* For ARM_MODE_SYS */
 
-#define NULLSTK 8192
+/* Null-thread stack.  sysinit()/usbinit() run on this stack during early
+ * boot, and the USB enumeration call chain is deep; Cortex-A53 frames are
+ * larger than Pi1's ARM1176, so 8 KB overflowed (crash in a bind_device
+ * prologue).  128 KB is plenty given the ~195 MB heap. */
+#define NULLSTK 0x20000
 
 .section .init
 	.globl _start
@@ -75,10 +79,10 @@ _vectors:
 	ldr pc, fiq_addr	  /* FIQ (Fast interrupt request) handler */
 
 reset_addr:     .word reset_handler
-undef_addr:     .word reset_handler
-swi_addr:       .word reset_handler
-prefetch_addr:  .word reset_handler
-abort_addr:     .word reset_handler
+undef_addr:     .word exc_undef       /* Pi3 bring-up: report + halt instead */
+swi_addr:       .word reset_handler   /* of silently looping to reset_handler */
+prefetch_addr:  .word exc_pabort
+abort_addr:     .word exc_dabort
 reserved_addr:  .word reset_handler
 irq_addr:       .word irq_handler
 fiq_addr:       .word reset_handler
@@ -86,6 +90,76 @@ fiq_addr:       .word reset_handler
 _endvectors:
 
 .section .text
+
+/* Pi3 bring-up exception reporters: print "!EXC <type> <faulting-pc>" to the
+ * PL011 UART and halt, instead of silently jumping to reset_handler (which
+ * looked like a reboot loop).  Register-only (banked SP isn't set up in the
+ * exception modes).  Look the printed PC up in xinu.elf to find the culprit. */
+exc_undef:    mov r5, #'U'; sub r6, lr, #4; mov r8, #0; b exc_report
+exc_pabort:   mov r5, #'P'; sub r6, lr, #4; mov r8, #0; b exc_report
+exc_dabort:   mov r5, #'A'; sub r6, lr, #8; mrc p15, 0, r8, c6, c0, 0; b exc_report
+/* (r9 = SCTLR, captured in exc_report so all paths show it) */
+exc_report:
+	mrc p15, 0, r9, c1, c0, 0    /* SCTLR: bit0=M(MMU) bit1=A(align) bit2=C */
+	ldr r2, =0x3F201000          /* PL011 base */
+	ldr r3, =0x301
+	str r3, [r2, #0x30]          /* ensure UART enabled */
+	mov r3, #0x0d; bl exc_putc
+	mov r3, #0x0a; bl exc_putc
+	mov r3, #'!'; bl exc_putc
+	mov r3, #'E'; bl exc_putc
+	mov r3, #'X'; bl exc_putc
+	mov r3, #'C'; bl exc_putc
+	mov r3, #' '; bl exc_putc
+	mov r3, r5;   bl exc_putc    /* exception type: U/P/A */
+	mov r3, #' '; bl exc_putc
+	mov r7, #28                  /* print r6 as 8 hex digits */
+exc_hex:
+	mov r3, r6, lsr r7
+	and r3, r3, #0xf
+	cmp r3, #10
+	addlt r3, r3, #'0'
+	addge r3, r3, #('a' - 10)
+	bl exc_putc
+	subs r7, r7, #4
+	bge exc_hex
+	mov r3, #' '; bl exc_putc
+	mov r3, #'d'; bl exc_putc
+	mov r3, #'='; bl exc_putc
+	mov r7, #28                  /* print r8 (DFAR, data fault addr) as hex */
+exc_hex2:
+	mov r3, r8, lsr r7
+	and r3, r3, #0xf
+	cmp r3, #10
+	addlt r3, r3, #'0'
+	addge r3, r3, #('a' - 10)
+	bl exc_putc
+	subs r7, r7, #4
+	bge exc_hex2
+	mov r3, #' '; bl exc_putc
+	mov r3, #'s'; bl exc_putc
+	mov r3, #'='; bl exc_putc
+	mov r7, #28                  /* print r9 (SCTLR) as hex */
+exc_hex3:
+	mov r3, r9, lsr r7
+	and r3, r3, #0xf
+	cmp r3, #10
+	addlt r3, r3, #'0'
+	addge r3, r3, #('a' - 10)
+	bl exc_putc
+	subs r7, r7, #4
+	bge exc_hex3
+	mov r3, #0x0d; bl exc_putc
+	mov r3, #0x0a; bl exc_putc
+exc_halt:
+	wfe
+	b exc_halt
+exc_putc:
+	ldr r4, [r2, #0x18]          /* FR */
+	tst r4, #0x20               /* TXFF */
+	bne exc_putc
+	str r3, [r2, #0x00]          /* DR */
+	bx lr
 
 	/* reset_handler: Reset handler routine executed to start up the kernel,
 	 * when the ARM processor is reset, or (currently) when an unhandled
@@ -118,17 +192,15 @@ reset_handler:
 	ldmia r1!, {r2-r9}
 	stmia r0!, {r2-r9}
 
-	/* Enable the following features by modifying the ARM processor's
-	 * Control Register:
-	 *
-	 * - unaligned memory accesses   (bit 22)
-	 *
-	 * Note: Xinu shouldn't do any unaligned memory accesses on purpose, but
-	 * we found that gcc can still generate unaligned memory accesses for
-	 * tasks such as copying character strings.  (An alternative would be to
-	 * pass -mno-unaligned-access to gcc to prevent it from doing so.)  */
+	/* Allow unaligned memory accesses.  gcc generates unaligned loads/stores
+	 * (e.g. 16-bit reads of USB descriptor fields like wMaxPacketSize at odd
+	 * offsets), and the USB enumeration hit an alignment data abort on the
+	 * Cortex-A53.  On ARMv8-AArch32 the legacy U bit (22) is deprecated/RAO;
+	 * what matters is SCTLR.A (bit 1) — it MUST be CLEAR to permit unaligned
+	 * accesses to Normal memory.  Clear A, and set bit 22 for old cores. */
 	mrc p15, 0, r0, c1, c0, 0
-	orr r0, #1 << 22
+	bic r0, r0, #(1 << 1)        /* clear SCTLR.A: allow unaligned accesses */
+	orr r0, r0, #(1 << 22)       /* legacy unaligned-support bit (RAO on ARMv7+) */
 	mcr p15, 0, r0, c1, c0, 0
 
 	/* Clear the .bss section of the kernel.  */

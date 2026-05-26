@@ -356,6 +356,18 @@ thread shell(int indescrp, int outdescrp, int errdescrp)
             continue;
         }
 
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+        /* Keyboard/HDMI shell (TTY1): wipe the framebuffer before each
+         * command so its output starts at the top of a fresh screen and is
+         * fully visible.  Smooth scrolling is impractical here because the
+         * GPU framebuffer can't be read back with the D-cache off. */
+        if (outdescrp == TTY1)
+        {
+            extern void fbConsoleClear(void);
+            fbConsoleClear();
+        }
+#endif
+
         /* Handle command if it is built-in */
         if (commandtab[i].builtin)
         {

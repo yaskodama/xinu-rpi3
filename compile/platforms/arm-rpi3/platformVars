@@ -11,7 +11,12 @@ PLATFORM_NAME := Raspberry Pi
 
 # Target the Cortex-A53 used on the BCM2837 (Raspberry Pi 3), running in
 # 32-bit AArch32 mode.  -marm forces ARM (not Thumb) like the Pi1 build.
-CFLAGS   += -mcpu=cortex-a53 -marm
+# -mno-unaligned-access: with the MMU off, ARMv8-AArch32 treats all memory as
+# Strongly-Ordered, where unaligned accesses ALWAYS fault (independent of
+# SCTLR.A).  Xinu/gcc otherwise emit unaligned 16/32-bit loads (e.g. USB
+# descriptor fields at odd offsets), which data-aborted during enumeration on
+# the Pi3 (Pi1's ARMv6 tolerated them).  This forces byte-wise access instead.
+CFLAGS   += -mcpu=cortex-a53 -marm -mno-unaligned-access
 ASFLAGS  += -mcpu=cortex-a53
 
 # Keep _ARM_RPI_ so existing Pi source paths compile, and add an

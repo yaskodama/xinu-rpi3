@@ -136,6 +136,7 @@ ulong physToBus(void *);
 void writeMMIO(ulong, ulong, ulong);
 ulong readMMIO(ulong, ulong);
 void screenClear(ulong);
+void fbConsoleClear(void);
 void minishellClear(ulong);
 void viewlinemap(void); 
 void drawPixel(int, int, ulong);

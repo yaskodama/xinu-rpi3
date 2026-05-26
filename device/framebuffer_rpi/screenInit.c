@@ -101,6 +101,19 @@ int framebufferInit() {
 	return OK;
 }
 
+/* Clear the framebuffer console and move the cursor home.  Called by the
+ * keyboard shell before each command runs, so every command's output starts
+ * on a fresh screen and is fully visible (smooth scrolling is impractical
+ * here because the GPU framebuffer cannot be read back with the D-cache
+ * off). */
+void fbConsoleClear(void) {
+    if (screen_initialized) {
+        screenClear(background);
+        cursor_row = 0;
+        cursor_col = 0;
+    }
+}
+
 /* Very heavy handed clearing of the screen to a single color. */
 void screenClear(ulong color) {
 	ulong *address = (ulong *)(framebufferAddress);

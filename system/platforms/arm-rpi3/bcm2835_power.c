@@ -81,6 +81,57 @@ static uint bcm2835_power_mask;
  * @return
  *      ::OK if successful; ::SYSERR otherwise.
  */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+
+/* Pi3 (BCM2837): the legacy channel-0 power-management mailbox is gone.
+ * Power devices on/off via the VideoCore *property* mailbox (channel 8)
+ * using the SET_POWER_STATE tag.  POWER_USB (==3) maps directly to the
+ * property device id for the USB HCD. */
+#define MAILBOX_CHANNEL_PROPERTY 8
+
+/* 16-byte-aligned property message buffer (low RAM; D-cache is off). */
+static volatile uint prop_buf[8] __attribute__((aligned(16)));
+
+int bcm2835_setpower(enum board_power_feature feature, bool on)
+{
+    volatile uint *b = prop_buf;
+    uint addr, val;
+
+    b[0] = 8 * 4;            /* total buffer size in bytes        */
+    b[1] = 0;                /* request code                      */
+    b[2] = 0x00028001;       /* tag: SET_POWER_STATE              */
+    b[3] = 8;                /* value buffer size (2 words)       */
+    b[4] = 0;                /* tag request code                  */
+    b[5] = (uint)feature;    /* device id (POWER_USB == 3 == HCD) */
+    b[6] = on ? 0x3 : 0x2;   /* bit0 = on/off, bit1 = wait stable */
+    b[7] = 0;                /* end tag                           */
+
+    /* Hand the GPU the uncached bus alias so it reads RAM directly
+     * (Xinu runs with the D-cache off). */
+    addr = (uint)prop_buf + 0xC0000000;
+
+    while (mailbox_regs[MAILBOX_STATUS] & MAILBOX_FULL)
+        ;
+    mailbox_regs[MAILBOX_WRITE] =
+        (addr & ~MAILBOX_CHANNEL_MASK) | MAILBOX_CHANNEL_PROPERTY;
+
+    do
+    {
+        while (mailbox_regs[MAILBOX_STATUS] & MAILBOX_EMPTY)
+            ;
+        val = mailbox_regs[MAILBOX_READ];
+    } while ((val & MAILBOX_CHANNEL_MASK) != MAILBOX_CHANNEL_PROPERTY);
+
+    return (b[1] == 0x80000000) ? OK : SYSERR;
+}
+
+void bcm2835_power_init(void)
+{
+    /* The property interface needs no pre-clear of a power mask. */
+}
+
+#else  /* Pi1 (BCM2835): legacy channel-0 power-management mailbox */
+
 int bcm2835_setpower(enum board_power_feature feature, bool on)
 {
     uint bit;
@@ -110,3 +161,5 @@ void bcm2835_power_init(void)
     bcm2835_set_power_mask(0);
     bcm2835_power_mask = 0;
 }
+
+#endif
