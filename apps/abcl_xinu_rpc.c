@@ -29,6 +29,12 @@
 #include <stddef.h>
 #include <kernel.h>
 #include <thread.h>
+#include <device.h>
+#include <ether.h>
+#include <network.h>
+#include <ipv4.h>
+#include <tcp.h>
+#include <clock.h>
 
 /* Value tag layout must mirror c_translator.ml's runtime_prelude_xinu
    and apps/abcl_xinu_gui.c. */
@@ -48,6 +54,12 @@ extern int  abcl_n_objects(void);
 extern int  abcl_object_class_id(int obj_id);
 extern const char* abcl_class_name(int class_id);
 extern int  abcl_object_field_get(int obj_id, int field_idx, value_t *out);
+
+/* Transport selector: when >= 0 the RPC reply/output is written to this TCP
+ * device (the ethernet AIPL-RPC server, abcl_rpc_tcp_main) instead of UART1.
+ * This lets the proven SEND/QUERY/PING/LIST handlers serve a remote Mac over
+ * the LAN78xx TCP stack — the real Pi3 has no spare UART for UART1 RPC. */
+static int g_rpc_tcpdev = -1;
 
 /* ============================================================
  *  PL011 UART1 driver (memory-mapped at 0x101F2000).
@@ -99,6 +111,13 @@ static void uart1_putc(char c)
 
 static void uart1_puts(const char *s)
 {
+    if (g_rpc_tcpdev >= 0)
+    {
+        int len = 0;
+        while (s[len]) len++;
+        if (len > 0) write(g_rpc_tcpdev, (void *)s, len);
+        return;
+    }
     while (*s) uart1_putc(*s++);
 }
 
@@ -629,6 +648,115 @@ thread rpc_dispatcher_main(void)
         }
     }
     return OK;
+}
+
+/* ============================================================
+ *  TCP transport — same line protocol over the LAN78xx/ethernet
+ *  TCP stack, so a Mac running the Py-I `uart1://host:port` client
+ *  can drive the Xinu actor table over the network.  The dispatcher
+ *  is single-client (one long-lived connection carries every request
+ *  from all host philosophers, serialised by the Py-I socket lock) —
+ *  which also sidesteps the Pi3 TCP listener-recycling issues, since
+ *  we accept once and stay connected.
+ * ============================================================ */
+
+/* TCP-safe opcode subset (no LOAD/COMPILE/RUN — those stream raw bytes
+ * from the UART1 RX path).  All replies go through uart1_puts(), which
+ * is redirected to g_rpc_tcpdev while a TCP client is connected. */
+static void rpc_dispatch_line(char *line)
+{
+    char *toks[MAX_RPC_TOKS];
+    int   n_toks;
+
+    if (line[0] == '\0') return;
+    n_toks = rpc_split(line, toks, MAX_RPC_TOKS);
+    if (n_toks == 0) return;
+
+    if (str_eq_short(toks[0], "PING"))       handle_ping();
+    else if (str_eq_short(toks[0], "SEND"))  handle_send(toks, n_toks);
+    else if (str_eq_short(toks[0], "QUERY")) handle_query(toks, n_toks);
+    else if (str_eq_short(toks[0], "LIST"))  handle_list();
+    else if (str_eq_short(toks[0], "SPAWN")) handle_spawn(toks, n_toks);
+    else                                     send_err("unknown opcode");
+}
+
+/* Read one LF-terminated line from the TCP connection.  Returns the line
+ * length, or -1 on EOF/error (peer closed).  Reads one byte at a time so it
+ * never blocks waiting for a fixed count that the client won't send. */
+static int rpc_tcp_readline(int dev, char *out, int cap)
+{
+    int  n = 0;
+    char c;
+    for (;;)
+    {
+        if (read(dev, &c, 1) != 1) return -1;   /* peer closed / error */
+        if (c == '\r') continue;
+        if (c == '\n') { out[n] = '\0'; return n; }
+        if (n + 1 < cap) out[n++] = c;
+    }
+}
+
+/* AIPL RPC server over TCP.  Accepts one client at a time and serves every
+ * request on that connection until the peer closes, then re-accepts. */
+thread abcl_rpc_tcp_main(int port)
+{
+    struct netif   *interface;
+    struct netaddr *host;
+    ushort tcpdev;
+    char   line[MAX_RPC_LINE];
+
+    interface = netLookup((ethertab[0].dev)->num);
+    if (NULL == interface)
+    {
+        kprintf("[rpc-tcp] ETH0 has no IP — netUp first\r\n");
+        return SYSERR;
+    }
+    host = &(interface->ip);
+    kprintf("[rpc-tcp] AIPL RPC server up on TCP port %d\r\n", port);
+
+    while (TRUE)
+    {
+        tcpdev = tcpAlloc();
+        if (SYSERR == (short)tcpdev) { sleep(100); continue; }
+        if (open(tcpdev, host, NULL, port, NULL, TCP_PASSIVE) < 0)
+        {
+            close(tcpdev);
+            sleep(100);
+            continue;
+        }
+        /* Route all RPC replies to this connection. */
+        g_rpc_tcpdev = (short)tcpdev;
+        uart1_puts("OK ready=1\r\n");   /* boot greeting (client drains it) */
+        kprintf("[rpc-tcp] client connected\r\n");
+        for (;;)
+        {
+            if (rpc_tcp_readline(tcpdev, line, sizeof line) < 0)
+                break;                  /* peer closed */
+            rpc_dispatch_line(line);
+        }
+        g_rpc_tcpdev = -1;
+        close(tcpdev);
+        kprintf("[rpc-tcp] client disconnected\r\n");
+    }
+    return OK;
+}
+
+/* Start the ethernet AIPL-RPC server (call after netUp + actors exist). */
+void abcl_rpc_tcp_start(int port)
+{
+    tid_typ tid;
+    tid = create((void *)abcl_rpc_tcp_main, 8192, INITPRIO,
+                 "aipl-rpc-tcp", 1, port);
+    if (tid != SYSERR)
+    {
+        ready(tid, RESCHED_NO);
+        kprintf("[rpc-tcp] dispatcher thread created tid=%d port=%d\r\n",
+                (int)tid, port);
+    }
+    else
+    {
+        kprintf("[rpc-tcp] FAILED to create dispatcher thread\r\n");
+    }
 }
 
 /* External-facing starter — call this from system/main.c (or any boot

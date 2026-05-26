@@ -281,6 +281,25 @@ thread webactor_autostart(void)
     kprintf("[webactor] autostart: netUp %s/%s gw %s\r\n",
             WEBACTOR_IP, WEBACTOR_MASK, WEBACTOR_GW);
 
+    /* Distributed dining philosophers: bring up the AIPL actor table
+     * (5 Forks = ids 0..4, plus the 2 Xinu Philosophers P4=id5 / P5=id6,
+     * apps/abcl_program.c) and the ethernet AIPL-RPC server so the 3 Mac
+     * philosophers can acquire/release/query those same Fork actors over
+     * the LAN via Py-I's uart1://192.168.3.50:5555 client.  aipl_main runs
+     * BEFORE webactor_start so the Forks keep ids 0..4 (the WebReceiver,
+     * if started, lands at a higher id and never shifts them). */
+    {
+        extern thread aipl_main(void);
+        extern void   abcl_rpc_tcp_start(int port);
+        tid_typ at = create((void *)aipl_main, 16384, INITPRIO, "AIPL", 0);
+        if (SYSERR != at)
+        {
+            ready(at, RESCHED_NO);
+        }
+        sleep(800);                 /* let the 7 actors spawn (ids 0..6) */
+        abcl_rpc_tcp_start(5555);   /* Mac <-> Xinu fork RPC over ethernet */
+    }
+
     webactor_start();
     return OK;
 }
