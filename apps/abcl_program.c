@@ -60,15 +60,60 @@ static value_t v_binop(const char *op, value_t a, value_t b) {
   return mk_int(0);
 }
 
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+extern void aipl_console_puts(const char *s);  /* HDMI console (apps/gwm.c) */
+#endif
+
+static void v_int_to_buf(char *b, int *p, long n) {
+  char t[20];
+  int  i = 0, j, neg = (n < 0);
+  if (neg) n = -n;
+  if (n == 0) t[i++] = '0';
+  while (n > 0) { t[i++] = (char)('0' + (n % 10)); n /= 10; }
+  if (neg) b[(*p)++] = '-';
+  for (j = i - 1; j >= 0; j--) b[(*p)++] = t[j];
+}
+
+/* Print a value to the serial console AND (on the Pi3) the on-screen
+ * AIPL print window. */
 static void v_print(value_t v) {
-  wait(print_mu);
+  char line[80];
+  int  p = 0, i;
   switch (v.tag) {
-  case V_STR: kprintf("%s\r\n", v.s ? v.s : ""); break;
-  case V_INT: kprintf("%d\r\n", (int)v.i);       break;
-  case V_OBJ: kprintf("<obj %d>\r\n", v.obj_id); break;
-  default:    kprintf("<nil>\r\n");              break;
+  case V_STR: { const char *s = v.s ? v.s : "";
+                for (i = 0; s[i] && p < 79; i++) line[p++] = s[i]; break; }
+  case V_INT: v_int_to_buf(line, &p, v.i); break;
+  case V_OBJ: { const char *pre = "<obj ";
+                for (i = 0; pre[i] && p < 79; i++) line[p++] = pre[i];
+                v_int_to_buf(line, &p, v.obj_id);
+                if (p < 79) line[p++] = '>'; break; }
+  default:    { const char *s = "<nil>";
+                for (i = 0; s[i] && p < 79; i++) line[p++] = s[i]; break; }
   }
+  line[p] = '\0';
+  wait(print_mu);
+  kprintf("%s\r\n", line);
   signal(print_mu);
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+  aipl_console_puts(line);
+#endif
+}
+
+/* Narrate a Xinu philosopher's state into the AIPL print stream (serial +
+ * HDMI console): formats "P<pid> <action>" and prints it. */
+void abcl_phil_say(int pid, const char *action) {
+  static char pool[8][48];
+  static int  slot = 0;
+  char *b = pool[slot & 7];
+  int   p = 0, i = 0;
+  slot++;
+  b[p++] = 'P';
+  if (pid >= 10) b[p++] = (char)('0' + (pid / 10));
+  b[p++] = (char)('0' + (pid % 10));
+  b[p++] = ' ';
+  while (action[i] && p < 46) b[p++] = action[i++];
+  b[p] = '\0';
+  v_print(mk_str(b));
 }
 
 typedef struct {
@@ -427,7 +472,7 @@ static void init_fields_Philosopher(int self_id) {
   objects[self_id].fields[F_Philosopher_my_id] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_f_low] = mk_int(0L);
   objects[self_id].fields[F_Philosopher_f_high] = mk_int(0L);
-  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(100L));
+  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(200L));
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
 }
@@ -440,7 +485,7 @@ static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_ar
   objects[self_id].fields[F_Philosopher_my_id] = mk_int((long)(p_id_arg));
   objects[self_id].fields[F_Philosopher_f_low] = mk_obj((int)(p_lo));
   objects[self_id].fields[F_Philosopher_f_high] = mk_obj((int)(p_hi));
-  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(100L));
+  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(200L));
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
   enqueue(self_id, self_id, "try_eat", 0, NULL);
@@ -448,9 +493,12 @@ static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_ar
 
 static void Philosopher_try_eat(int self_id, int sender_id, value_t* args, int n_args) {
   (void)args; (void)n_args; (void)sender_id;
+  int _pid = (int)((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f));
   if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_meals]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meals]).i : (long)((objects[self_id].fields[F_Philosopher_meals]).f))) == (0L))))))) {
-    v_print(mk_int((long)(((70000L) + (((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f)))))));
+    abcl_phil_say(_pid, "is full (done eating)");
   } else {
+    abcl_phil_say(_pid, "thinking");
+    sleep(450);   /* pace so the narration is readable on the console */
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_low].obj_id, "acquire", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
   }
 }
@@ -458,15 +506,22 @@ static void Philosopher_try_eat(int self_id, int sender_id, value_t* args, int n
 static void Philosopher_fork_granted(int self_id, int sender_id, value_t* args, int n_args) {
   (void)args; (void)n_args; (void)sender_id;
   value_t p_pid = (n_args > 0) ? args[0] : mk_int(0L);
+  int _pid = (int)((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f));
   if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_state]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_state]).i : (long)((objects[self_id].fields[F_Philosopher_state]).f))) == (0L))))))) {
+    /* got the first (low) fork — go for the second (high) one. */
     objects[self_id].fields[F_Philosopher_state] = mk_int((long)(1L));
+    abcl_phil_say(_pid, "took a fork");
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_high].obj_id, "acquire", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
   } else {
-    v_print(mk_int((long)(((((60000L) + (((100L) * (((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))))) + (((objects[self_id].fields[F_Philosopher_meal_idx]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meal_idx]).i : (long)((objects[self_id].fields[F_Philosopher_meal_idx]).f)))))));
+    /* got the second fork — both held, so eat, then put them down. */
+    abcl_phil_say(_pid, "took a fork");
+    abcl_phil_say(_pid, "eating");
+    sleep(450);   /* eating (holds both forks) */
     objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(((((objects[self_id].fields[F_Philosopher_meal_idx]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meal_idx]).i : (long)((objects[self_id].fields[F_Philosopher_meal_idx]).f))) + (1L))));
     objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(((((objects[self_id].fields[F_Philosopher_meals]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meals]).i : (long)((objects[self_id].fields[F_Philosopher_meals]).f))) - (1L))));
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_high].obj_id, "release", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_low].obj_id, "release", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
+    abcl_phil_say(_pid, "put down forks");
     objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
     enqueue(self_id, self_id, "try_eat", 0, NULL);
   }

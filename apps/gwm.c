@@ -523,6 +523,61 @@ static void actor_draw(window_t *self, unsigned int frame)
     }
 }
 
+/* ===================================================================
+ *  AIPL print console window — shows the text passed to the AIPL
+ *  print() / v_print() runtime (apps/abcl_program.c calls
+ *  aipl_console_puts() for every printed line).  A scrolling ring of
+ *  the most recent lines; the Xinu philosophers narrate their state
+ *  here (thinking / took fork / eating / put down fork).
+ * =================================================================== */
+#define CON_ROWS  23
+#define CON_COLW  50
+static char con_ring[CON_ROWS][CON_COLW];
+static volatile unsigned int con_head = 0;          /* total lines ever written */
+static unsigned int con_drawn = 0xFFFFFFFFu;
+
+/* Append one line to the console ring.  Called from the AIPL runtime
+ * (abcl_program.c v_print) on the actor threads. */
+void aipl_console_puts(const char *s)
+{
+    unsigned int slot = con_head % CON_ROWS;
+    int i = 0;
+    while (s && s[i] && i < CON_COLW - 1) { con_ring[slot][i] = s[i]; i++; }
+    while (i < CON_COLW - 1) con_ring[slot][i++] = ' ';   /* pad: clean overwrite */
+    con_ring[slot][CON_COLW - 1] = '\0';
+    con_head++;
+}
+
+static window_t console_win;
+
+static void console_draw(window_t *self, unsigned int frame)
+{
+    int cx = self->x + 6;
+    int y0 = self->y + WM_TITLEBAR_H + 4;
+    unsigned int head, total, start;
+    int r;
+
+    if ((frame % 7) != 0) return;       /* ~3 Hz */
+    head = con_head;
+    if (head == con_drawn) return;       /* nothing new since last paint */
+    con_drawn = head;
+
+    total = head;
+    start = (total > CON_ROWS) ? (total - CON_ROWS) : 0;
+    for (r = 0; r < CON_ROWS; r++) {
+        int ry = y0 + r * 12;
+        if (start + (unsigned int)r < total) {
+            unsigned int slot = (start + (unsigned int)r) % CON_ROWS;
+            /* the line is space-padded to full width, so this single draw
+             * cleanly overwrites the previous row content (low flicker). */
+            draw_string_at(cx, ry, con_ring[slot],
+                           0xFF40FF80U, self->content_bg);
+        } else {
+            fill_rect(self->x + 1, ry, self->width - 2, 12, self->content_bg);
+        }
+    }
+}
+
 thread gwm_main(void)
 {
     extern int kprintf(const char *, ...);
@@ -555,9 +610,10 @@ thread gwm_main(void)
     info_win.draw_content = info_draw;
     wm_add(&info_win);
 
-    /* Soft keyboard window: lower-left, sized for the 1024-wide panel. */
+    /* Soft keyboard window: bottom, below the actor monitor (which ends at
+     * y=456) so the two never overlap. */
     softkbd_win.x = 16;
-    softkbd_win.y = 200;
+    softkbd_win.y = 470;
     softkbd_win.width  = 640;
     softkbd_win.height = 220;
     title_set(&softkbd_win, "Soft keyboard");
@@ -567,6 +623,20 @@ thread gwm_main(void)
     softkbd_win.content_bg   = 0xFF0A0A14U;
     softkbd_win.draw_content = softkbd_draw;
     wm_add(&softkbd_win);
+
+    /* AIPL print console: left column, below the info window and left of
+     * the actor monitor (no overlap with info / actor / soft keyboard). */
+    console_win.x = 16;
+    console_win.y = 148;
+    console_win.width  = 420;
+    console_win.height = 304;
+    title_set(&console_win, "AIPL console (print)");
+    console_win.chrome_color = 0xFF80FF80U;
+    console_win.title_bg     = 0xFF205020U;
+    console_win.title_fg     = 0xFFFFFFFFU;
+    console_win.content_bg   = 0xFF001000U;
+    console_win.draw_content = console_draw;
+    wm_add(&console_win);
 
     /* Actor monitor: right side, tall enough for the whole table. */
     actor_win.x = 448;
