@@ -414,6 +414,115 @@ static void title_set(window_t *w, const char *t)
     w->title[i] = 0;
 }
 
+/* ===================================================================
+ *  Actor monitor window — a live table of the AIPL actors currently
+ *  on this Xinu node: id, class, active state, and message counts
+ *  (RECV = received, PROC = processed, PEND = backlog).  Reads the
+ *  runtime via the abcl_object_* accessors every refresh, so actors
+ *  spawned at runtime (e.g. over the RPC link) appear automatically.
+ * =================================================================== */
+extern int         abcl_n_objects(void);
+extern int         abcl_object_class_id(int obj_id);
+extern const char *abcl_class_name(int class_id);
+extern int         abcl_object_enq(int obj_id);
+extern int         abcl_object_deq(int obj_id);
+extern int         abcl_object_drops(int obj_id);
+extern int         abcl_object_started(int obj_id);
+
+static window_t actor_win;
+
+#define ACT_MAX_ROWS 30
+#define ACT_LINE_W   64
+static char act_row_cache[ACT_MAX_ROWS][ACT_LINE_W];
+
+static void act_put_str(char *b, int *p, const char *s, int w)
+{
+    int i = 0;
+    while (s && s[i] && i < w) { b[(*p)++] = s[i]; i++; }
+    while (i < w) { b[(*p)++] = ' '; i++; }
+}
+
+static void act_put_int(char *b, int *p, long v, int w)
+{
+    char t[20];
+    int  n = 0, neg = 0, j, pad;
+    if (v < 0) { neg = 1; v = -v; }
+    if (v == 0) t[n++] = '0';
+    while (v > 0) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+    if (neg) t[n++] = '-';
+    for (pad = w - n; pad > 0; pad--) b[(*p)++] = ' ';
+    for (j = n - 1; j >= 0; j--) b[(*p)++] = t[j];
+}
+
+static int act_str_eq(const char *a, const char *b)
+{
+    int i;
+    for (i = 0; i < ACT_LINE_W; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
+}
+
+static void act_str_cpy(char *d, const char *s)
+{
+    int i;
+    for (i = 0; i < ACT_LINE_W - 1 && s[i]; i++) d[i] = s[i];
+    d[i] = '\0';
+}
+
+static void actor_draw(window_t *self, unsigned int frame)
+{
+    int cx = self->x + 6;
+    int y0 = self->y + WM_TITLEBAR_H + 4;
+    int n, i, p;
+    char line[ACT_LINE_W];
+    unsigned int bg = self->content_bg;
+
+    /* Refresh a few times a second; the uncached framebuffer flickers
+     * if every 20 fps frame repaints, so update on every 7th frame. */
+    if ((frame % 7) != 0) return;
+
+    draw_string_at(cx, y0, "ID CLASS        ST   RECV  PROC  PEND",
+                   0xFF80C0FFU, bg);
+
+    n = abcl_n_objects();
+    for (i = 0; i < ACT_MAX_ROWS - 1; i++) {
+        int ry = y0 + (i + 1) * 12;
+        if (i < n) {
+            int enq  = abcl_object_enq(i);
+            int deq  = abcl_object_deq(i);
+            int pend = enq - deq;
+            const char *cls = abcl_class_name(abcl_object_class_id(i));
+            const char *st;
+            if (!abcl_object_started(i)) st = "new";
+            else if (pend > 0)           st = "act";
+            else                         st = "idle";
+            p = 0;
+            act_put_int(line, &p, i, 2);                line[p++] = ' ';
+            act_put_str(line, &p, cls ? cls : "?", 12); line[p++] = ' ';
+            act_put_str(line, &p, st, 4);               line[p++] = ' ';
+            act_put_int(line, &p, enq, 5);              line[p++] = ' ';
+            act_put_int(line, &p, deq, 5);              line[p++] = ' ';
+            act_put_int(line, &p, pend, 5);
+            line[p] = '\0';
+        } else {
+            line[0] = '\0';
+        }
+        /* Repaint a row only when its text changed (cuts flicker). */
+        if (!act_str_eq(line, act_row_cache[i])) {
+            fill_rect(self->x + 1, ry, self->width - 2, 12, bg);
+            if (line[0]) {
+                unsigned int fg = (i < n && abcl_object_class_id(i) == 1)
+                                  ? 0xFFFFE080U   /* Philosopher: amber */
+                                  : 0xFFD0D0D0U;  /* others: grey */
+                draw_string_at(cx, ry, line, fg, bg);
+            }
+            act_str_cpy(act_row_cache[i], line);
+        }
+    }
+}
+
 thread gwm_main(void)
 {
     extern int kprintf(const char *, ...);
@@ -458,6 +567,19 @@ thread gwm_main(void)
     softkbd_win.content_bg   = 0xFF0A0A14U;
     softkbd_win.draw_content = softkbd_draw;
     wm_add(&softkbd_win);
+
+    /* Actor monitor: right side, tall enough for the whole table. */
+    actor_win.x = 448;
+    actor_win.y = 16;
+    actor_win.width  = 560;
+    actor_win.height = 440;
+    title_set(&actor_win, "AIPL actors (live)");
+    actor_win.chrome_color = 0xFF60E0A0U;
+    actor_win.title_bg     = 0xFF105030U;
+    actor_win.title_fg     = 0xFFFFFFFFU;
+    actor_win.content_bg   = 0xFF001008U;
+    actor_win.draw_content = actor_draw;
+    wm_add(&actor_win);
 
     /* Start the cursor at the centre of the screen. */
     wm_cursor_set(sw / 2, sh / 2, 1);
