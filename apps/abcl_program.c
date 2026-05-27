@@ -152,6 +152,8 @@ typedef struct {
   mailbox_t mbox;
   tid_typ   tid;
   int       started;
+  volatile int dead;     /* set by abcl_actor_suicide(): the actor's worker
+                            thread exits after the current dispatch returns */
 } object_t;
 
 static object_t objects[MAX_OBJECTS];
@@ -236,6 +238,45 @@ int abcl_object_drops(int obj_id) {
 int abcl_object_started(int obj_id) {
   if (obj_id < 0 || obj_id >= n_objects) return -1;
   return objects[obj_id].started;
+}
+int abcl_object_dead(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  return objects[obj_id].dead;
+}
+
+/* 自殺関数: the actor terminates itself.  Sets the dead flag so its worker
+ * thread (abcl_actor_main) leaves its dispatch loop after the current
+ * message and exits.  Callable from a generated method via self_id. */
+void abcl_actor_suicide(int self_id) {
+  if (self_id < 0 || self_id >= n_objects) return;
+  objects[self_id].dead = 1;
+}
+
+/* Clear the whole actor table so a host program can run again from a clean
+ * slate (the next SPAWN starts at id 0).  Without this, re-running a program
+ * spawns new actors at shifted ids while leftover actors from the previous
+ * run persist, and the table fills toward MAX_OBJECTS.  Stops every actor
+ * thread cooperatively (mark dead + wake it so it leaves its loop), frees the
+ * per-mailbox semaphores, then resets n_objects.  Call when the actors are
+ * idle / between runs (the RESET RPC opcode invokes this). */
+void abcl_rt_reset(void) {
+  int i, total;
+  wait(objects_mu);
+  total = n_objects;
+  signal(objects_mu);
+  for (i = 0; i < total; i++) objects[i].dead = 1;
+  for (i = 0; i < total; i++) signal(objects[i].mbox.items); /* wake blocked */
+  sleep(100);                       /* let the worker threads exit their loops */
+  for (i = 0; i < total; i++) {
+    semfree(objects[i].mbox.items); /* avoid a semaphore leak across resets */
+    objects[i].started = 0;
+    objects[i].dead    = 0;
+  }
+  wait(objects_mu);
+  n_objects = 0;
+  signal(objects_mu);
+  kprintf("[aipl] runtime reset — %d actors cleared, next id starts at 0\r\n",
+          total);
 }
 
 /* Xinu の queue.h にある enqueue() と名前が衝突するのでリネーム。
@@ -472,7 +513,7 @@ static void init_fields_Philosopher(int self_id) {
   objects[self_id].fields[F_Philosopher_my_id] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_f_low] = mk_int(0L);
   objects[self_id].fields[F_Philosopher_f_high] = mk_int(0L);
-  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(200L));
+  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(50L));
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
 }
@@ -485,7 +526,7 @@ static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_ar
   objects[self_id].fields[F_Philosopher_my_id] = mk_int((long)(p_id_arg));
   objects[self_id].fields[F_Philosopher_f_low] = mk_obj((int)(p_lo));
   objects[self_id].fields[F_Philosopher_f_high] = mk_obj((int)(p_hi));
-  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(200L));
+  objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(50L));
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
   enqueue(self_id, self_id, "try_eat", 0, NULL);
@@ -495,7 +536,8 @@ static void Philosopher_try_eat(int self_id, int sender_id, value_t* args, int n
   (void)args; (void)n_args; (void)sender_id;
   int _pid = (int)((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f));
   if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_meals]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meals]).i : (long)((objects[self_id].fields[F_Philosopher_meals]).f))) == (0L))))))) {
-    abcl_phil_say(_pid, "is full (done eating)");
+    abcl_phil_say(_pid, "finished — terminating (suicide)");
+    abcl_actor_suicide(self_id);
   } else {
     abcl_phil_say(_pid, "thinking");
     sleep(450);   /* pace so the narration is readable on the console */
@@ -639,6 +681,7 @@ thread abcl_actor_main(int self_id) {
     if (global_shutdown) break;
     wait(mb->items);
     if (global_shutdown) break;
+    if (objects[self_id].dead) break;   /* woken by suicide / abcl_rt_reset */
 #ifdef _XINU_PLATFORM_ARM_RPI3_
     /* Pi3: strongly-ordered memory, no LDREX/STREX — dequeue under a short
      * interrupt-disabled critical section (matches the producer above). */
@@ -693,6 +736,12 @@ thread abcl_actor_main(int self_id) {
       break;
     }
     dispatch(self_id, m.sender, m.method, m.args, m.n_args);
+    if (objects[self_id].dead) {
+      wait(print_mu);
+      kprintf("[aipl] actor %d terminated (suicide)\r\n", self_id);
+      signal(print_mu);
+      break;            /* self-terminate: leave the loop, thread exits */
+    }
   }
   return OK;
 }

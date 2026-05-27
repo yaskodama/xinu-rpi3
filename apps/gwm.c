@@ -428,6 +428,7 @@ extern int         abcl_object_enq(int obj_id);
 extern int         abcl_object_deq(int obj_id);
 extern int         abcl_object_drops(int obj_id);
 extern int         abcl_object_started(int obj_id);
+extern int         abcl_object_dead(int obj_id);
 
 static window_t actor_win;
 
@@ -495,7 +496,8 @@ static void actor_draw(window_t *self, unsigned int frame)
             int pend = enq - deq;
             const char *cls = abcl_class_name(abcl_object_class_id(i));
             const char *st;
-            if (!abcl_object_started(i)) st = "new";
+            if (abcl_object_dead(i))     st = "dead";
+            else if (!abcl_object_started(i)) st = "new";
             else if (pend > 0)           st = "act";
             else                         st = "idle";
             p = 0;

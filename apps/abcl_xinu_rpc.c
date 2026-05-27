@@ -54,6 +54,7 @@ extern int  abcl_n_objects(void);
 extern int  abcl_object_class_id(int obj_id);
 extern const char* abcl_class_name(int class_id);
 extern int  abcl_object_field_get(int obj_id, int field_idx, value_t *out);
+extern void abcl_rt_reset(void);   /* clear the actor table (RESET opcode) */
 
 /* Transport selector: when >= 0 the RPC reply/output is written to this TCP
  * device (the ethernet AIPL-RPC server, abcl_rpc_tcp_main) instead of UART1.
@@ -382,6 +383,13 @@ static void handle_ping(void)
     kprintf("[rpc] PING\r\n");
 }
 
+static void handle_reset(void)
+{
+    abcl_rt_reset();
+    send_ok("reset=1");
+    kprintf("[rpc] RESET\r\n");
+}
+
 /* ============================================================
  *  LOAD / COMPILE / RUN — dynamic compilation pipeline.
  *
@@ -682,6 +690,7 @@ static void rpc_dispatch_line(char *line)
     if (n_toks == 0) return;
 
     if (str_eq_short(toks[0], "PING"))         handle_ping();
+    else if (str_eq_short(toks[0], "RESET"))   handle_reset();
     else if (str_eq_short(toks[0], "SEND"))    handle_send(toks, n_toks);
     else if (str_eq_short(toks[0], "QUERY"))   handle_query(toks, n_toks);
     else if (str_eq_short(toks[0], "LIST"))    handle_list();
