@@ -431,6 +431,15 @@ extern int xfsWrite(int fd, const void *buf, unsigned int count);
 static int uart1_read_exact(char *buf, int n)
 {
     int i = 0;
+    /* TCP transport: pull the LOAD body straight off the connection. */
+    if (g_rpc_tcpdev >= 0) {
+        while (i < n) {
+            int r = read(g_rpc_tcpdev, buf + i, n - i);
+            if (r <= 0) break;          /* peer closed */
+            i += r;
+        }
+        return i;
+    }
     while (i < n) {
         int c = uart1_getc();
         if (c < 0) continue;
@@ -672,12 +681,15 @@ static void rpc_dispatch_line(char *line)
     n_toks = rpc_split(line, toks, MAX_RPC_TOKS);
     if (n_toks == 0) return;
 
-    if (str_eq_short(toks[0], "PING"))       handle_ping();
-    else if (str_eq_short(toks[0], "SEND"))  handle_send(toks, n_toks);
-    else if (str_eq_short(toks[0], "QUERY")) handle_query(toks, n_toks);
-    else if (str_eq_short(toks[0], "LIST"))  handle_list();
-    else if (str_eq_short(toks[0], "SPAWN")) handle_spawn(toks, n_toks);
-    else                                     send_err("unknown opcode");
+    if (str_eq_short(toks[0], "PING"))         handle_ping();
+    else if (str_eq_short(toks[0], "SEND"))    handle_send(toks, n_toks);
+    else if (str_eq_short(toks[0], "QUERY"))   handle_query(toks, n_toks);
+    else if (str_eq_short(toks[0], "LIST"))    handle_list();
+    else if (str_eq_short(toks[0], "SPAWN"))   handle_spawn(toks, n_toks);
+    else if (str_eq_short(toks[0], "LOAD"))    handle_load(toks, n_toks);
+    else if (str_eq_short(toks[0], "COMPILE")) handle_compile(toks, n_toks);
+    else if (str_eq_short(toks[0], "RUN"))     handle_run(toks, n_toks);
+    else                                       send_err("unknown opcode");
 }
 
 /* Read one LF-terminated line from the TCP connection.  Returns the line

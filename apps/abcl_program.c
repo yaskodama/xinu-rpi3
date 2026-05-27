@@ -172,6 +172,27 @@ int abcl_object_tid(int obj_id) {
   return (int)objects[obj_id].tid;
 }
 
+/* Mailbox telemetry for the on-screen actor monitor (apps/gwm.c).
+ * enq = total messages received, deq = total processed, so (enq - deq)
+ * is the current backlog; drops = messages lost to a full mailbox;
+ * started = 1 once the actor's consumer thread has been spawned. */
+int abcl_object_enq(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  return (int)objects[obj_id].mbox.enq;
+}
+int abcl_object_deq(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  return (int)objects[obj_id].mbox.deq;
+}
+int abcl_object_drops(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  return (int)objects[obj_id].mbox.drops;
+}
+int abcl_object_started(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  return objects[obj_id].started;
+}
+
 /* Xinu の queue.h にある enqueue() と名前が衝突するのでリネーム。
    以降 abcl 側のコードでは enqueue マクロで本関数を呼ぶ。 */
 /* R1 smoke markers: print the FIRST send + FIRST recv to the serial
@@ -641,6 +662,14 @@ int abcl_web_init(void) {
   abcl_rt_init_once();
   if (web_id < 0) web_id = create_obj(CLASS_WebReceiver, 0, NULL);
   return web_id;
+}
+
+/* Initialise the AIPL runtime (mutexes) WITHOUT instantiating any actors.
+ * Used for the "dynamic" dining demo where Xinu boots with zero dining
+ * actors and the Mac spawns the Forks/Philosophers at runtime via SPAWN RPC,
+ * so the first SPAWN'd Fork deterministically becomes actor id 0. */
+void abcl_rt_init(void) {
+  abcl_rt_init_once();
 }
 
 void abcl_web_deliver(int receiver, const char *method, const char *str) {
