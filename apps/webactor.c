@@ -25,6 +25,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <clock.h>
+#include <watchdog.h>  /* watchdogset() for /reboot route */
+#include "sd_block.h"  /* sd_init / sd_read_block for /sd-test route */
 
 /* AIPL bridge (apps/abcl_program.c) */
 extern int  abcl_web_init(void);
@@ -189,6 +191,70 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /sd-test: read LBA 0 (MBR) and report first 16 bytes hex.
+             * Sanity check that the in-kernel SD driver can read the same
+             * card the firmware booted us from. */
+            if (0 == strncmp(reqbuf, "GET /sd-test", 12) ||
+                0 == strncmp(reqbuf, "POST /sd-test", 13))
+            {
+                static unsigned char sd_buf[SD_BLOCK_SIZE];
+                static char sd_resp[600];
+                int rc = sd_read_block(0, sd_buf);
+                int blen;
+                if (rc != 0)
+                {
+                    blen = sprintf(sd_resp + 100,
+                                   "sd_read_block(0) FAILED rc=%d\r\n", rc);
+                }
+                else
+                {
+                    blen = sprintf(sd_resp + 100,
+                                   "sd_read_block(0) OK\r\n"
+                                   "first 16 bytes: %02x %02x %02x %02x "
+                                   "%02x %02x %02x %02x %02x %02x %02x %02x "
+                                   "%02x %02x %02x %02x\r\n"
+                                   "MBR signature [510-511]: %02x %02x (want 55 AA)\r\n",
+                                   sd_buf[0], sd_buf[1], sd_buf[2], sd_buf[3],
+                                   sd_buf[4], sd_buf[5], sd_buf[6], sd_buf[7],
+                                   sd_buf[8], sd_buf[9], sd_buf[10], sd_buf[11],
+                                   sd_buf[12], sd_buf[13], sd_buf[14], sd_buf[15],
+                                   sd_buf[510], sd_buf[511]);
+                }
+                int hlen = sprintf(sd_resp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                /* response = hdr + body; body lives at sd_resp+100; rewrite hdr in place */
+                memcpy(sd_resp + hlen, sd_resp + 100, blen);
+                write(tcpdev, sd_resp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /reboot: BCM2837 watchdog reset (no SD swap needed for soft
+             * recovery).  Detect either GET or POST.  Responds before the
+             * reset takes effect so the client sees the 200; the SoC then
+             * resets and re-loads kernel from SD a moment later. */
+            if (0 == strncmp(reqbuf, "GET /reboot", 11) ||
+                0 == strncmp(reqbuf, "POST /reboot", 12))
+            {
+                static const char reboot_resp[] =
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 11\r\n"
+                    "\r\n"
+                    "rebooting\r\n";
+                kprintf("[webactor] /reboot — triggering watchdog reset\r\n");
+                write(tcpdev, (void *)reboot_resp, sizeof(reboot_resp) - 1);
+                close(tcpdev);
+                /* 10 ms is enough for the TCP write to drain to the wire;
+                 * once watchdogset() fires we never return. */
+                sleep(10);
+                watchdogset(1);
+                /* defensive: should not reach here */
+                while (1) { }
+            }
             extract_message(reqbuf, n, msg, sizeof(msg));
             if (msg[0] != '\0')
             {
@@ -293,6 +359,23 @@ thread webactor_autostart(void)
         extern void abcl_rpc_tcp_start(int port);
         abcl_rt_init();             /* runtime ready, but no actors yet */
         abcl_rpc_tcp_start(5555);   /* Mac <-> Xinu RPC over ethernet */
+    }
+
+    /* Also start the simple HTTP server on 8080 so /reboot, /sd-test, and
+     * other Mac-side recovery tools are available without needing the AIPL
+     * RPC protocol.  Without this, port 8080 stays closed and the only
+     * way to reach Pi 3 is the serial console. */
+    {
+        int rid = webactor_start();
+        if (rid < 0)
+        {
+            kprintf("[webactor] autostart: webactor_start failed\r\n");
+        }
+        else
+        {
+            kprintf("[webactor] autostart: HTTP server up on port %d\r\n",
+                    WEBACTOR_PORT);
+        }
     }
     return OK;
 }
