@@ -92,6 +92,23 @@ struct tcpPseudo
 #define TCP_IBLEN 16384  /**< Size of input buffer, must be multiple of 8 */
 #define TCP_OBLEN 16384  /**< Size of output buffer */
 
+/* Enable the "gracious ACK" path in tcpRead.c: when user-space drains
+ * the receive buffer enough that the advertised window grew, send an
+ * immediate window-update ACK so the sender knows it can resume.
+ *
+ * Without this, large HTTP uploads with multi-KB reads deadlock:
+ *   - sender fills receive buffer (16 KB), advertised window goes to 0
+ *   - sender stops sending
+ *   - our user-space drains the buffer
+ *   - icount drops, window opens — but no ACK is sent
+ *   - sender waits forever for a window update
+ *
+ * Single-byte reads avoid this because the buffer never fills.  The
+ * /upload route used to suffer the deadlock when switched to 4 KB
+ * body-phase chunks; gracious-ACK fixes it at the TCP layer instead
+ * of forcing all readers back to slow byte-by-byte. */
+#define TCP_GRACIOUSACK 1
+
 /* Initial sizes */
 #define TCP_INIT_MSS (1440 + TCP_HDR_LEN)
 //#define TCP_INIT_MSS (4 + TCP_HDR_LEN) 

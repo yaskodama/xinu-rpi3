@@ -187,19 +187,61 @@ thread webactor_server(void)
          * `while (count < len)` loop in device/tcp/tcpRead.c — so a single
          * read(.., WEB_BUFSZ-1) deadlocks: the client sends a short request
          * and then waits for the response without closing, so the rest of the
-         * 1023 bytes never arrive.  Read byte-by-byte until the request is
-         * complete: the blank line after the headers, plus any Content-Length
-         * body. */
+         * 1023 bytes never arrive.
+         *
+         * Strategy: two-phase reader.
+         *   - header phase: ONE BYTE AT A TIME.  A small GET like
+         *                   "GET /api/mmu HTTP/1.1\r\nHost: ...\r\n\r\n"
+         *                   is ~85 B.  If we ask for 128 in one go,
+         *                   Xinu's tcpRead blocks waiting for the
+         *                   missing 43 bytes that the client never
+         *                   sends (it's done) — deadlocks webactor.
+         *                   Per-byte read lets us detect "\r\n\r\n"
+         *                   the instant it arrives and exit.  Header
+         *                   is bounded (a few hundred bytes), so the
+         *                   syscall overhead is small.
+         *   - body phase  : 4 KB chunks once Content-Length is known.
+         *                   Cap stays well under TCP_IBLEN (16 KB) so
+         *                   buffer can refill while we're parsing.
+         *                   The last chunk is sized to exactly the
+         *                   remaining body so we never overshoot.
+         *
+         * Previous version was 1-byte reads through EVERYTHING — O(n^2)
+         * over the whole reqbuf because of per-byte strstr.  A 305 KB
+         * /upload took 92 s; the chunked-body version below drops it
+         * to a few seconds end-to-end. */
         n = 0;
         {
             int header_end = -1, content_len = 0, have_cl = 0;
             while (n < WEB_BUFSZ - 1)
             {
-                if (read(tcpdev, reqbuf + n, 1) <= 0)
+                int want;
+                if (header_end < 0)
+                {
+                    want = 1;               /* 1 byte at a time — see big
+                                             * comment above re GET deadlock */
+                }
+                else
+                {
+                    int remaining = (header_end + content_len) - n;
+                    if (remaining <= 0) break;          /* body complete */
+                    /* Cap at 4 KB — Xinu's TCP input buffer is
+                     * TCP_IBLEN=16384, so asking for the whole IBLEN
+                     * forces a producer/consumer ping-pong with the
+                     * client's TCP window: the first 16 KB read of a
+                     * /upload wedged webactor (kernel still alive,
+                     * pings, just no HTTP).  4 KB is well under IBLEN
+                     * so the buffer can refill while we're parsing. */
+                    want = remaining < 4096 ? remaining : 4096;
+                }
+                if (n + want >= WEB_BUFSZ) want = WEB_BUFSZ - 1 - n;
+                if (want <= 0) break;
+                int r = read(tcpdev, reqbuf + n, want);
+                if (r <= 0)
                 {
                     break;                  /* peer closed / error */
                 }
-                n++;
+                n += r;
                 reqbuf[n] = '\0';
                 if (header_end < 0)
                 {
@@ -227,17 +269,14 @@ thread webactor_server(void)
                             }
                             have_cl = 1;
                         }
-                    }
-                }
-                if (header_end >= 0)
-                {
-                    if (!have_cl || content_len <= 0)
-                    {
-                        break;              /* no body (e.g. GET) */
-                    }
-                    if (n >= header_end + content_len)
-                    {
-                        break;              /* full body received */
+                        if (!have_cl || content_len <= 0)
+                        {
+                            break;          /* no body (e.g. GET) */
+                        }
+                        if (n >= header_end + content_len)
+                        {
+                            break;          /* short body fit in header read */
+                        }
                     }
                 }
             }
