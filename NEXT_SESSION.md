@@ -13,16 +13,16 @@
 - ✅ **HTTP server (port 8080)** — 25+ ルートで introspection + 操作
 - ✅ **AIPL-RPC server (port 5555)** — Mac から SPAWN/COMPILE 等
 - ✅ **C JIT (cc_mvp Stage 5)** — Turing-complete に近い structured C を ARM32 機械語に変換+実行
-- ✅ **負荷分散アクター** — Dispatcher + 4 Workers, sleep & JIT 両モード, pause/resume + per-task tracking + cancellation + 429 backpressure + latency histogram
-- ✅ **Global actor GC (Collector actor)** — 周期 sweep、infrastructure protect、HTTP で configure/enable/sweep_now
+- ✅ **負荷分散アクター** — Dispatcher + 4 Workers, sleep & JIT 両モード, pause/resume + per-task tracking + cancellation + 429 backpressure + latency histogram + **sticky routing + worker restart + rate limit + task timeout + priority (Tier 2 完)**
+- ✅ **Global actor GC (Collector actor)** — 周期 sweep、infrastructure protect、HTTP で configure/enable/sweep_now、task-timeout scan も担当
 - ✅ **MMU enable** — identity-map, RAM/MMIO 領域属性分離
 - ✅ **Network kernel update** — `/upload` + `/kexec` で SD swap 不要のカーネル入れ替え
 - ✅ TCP upload ~26 KB/s (IBLEN bump 後)
 
 **2026-05-27**: ethernet ping 完全動作 (LAN78xx ドライバ + DWC NAK 修正)
-**2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1 + GC actor を一気に積み上げ (30 commits)
+**2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1+2 + GC actor を一気に積み上げ (34 commits)
 
-## 2026-06-01 セッション概要 (30 commits)
+## 2026-06-01 セッション概要 (34 commits)
 
 ```
 3f9fb9e  cc_mvp MVP — int main() { return CONST; }
@@ -44,7 +44,11 @@ fbcc192  README English fork overview
 b7e5b5e  loadbal — pause/resume + per-task tracking + enabled mask
 5e63d31  loadbal Tier 1 — cancellation + 429 backpressure + latency histogram
 11cd126  global actor GC implemented as actor (CLASS_Collector)
-9c89aad  version.h refresh                                      ← 最新
+9c89aad  version.h refresh
+8d1ef4b  NEXT_SESSION refresh (30 commits 全反映)
+53d29bd  loadbal Tier 2 — sticky routing + worker restart + prefix-collision fix
+50b3366  loadbal Tier 2 rest — rate limit + task timeout + priority
+456d247  version.h refresh                                       ← 最新
 ```
 
 ## 重要な追加機能 (このセッション)
@@ -76,7 +80,7 @@ HTTP: `POST /compile` with C source as body。
 - `CLASS_Worker` (4) × 4 — sleep または JIT で並列処理、結果を `done` で dispatcher に返却
 - `LB_N_WORKERS = 4` (MAX_OBJECTS=16 のうち bootstrap 7 + 余裕9)
 
-**production 機能 (b7e5b5e + 5e63d31)**:
+**Tier 1 機能 (b7e5b5e + 5e63d31)**:
 - **Pause/resume drain**: `set_enabled(idx, on)` で worker 一時停止、dispatcher が skip。
   `F_Disp_enabled` mask field (bit i = worker i 有効) で管理。in-flight タスクは完了する。
 - **Per-task tracking**: `lb_tasks[64]` circular buffer に submit_ms/done_ms/result/state 保持。
@@ -87,6 +91,21 @@ HTTP: `POST /compile` with C source as body。
   HTTP 429 + `Retry-After: 1` 返却 (mailbox 飽和を防ぐ)。
 - **Latency histogram**: Worker毎 7 bucket (<50/50-99/100-199/200-499/500-999/1k-2k/≥2k ms)。
   Dispatcher_done が done時に elapsed_ms 計算 → 該当 bucket を増分 → `/api/loadbal/stats` で表示。
+
+**Tier 2 機能 (53d29bd + 50b3366)**:
+- **Sticky routing**: `/api/loadbal/submit-sticky?key=NAME` で djb2(key)%n で同 worker 集中。
+  paused なら次の enabled に walk。実機: key=foo 8 タスク全部 worker 1 (hash=193491849%4=1)。
+- **Worker restart**: `/api/loadbal/restart?w=N` で kill+alloc+spawn+bind+slot 更新。新 obj_id
+  (n_objects bump)。実機: w=1 → obj 3 dead, obj 7 新規割当、後続 submit が obj 7 に届く。
+- **Rate limiting**: token bucket (file-scope state)、`/api/loadbal/rate-limit?per_sec=N&capacity=M`
+  で構成、`/api/loadbal/rate-stats` で query。`/submit` と `/jit` が gate (queue cap の後で)。
+- **Task timeout**: `/api/loadbal/timeout?ms=N` (0=disable、default 30000)。Collector.tick が
+  毎秒 PENDING タスクを scan、age > timeout なら state=CANCELLED + g_task_timed_out++。
+- **Priority (simplified)**: `?prio=high` で **rate-limit bypass** (queue cap は引き続き check)。
+  真の priority queue (per-prio mailbox + preemption) は Tier 3 に deferred。
+
+**Tier 2 prefix-collision バグ fix**: `/api/loadbal/submit` (23 chars) が `/api/loadbal/submit-sticky`
+にも match して sticky が non-sticky path に落ちていた → 次の char が `?`/` ` の guard 追加で修正。
 
 ### Global Actor GC (`apps/abcl_program.c` — CLASS_Collector)
 - `CLASS_Collector` (5) — actor として実装された GC、独自 mailbox + dispatch loop
@@ -153,14 +172,22 @@ GET  /api/object-field?id=N&field=K    — peek actor field
 GET  /api/threads                      — thrtab dump
 GET  /api/memstat                      — free bytes
 
-# Load-balancer
+# Load-balancer (基本 + Tier 1)
 GET  /api/loadbal/stats                — dispatcher + workers + enabled_mask + per-worker histogram
-POST /api/loadbal/submit?n=K&ms=M      — submit K sleep tasks (returns 429 when saturated)
-POST /api/loadbal/jit?n=K&prog=P       — submit K JIT tasks (returns 429 when saturated)
+POST /api/loadbal/submit?n=K&ms=M[&prio=high]      — submit K sleep tasks (429 on cap+rate)
+POST /api/loadbal/jit?n=K&prog=P[&prio=high]       — submit K JIT tasks (429 on cap+rate)
 POST /api/loadbal/pause?w=N            — pause worker N (drain mode)
 POST /api/loadbal/resume?w=N           — resume worker N
 GET  /api/loadbal/task?id=N            — query task by id (last 64 retained)
 POST /api/loadbal/cancel?id=N          — mark task as cancelled (worker aborts on chunk boundary)
+
+# Load-balancer Tier 2
+POST /api/loadbal/submit-sticky?n=K&ms=M&key=NAME  — djb2(key)%n で同 worker 集中
+POST /api/loadbal/restart?w=N          — kill + alloc + spawn + bind (n_objects bump)
+POST /api/loadbal/rate-limit?per_sec=N&capacity=M  — token bucket configure
+GET  /api/loadbal/rate-stats           — tokens / throttled / timed_out counters
+POST /api/loadbal/timeout?ms=N         — server-side PENDING task deadline (0=disable, default 30000)
+#                                        priority: ?prio=high が submit/jit で rate-limit bypass
 
 # GC actor (periodic global actor sweep)
 GET  /api/gc-actor/stats               — period/threshold + sweep_count + counters
@@ -212,9 +239,14 @@ backup kernel:
   → 現 `apps/sd_block.c` は EMMC 前提で動かない。永続的な network kernel write には必須
 - **JIT 拡張** — 論理 (`&&`/`||`), unary, ポインタ/配列、関数定義 (1関数→複数関数)、
   value_t builtin (v_int_of, v_add, v_eq 等) → aipl2c 出力を JIT で実行できる
-- **Load-balancer Tier 2/3 機能**:
-  - sticky routing (consistent hash by key)、priority queues、retry on failure、
-    worker kill+restart、worker pool dynamic resize、speculative execution、scatter-gather
+- **Load-balancer Tier 2 残機能の実機テスト** (このセッションで未実施):
+  - rate-limit (`/api/loadbal/rate-limit` + `/rate-stats`)、task timeout、prio=high bypass
+  - Code は commit 50b3366 で実装+build success、deploy 時 USB ethernet brick で実機確認断念
+  - 次セッションで SD-direct flash 後に検証
+- **Load-balancer Tier 3 機能**:
+  - true priority queues (per-prio mailbox + preemption)、auto-retry with task-id lineage、
+    dynamic worker pool resize (MAX_OBJECTS=16 cap)、speculative execution、scatter-gather、
+    worker affinity / session sticky beyond hash
 
 ### 低優先 / 未着手
 - per-process VAS + TTBR0 swap (要 mmu_disable + context save 拡張)
