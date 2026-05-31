@@ -960,6 +960,34 @@ thread webactor_server(void)
                     web_cur_tcpdev = -1;
                     continue;
                 }
+                /* Rate limit — bypassed for prio=high.  Priority is
+                 * just "skip rate-limit + skip queue cap" here, which
+                 * is the simplest meaningful priority semantic in a
+                 * FIFO-mailbox actor system (true priority queues
+                 * would need per-prio mailboxes, deferred to Tier 3). */
+                {
+                    int is_high = (NULL != strstr(reqbuf, "prio=high"));
+                    extern int abcl_loadbal_rate_check(void);
+                    if (!is_high && !abcl_loadbal_rate_check())
+                    {
+                        static char rl[200];
+                        int bb = sprintf(rl + 100,
+                            "loadbal rate-limited (token bucket empty; "
+                            "use prio=high to bypass)\r\n");
+                        int hh = sprintf(rl,
+                            "HTTP/1.0 429 Too Many Requests\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Retry-After: 1\r\n"
+                            "X-LB-Reason: rate-limit\r\n"
+                            "Content-Length: %d\r\n"
+                            "\r\n", bb);
+                        memcpy(rl + hh, rl + 100, bb);
+                        write(tcpdev, rl, hh + bb);
+                        close(tcpdev);
+                        web_cur_tcpdev = -1;
+                        continue;
+                    }
+                }
                 int i;
                 for (i = 1; i <= n_tasks; i++)
                 {
@@ -1158,6 +1186,29 @@ thread webactor_server(void)
                     web_cur_tcpdev = -1;
                     continue;
                 }
+                /* Rate-limit (same prio=high bypass as /submit). */
+                {
+                    int is_high = (NULL != strstr(reqbuf, "prio=high"));
+                    extern int abcl_loadbal_rate_check(void);
+                    if (!is_high && !abcl_loadbal_rate_check())
+                    {
+                        static char rl[200];
+                        int bb = sprintf(rl + 100,
+                            "loadbal rate-limited (use prio=high to bypass)\r\n");
+                        int hh = sprintf(rl,
+                            "HTTP/1.0 429 Too Many Requests\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Retry-After: 1\r\n"
+                            "X-LB-Reason: rate-limit\r\n"
+                            "Content-Length: %d\r\n"
+                            "\r\n", bb);
+                        memcpy(rl + hh, rl + 100, bb);
+                        write(tcpdev, rl, hh + bb);
+                        close(tcpdev);
+                        web_cur_tcpdev = -1;
+                        continue;
+                    }
+                }
                 int i;
                 for (i = 1; i <= n_tasks; i++)
                 {
@@ -1355,6 +1406,118 @@ thread webactor_server(void)
                                    "\r\n", blen);
                 memcpy(rresp + hlen, rresp + 100, blen);
                 write(tcpdev, rresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/rate-limit?per_sec=N&capacity=M
+             *   Configure the token-bucket rate limiter.  Both params
+             *   optional — omit to leave current value.
+             * /api/loadbal/rate-stats
+             *   Current tokens + lifetime throttled count + task-timeout
+             *   ms + lifetime auto-cancelled count. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/rate-limit",  27) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/rate-limit", 28))
+            {
+                extern void abcl_loadbal_rate_set(int, int);
+                int per_sec = -1, capacity = -1;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url) {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q) {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int kl = eq - p;
+                            if (kl == 7 && 0 == strncmp(p, "per_sec", 7)
+                                && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                per_sec = v;
+                            } else if (kl == 8 && 0 == strncmp(p, "capacity", 8)
+                                       && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                capacity = v;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                abcl_loadbal_rate_set(per_sec, capacity);
+                static char rresp2[200];
+                int blen = sprintf(rresp2 + 100,
+                    "rate-limit set per_sec=%d capacity=%d\r\n", per_sec, capacity);
+                int hlen = sprintf(rresp2,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(rresp2 + hlen, rresp2 + 100, blen);
+                write(tcpdev, rresp2, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/rate-stats",  27) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/rate-stats", 28))
+            {
+                extern int abcl_loadbal_rate_stats(char *, int);
+                static char rstats[400];
+                int blen = abcl_loadbal_rate_stats(rstats + 100, 300);
+                int hlen = sprintf(rstats,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(rstats + hlen, rstats + 100, blen);
+                write(tcpdev, rstats, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/timeout?ms=N — set per-task pending deadline.
+             *   PENDING tasks older than this get auto-CANCELLED by the
+             *   Collector's tick.  0 = disable (no expiry).  Default
+             *   30 000 ms (30 s). */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/timeout",  24) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/timeout", 25))
+            {
+                extern void abcl_loadbal_timeout_set(int);
+                int ms = -1;
+                const char *q = strstr(reqbuf, "?ms=");
+                if (NULL != q) {
+                    q += 4;
+                    ms = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        ms = ms * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                static char tresp3[200];
+                int blen;
+                if (ms < 0) {
+                    blen = sprintf(tresp3 + 100,
+                        "usage: /api/loadbal/timeout?ms=N (N >= 0)\r\n");
+                } else {
+                    abcl_loadbal_timeout_set(ms);
+                    blen = sprintf(tresp3 + 100,
+                        "task timeout set to %d ms (0 = disabled)\r\n", ms);
+                }
+                int hlen = sprintf(tresp3,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(tresp3 + hlen, tresp3 + 100, blen);
+                write(tcpdev, tresp3, hlen + blen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;

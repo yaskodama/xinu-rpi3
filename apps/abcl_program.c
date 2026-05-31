@@ -584,6 +584,24 @@ static int g_loadbal_w[LB_N_WORKERS] = { -1, -1, -1, -1 };
 static int g_gc_actor = -1;
 #define GC_HEARTBEAT_MS 1000   /* heartbeat poll granularity (ms) */
 
+/* Rate-limiter (token bucket) for HTTP /submit + /jit gating.  Kept as
+ * file-scope state because the Dispatcher object is at the F_Disp__N=13
+ * fields budget already (MAX_FIELDS=16 leaves room for 3 more, all
+ * earmarked for future Dispatcher-internal use).  Race on the counters
+ * is benign — worst case we miss a refill tick or count a throttle
+ * twice; not worth a mutex on the hot path. */
+static long g_rate_tokens       = 100;   /* current bucket level */
+static long g_rate_capacity     = 100;   /* burst cap */
+static long g_rate_per_sec      = 50;    /* refill rate */
+static long g_rate_last_refill  = 0;     /* clkticks at last refill */
+static long g_rate_throttled    = 0;     /* lifetime 429-from-rate count */
+
+/* Server-side task timeout.  Collector.tick scans the task table and
+ * marks any PENDING entry older than this CANCELLED.  Mac can detect
+ * via /api/loadbal/task?id=N (state=CANCELLED + done_ms still 0). */
+static long g_task_timeout_ms   = 30000;
+static long g_task_timed_out    = 0;     /* lifetime auto-expire count */
+
 enum { F_Fork_holder, F_Fork__N };
 
 static void init_fields_Fork(int self_id) {
@@ -1405,6 +1423,72 @@ int abcl_loadbal_hash_key(const char *s, int len) {
   return (int)(h & 0x7FFFFFFFu);
 }
 
+/* Token-bucket rate limit.  Refills based on elapsed clkticks (100 Hz)
+ * since the last call; bucket caps at capacity.  Returns 1 if a token
+ * was deducted (caller may proceed) or 0 if throttled.  Bypassed
+ * entirely when caller passes priority="high" — see webactor's /submit
+ * route.  All state in file-scope statics above. */
+int abcl_loadbal_rate_check(void) {
+  long now = (long)clkticks;
+  long elapsed = now - g_rate_last_refill;
+  if (elapsed > 0) {
+    /* refill = (elapsed_ticks * per_sec) / 100  [ticks-per-second] */
+    long refill = (elapsed * g_rate_per_sec) / 100;
+    if (refill > 0) {
+      g_rate_tokens += refill;
+      if (g_rate_tokens > g_rate_capacity) g_rate_tokens = g_rate_capacity;
+      g_rate_last_refill = now;
+    }
+  }
+  if (g_rate_tokens >= 1) {
+    g_rate_tokens--;
+    return 1;
+  }
+  g_rate_throttled++;
+  return 0;
+}
+
+void abcl_loadbal_rate_set(int per_sec, int capacity) {
+  if (per_sec  > 0) g_rate_per_sec  = (long)per_sec;
+  if (capacity > 0) g_rate_capacity = (long)capacity;
+  if (g_rate_tokens > g_rate_capacity) g_rate_tokens = g_rate_capacity;
+}
+
+int abcl_loadbal_rate_stats(char *buf, int cap) {
+  if (cap < 200) return 0;
+  return sprintf(buf,
+    "rate_limit: per_sec=%ld capacity=%ld tokens=%ld throttled=%ld\n"
+    "task_timeout: ms=%ld auto_cancelled=%ld\n",
+    g_rate_per_sec, g_rate_capacity, g_rate_tokens, g_rate_throttled,
+    g_task_timeout_ms, g_task_timed_out);
+}
+
+void abcl_loadbal_timeout_set(int ms) {
+  if (ms >= 0) g_task_timeout_ms = (long)ms;
+}
+
+/* Walk the task table; any PENDING task whose age exceeds
+ * g_task_timeout_ms gets marked CANCELLED.  Called from Collector.tick
+ * so it shares the GC actor's heartbeat (no extra thread).  Returns
+ * the number freshly expired this call (for kprintf in caller). */
+int abcl_loadbal_timeout_scan(void) {
+  if (g_task_timeout_ms <= 0) return 0;
+  long now_ms = (long)(clkticks * 10);
+  int  expired = 0;
+  int  i;
+  for (i = 0; i < LB_TASKS_MAX; i++) {
+    lb_task_t *t = &lb_tasks[i];
+    if (t->task_id == 0) continue;
+    if (t->state != LB_STATE_PENDING) continue;
+    long age = now_ms - t->submit_ms;
+    if (age < g_task_timeout_ms) continue;
+    t->state = LB_STATE_CANCELLED;
+    expired++;
+    g_task_timed_out++;
+  }
+  return expired;
+}
+
 /* HTTP backpressure check.  Returns 1 if at least one enabled worker
  * has load < LB_WORKER_QUEUE_MAX, else 0.  Inherently racey (load may
  * change between this check and the subsequent submit) but good
@@ -1599,6 +1683,17 @@ static void Collector_tick(int self_id, int sender_id,
                            value_t* args, int n_args) {
   (void)sender_id; (void)args; (void)n_args;
   if (!objects[self_id].fields[F_GC_enabled].i) return;
+  /* Task-timeout scan runs EVERY tick (1 s), independent of the
+   * actor-GC period — Mac wants prompt deadline enforcement even
+   * if actor GC is set to a long interval. */
+  {
+    int expired = abcl_loadbal_timeout_scan();
+    if (expired > 0) {
+      wait(print_mu);
+      kprintf("[gc-actor] timeout: %d pending task(s) auto-cancelled\r\n", expired);
+      signal(print_mu);
+    }
+  }
   long now_ticks = (long)clkticks;
   long last      = objects[self_id].fields[F_GC_last_sweep_ticks].i;
   long period_ticks = objects[self_id].fields[F_GC_period_ms].i / 10;
