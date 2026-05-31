@@ -211,6 +211,96 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/actor-send?to=N&m=METHOD[&v=STRING]:
+             * deliver one message to any AIPL actor (not just the
+             * single web_receiver actor that the bare /).  Pi 4
+             * equivalent: /actor/send?to=...&m=...&arg=... — Pi 4
+             * passes int arg, here we pass string (Pi 3's
+             * abcl_web_deliver is string-only). */
+            if (0 == strncmp(reqbuf, "GET /api/actor-send", 19) ||
+                0 == strncmp(reqbuf, "POST /api/actor-send", 20))
+            {
+                /* Find the URL portion: between the first space and the
+                 * second.  e.g. "GET /api/actor-send?to=0&m=tick HTTP/1.0" */
+                const char *url = strchr(reqbuf, ' ');
+                int to_id = -1;
+                char meth[32] = "recv";
+                char val[200]  = "";
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        /* Tiny query-string parser: key=value & key=value */
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n')
+                        {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int klen = eq - p;
+                            int vlen = (*eq == '=') ? (amp - (eq + 1)) : 0;
+                            if (klen == 2 && 0 == strncmp(p, "to", 2))
+                            {
+                                to_id = 0;
+                                const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                {
+                                    to_id = to_id * 10 + (*d - '0');
+                                    d++;
+                                }
+                            }
+                            else if (klen == 1 && *p == 'm')
+                            {
+                                int ml = vlen < 31 ? vlen : 31;
+                                memcpy(meth, eq + 1, ml); meth[ml] = '\0';
+                            }
+                            else if (klen == 1 && *p == 'v')
+                            {
+                                int vl = vlen < 199 ? vlen : 199;
+                                memcpy(val, eq + 1, vl); val[vl] = '\0';
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                static char sresp[300];
+                int blen;
+                if (to_id < 0)
+                {
+                    blen = sprintf(sresp + 100,
+                                   "usage: /api/actor-send?to=N&m=METHOD[&v=STRING]\r\n");
+                }
+                else
+                {
+                    extern int  abcl_n_objects(void);
+                    extern void abcl_web_deliver(int, const char *, const char *);
+                    if (to_id >= abcl_n_objects())
+                    {
+                        blen = sprintf(sresp + 100, "no such actor %d\r\n", to_id);
+                    }
+                    else
+                    {
+                        abcl_web_deliver(to_id, meth, val);
+                        blen = sprintf(sresp + 100,
+                                       "delivered to=%d m=%s v=\"%s\"\r\n",
+                                       to_id, meth, val);
+                    }
+                }
+                int hlen = sprintf(sresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(sresp + hlen, sresp + 100, blen);
+                write(tcpdev, sresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/actors: AIPL actor inventory.  Each row:
              *   obj_id class_id tid started dead enq deq drops
              * (enq-deq = current mailbox backlog; drops = lost to full mbox).
