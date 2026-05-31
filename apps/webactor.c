@@ -26,7 +26,27 @@
 #include <stdio.h>
 #include <clock.h>
 #include <watchdog.h>  /* watchdogset() for /reboot route */
+#include <thread.h>    /* thrtab + NTHREAD for /api/threads route */
+#include <memory.h>    /* memlist for /api/memstat */
 #include "sd_block.h"  /* sd_init / sd_read_block for /sd-test route */
+
+/* Convert a state code to a short name (mirrors Pi 4 wm_actors window
+ * + the in-kernel ps shell command). */
+static const char *state_name(uchar s)
+{
+    switch (s) {
+        case THRFREE:    return "FREE";
+        case THRCURR:    return "CURR";
+        case THRREADY:   return "READY";
+        case THRRECV:    return "RECV";
+        case THRSLEEP:   return "SLEEP";
+        case THRSUSP:    return "SUSP";
+        case THRWAIT:    return "WAIT";
+        case THRTMOUT:   return "TMOUT";
+        case THRMIGRATE: return "MIGR";
+        default:         return "?";
+    }
+}
 
 /* AIPL bridge (apps/abcl_program.c) */
 extern int  abcl_web_init(void);
@@ -191,6 +211,55 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/threads: dump thrtab as plain text (id state prio name).
+             * Useful Mac-side introspection — mirrors the in-kernel `ps`
+             * shell command (which only reaches the serial console). */
+            if (0 == strncmp(reqbuf, "GET /api/threads", 16) ||
+                0 == strncmp(reqbuf, "POST /api/threads", 17))
+            {
+                static char tresp[2400];
+                int tlen = sprintf(tresp + 200, "tid state prio name\n");
+                int i;
+                for (i = 0; i < NTHREAD; i++)
+                {
+                    if (thrtab[i].state == THRFREE) continue;
+                    tlen += sprintf(tresp + 200 + tlen, "%d %s %d %s\n",
+                                    i, state_name(thrtab[i].state),
+                                    thrtab[i].prio, thrtab[i].name);
+                    if (tlen > 1900) break;     /* one MTU cap */
+                }
+                int hlen = sprintf(tresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", tlen);
+                memcpy(tresp + hlen, tresp + 200, tlen);
+                write(tcpdev, tresp, hlen + tlen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/memstat: free memory + total reachable.  Lightweight,
+             * fits in one packet. */
+            if (0 == strncmp(reqbuf, "GET /api/memstat", 16) ||
+                0 == strncmp(reqbuf, "POST /api/memstat", 17))
+            {
+                static char mresp[400];
+                ulong free_mem = (ulong)memlist.length;
+                int blen = sprintf(mresp + 100,
+                                   "free_bytes=%lu\nfree_kb=%lu\n",
+                                   free_mem, free_mem / 1024);
+                int hlen = sprintf(mresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(mresp + hlen, mresp + 100, blen);
+                write(tcpdev, mresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /sd-test: read LBA 0 (MBR) and report first 16 bytes hex.
              * Sanity check that the in-kernel SD driver can read the same
              * card the firmware booted us from. */
