@@ -1,20 +1,42 @@
 /**
  * @file cc_mvp.c
  *
- * C JIT for arm-rpi3, MVP-stage 3: function calls + builtin symbols.
+ * C JIT for arm-rpi3, MVP-stage 4: locals + multi-statement + if/else.
  *
  * Grammar:
- *   program  = "int" "main" "(" ")" "{" "return" expr ";" "}"
- *   expr     = primary ( ("+" | "-") primary )*
- *   primary  = INT_LITERAL
- *            | NAME "(" args? ")"           // function call
- *   args     = expr ( "," expr )*           // 0..4 args
- *   NAME     = [_A-Za-z][_A-Za-z0-9]*
+ *   program     = "int" "main" "(" ")" "{" stmt* "}"
+ *   stmt        = decl_stmt | assign_stmt | if_stmt | return_stmt
+ *               | expr_stmt | block
+ *   decl_stmt   = "int" NAME "=" expr ";"
+ *   assign_stmt = NAME "=" expr ";"
+ *   if_stmt     = "if" "(" expr ")" stmt ("else" stmt)?
+ *   return_stmt = "return" expr ";"
+ *   expr_stmt   = expr ";"
+ *   block       = "{" stmt* "}"
+ *   expr        = primary ( ("+" | "-") primary )*
+ *   primary     = INT_LITERAL
+ *               | NAME "(" args? ")"           // function call
+ *               | NAME                          // local-var load
+ *   args        = expr ( "," expr )*           // 0..4 args
+ *   NAME        = [_A-Za-z][_A-Za-z0-9]*
  *
  * Compiles to ARM32 (Cortex-A53 AArch32 mode), emits via memget()
  * buffer, calls in place.  AAPCS32 calling convention: args in
  * r0..r3, return in r0, ip (r12) for the call target so we can BLX
  * an arbitrary absolute address.
+ *
+ * Stack frame:
+ *   push {fp,lr}       ; save caller's fp and link reg
+ *   mov  fp, sp        ; fp points at saved-fp slot
+ *   sub  sp, sp, #N*4  ; reserve N local-int slots (N rounded up to 2
+ *                        for 8-byte SP alignment per AAPCS32)
+ *   ... body ...
+ *   mov  sp, fp        ; drop locals + intermediate pushes
+ *   pop  {fp,pc}       ; return through pc, restoring fp
+ *
+ * Local int at slot i (0-indexed) lives at [fp, #-(i+1)*4].
+ * Intermediate-value pushes (binop, function arg marshalling) happen
+ * on the stack BELOW the locals, so they don't clobber them.
  *
  * Function lookup: a small hand-rolled table near the top.  Add
  * entries when you want a Pi 3 kernel function callable from JIT
@@ -79,6 +101,42 @@ static void *lookup_sym(const char *name, int namelen)
     return NULL;
 }
 
+/* ===== local-variable symbol table ====================================
+ * Function-level scope only — no nested-block shadowing.  Reset at the
+ * start of every cc_mvp_compile_and_run so locals from a previous JIT
+ * don't leak in. */
+#define MAX_LOCALS 16
+static struct { char name[16]; int slot; } locals[MAX_LOCALS];
+static int n_locals;
+
+static void reset_locals(void) { n_locals = 0; }
+
+/* Return existing slot for `name` if it's already declared, else -1.
+ * Used by NAME-lookup in expressions and by assignment. */
+static int find_local(const char *name, int namelen)
+{
+    int i;
+    for (i = 0; i < n_locals; i++) {
+        int j = 0;
+        while (j < namelen && locals[i].name[j] && locals[i].name[j] == name[j]) j++;
+        if (j == namelen && locals[i].name[j] == '\0') return i;
+    }
+    return -1;
+}
+
+/* Allocate a fresh slot for `name`.  Returns slot index, or -1 if the
+ * symbol table is full or the name is too long. */
+static int alloc_local(const char *name, int namelen)
+{
+    if (n_locals >= MAX_LOCALS) return -1;
+    if (namelen >= 16) return -1;
+    int i;
+    for (i = 0; i < namelen; i++) locals[n_locals].name[i] = name[i];
+    locals[n_locals].name[namelen] = '\0';
+    locals[n_locals].slot = n_locals;
+    return n_locals++;
+}
+
 /* ===== ARM32 encoders ============================================== */
 static unsigned int enc_mov_imm8(int rd, int imm)
 {
@@ -104,6 +162,37 @@ static unsigned int enc_add_r0_r1_r0(void) { return 0xE0810000u; }
 static unsigned int enc_sub_r0_r1_r0(void) { return 0xE0410000u; }
 static unsigned int enc_push_lr_fp(void)   { return 0xE92D4800u; }  /* push {fp,lr} */
 static unsigned int enc_pop_fp_pc(void)    { return 0xE8BD8800u; }  /* pop  {fp,pc} */
+static unsigned int enc_mov_fp_sp(void)    { return 0xE1A0B00Du; }  /* mov fp, sp */
+static unsigned int enc_mov_sp_fp(void)    { return 0xE1A0D00Bu; }  /* mov sp, fp */
+static unsigned int enc_sub_sp_imm(int imm)
+{
+    /* sub sp, sp, #imm — imm encoded as imm8 (no rotation; caller
+     * guarantees imm < 256, which fits our MAX_LOCALS*4 = 64 cap). */
+    return 0xE24DD000u | (imm & 0xFF);
+}
+static unsigned int enc_ldr_r0_fp_neg(int off)
+{
+    /* ldr r0, [fp, #-off]  — off is positive byte offset (12-bit). */
+    return 0xE51B0000u | (off & 0xFFF);
+}
+static unsigned int enc_str_r0_fp_neg(int off)
+{
+    /* str r0, [fp, #-off] */
+    return 0xE50B0000u | (off & 0xFFF);
+}
+static unsigned int enc_cmp_r0_imm0(void) { return 0xE3500000u; }   /* cmp r0, #0 */
+static unsigned int enc_beq_placeholder(void) { return 0x0A000000u; } /* offset=0 */
+static unsigned int enc_b_placeholder(void)   { return 0xEA000000u; } /* offset=0 */
+
+/* Patch a previously-emitted B/Bcc at code[br_at] so it branches to
+ * code[target_at].  ARM imm24 = (target_pc - branch_pc - 8) / 4, where
+ * branch_pc and target_pc are byte addresses.  In word-index terms:
+ * imm24 = target_at - br_at - 2. */
+static void patch_branch(unsigned int *code, int br_at, int target_at)
+{
+    int off = target_at - br_at - 2;          /* word offset */
+    code[br_at] = (code[br_at] & 0xFF000000u) | ((unsigned int)off & 0x00FFFFFFu);
+}
 
 /* Emit a constant into register `rd` (0..15) using the shortest
  * available encoding.  Returns words written (1 or 2). */
@@ -139,6 +228,25 @@ static void skip_ws(const char **cur)
     *cur = p;
 }
 
+/* Match literal string, advancing past it on success.  For keywords
+ * (return, if, else, int) the trailing char MUST NOT be an ident
+ * continuation — otherwise "intx" would tokenise as "int" + "x".
+ * Punctuators ("(", "{", ";", ...) don't need this guard. */
+static int match_kw(const char **cur, const char *lit)
+{
+    skip_ws(cur);
+    const char *p = *cur;
+    int i;
+    for (i = 0; lit[i]; i++)
+        if (p[i] != lit[i]) return 0;
+    /* keyword must be followed by non-ident char */
+    char next = p[i];
+    if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') ||
+        (next >= '0' && next <= '9') || next == '_') return 0;
+    *cur = p + i;
+    return 1;
+}
+
 static int match(const char **cur, const char *lit)
 {
     skip_ws(cur);
@@ -170,8 +278,8 @@ static int is_ident_start(char c) { return (c=='_' || (c>='A'&&c<='Z') || (c>='a
 static int is_ident_cont(char c)  { return is_ident_start(c) || (c>='0'&&c<='9'); }
 
 /* If next token is an identifier, advance *cur past it and return
- * its length (via *out_len with *out_start the original start).
- * Returns 1 on success, 0 if no identifier present. */
+ * (1, name_start, name_len).  0 if no identifier.  Does NOT validate
+ * that the identifier isn't a reserved keyword — caller's responsibility. */
 static int parse_ident(const char **cur, const char **out_start, int *out_len)
 {
     skip_ws(cur);
@@ -187,94 +295,26 @@ static int parse_ident(const char **cur, const char **out_start, int *out_len)
 
 /* ===== codegen / parser ============================================ */
 static int compile_expr(unsigned int *code, int at, const char **cur);
+static int compile_stmt(unsigned int *code, int at, const char **cur);
 
 /* Emit code that puts a primary into r0.  Returns words written, or -1
- * on parse error. */
+ * on parse error.  Primary forms:
+ *   INT_LITERAL                      — mov r0, #imm
+ *   NAME ( args? )                   — call builtin
+ *   NAME                             — load local var
+ */
 static int compile_primary(unsigned int *code, int at, const char **cur)
-{
-    skip_ws(cur);
-    const char *save = *cur;
-
-    /* Try identifier-style: NAME ( args ) */
-    const char *name; int nlen;
-    if (parse_ident(cur, &name, &nlen)) {
-        skip_ws(cur);
-        if (**cur == '(') {
-            (*cur)++;
-            /* Parse comma-separated args.  For up to 4 args, we evaluate
-             * each into r0 and push, then pop into r0..r3 (in argN..arg0
-             * order).  We also save r0 from outer context by pushing
-             * before any arg work — caller's r0 is on top of stack so
-             * arg eval can clobber freely. */
-            int n_args = 0;
-            int  arg_pushes_at = at;  /* not used yet */
-            (void)arg_pushes_at;
-
-            skip_ws(cur);
-            if (**cur != ')') {
-                /* parse first arg */
-                int w = compile_expr(code, at, cur);
-                if (w < 0) return -1;
-                at += w;
-                code[at++] = enc_str_push_r0();        /* save arg0 */
-                n_args = 1;
-                while (1) {
-                    skip_ws(cur);
-                    if (**cur != ',') break;
-                    (*cur)++;
-                    if (n_args >= 4) return -1;        /* > 4 args unsupported */
-                    w = compile_expr(code, at, cur);
-                    if (w < 0) return -1;
-                    at += w;
-                    code[at++] = enc_str_push_r0();
-                    n_args++;
-                }
-            }
-            skip_ws(cur);
-            if (**cur != ')') return -1;
-            (*cur)++;
-
-            /* Pop args in reverse order into rN, r(N-1), ..., r0 */
-            int i;
-            for (i = n_args - 1; i >= 0; i--) {
-                code[at++] = enc_ldr_pop(i);
-            }
-
-            /* Resolve target — must be a known builtin. */
-            void *fn = lookup_sym(name, nlen);
-            if (NULL == fn) return -1;
-            unsigned int addr = (unsigned int)(unsigned long)fn;
-
-            /* mov ip, #low ; movt ip, #high ; blx ip — result in r0 */
-            code[at++] = enc_movw(12, addr & 0xFFFF);
-            code[at++] = enc_movt(12, (addr >> 16) & 0xFFFF);
-            code[at++] = enc_blx_ip();
-            return at - (int)(at - (at - 0));  /* dummy: return at-orig */
-        }
-        /* Not a call — rewind and try int literal next. */
-        *cur = save;
-    }
-
-    /* Fall back to int literal */
-    int ok = 0;
-    int n  = parse_int(cur, &ok);
-    if (!ok) return -1;
-    return emit_const(code, at, 0, n);
-}
-
-/* Wrapper that translates compile_primary's "return at" convention
- * (which I tangled above) into "return words written". */
-static int compile_primary_simple(unsigned int *code, int at, const char **cur)
 {
     int start = at;
     skip_ws(cur);
 
-    /* identifier? */
+    /* identifier? (call or var load) */
     const char *save = *cur;
     const char *name; int nlen;
     if (parse_ident(cur, &name, &nlen)) {
         skip_ws(cur);
         if (**cur == '(') {
+            /* call */
             (*cur)++;
             int n_args = 0;
             skip_ws(cur);
@@ -310,9 +350,15 @@ static int compile_primary_simple(unsigned int *code, int at, const char **cur)
             code[at++] = enc_blx_ip();
             return at - start;
         }
-        *cur = save;
+        /* var load — must be a declared local */
+        int slot = find_local(name, nlen);
+        if (slot < 0) return -1;
+        code[at++] = enc_ldr_r0_fp_neg((slot + 1) * 4);
+        return at - start;
     }
 
+    /* int literal */
+    *cur = save;
     int ok = 0;
     int n  = parse_int(cur, &ok);
     if (!ok) return -1;
@@ -322,7 +368,7 @@ static int compile_primary_simple(unsigned int *code, int at, const char **cur)
 static int compile_expr(unsigned int *code, int at, const char **cur)
 {
     int start = at;
-    int w = compile_primary_simple(code, at, cur);
+    int w = compile_primary(code, at, cur);
     if (w < 0) return -1;
     at += w;
     while (1) {
@@ -330,7 +376,7 @@ static int compile_expr(unsigned int *code, int at, const char **cur)
         if (op != '+' && op != '-') break;
         (*cur)++;
         code[at++] = enc_str_push_r0();
-        w = compile_primary_simple(code, at, cur);
+        w = compile_primary(code, at, cur);
         if (w < 0) return -1;
         at += w;
         code[at++] = enc_ldr_pop(1);
@@ -339,33 +385,188 @@ static int compile_expr(unsigned int *code, int at, const char **cur)
     return at - start;
 }
 
+/* Compile a block "{" stmt* "}".  Returns words written, or -1. */
+static int compile_block(unsigned int *code, int at, const char **cur)
+{
+    int start = at;
+    if (!match(cur, "{")) return -1;
+    while (1) {
+        skip_ws(cur);
+        if (**cur == '}') break;
+        if (**cur == '\0') return -1;          /* unterminated block */
+        int w = compile_stmt(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+    }
+    if (!match(cur, "}")) return -1;
+    return at - start;
+}
+
+/* if (cond) stmt [else stmt] */
+static int compile_if(unsigned int *code, int at, const char **cur)
+{
+    int start = at;
+    if (!match(cur, "(")) return -1;
+    int w = compile_expr(code, at, cur);
+    if (w < 0) return -1;
+    at += w;
+    if (!match(cur, ")")) return -1;
+
+    /* cmp r0, #0 ; beq L_else */
+    code[at++] = enc_cmp_r0_imm0();
+    int beq_at = at;
+    code[at++] = enc_beq_placeholder();
+
+    /* then-branch */
+    w = compile_stmt(code, at, cur);
+    if (w < 0) return -1;
+    at += w;
+
+    /* else clause? */
+    skip_ws(cur);
+    if (match_kw(cur, "else")) {
+        /* End of then-branch jumps over else */
+        int b_at = at;
+        code[at++] = enc_b_placeholder();
+        /* Patch BEQ to point HERE (start of else) */
+        patch_branch(code, beq_at, at);
+        /* Compile else-stmt */
+        w = compile_stmt(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        /* Patch the over-else B to point HERE (after else) */
+        patch_branch(code, b_at, at);
+    } else {
+        /* No else: BEQ jumps to end of if */
+        patch_branch(code, beq_at, at);
+    }
+    return at - start;
+}
+
+/* Compile one statement.  Forms:
+ *   "int" NAME "=" expr ";"          decl
+ *   NAME "=" expr ";"                assign
+ *   "if" "(" expr ")" stmt ("else" stmt)?
+ *   "return" expr ";"                — sets r0 + jumps to epilogue (we
+ *                                      simply emit `mov sp,fp ; pop {fp,pc}`
+ *                                      inline, since cc_mvp has only one
+ *                                      block-level scope so no register
+ *                                      saving below needed)
+ *   "{" stmt* "}"                    block
+ *   expr ";"                         eval-and-discard
+ *
+ * Returns words written, or -1 on parse error.
+ *
+ * Inline epilogue for `return`: that means multiple returns each emit
+ * their own 2-word epilogue.  Slightly wasteful but lets us avoid a
+ * label/backpatch for the function exit. */
+static int compile_stmt(unsigned int *code, int at, const char **cur)
+{
+    int start = at;
+    skip_ws(cur);
+
+    /* { block } */
+    if (**cur == '{') {
+        return compile_block(code, at, cur);
+    }
+
+    /* return */
+    if (match_kw(cur, "return")) {
+        int w = compile_expr(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        if (!match(cur, ";")) return -1;
+        code[at++] = enc_mov_sp_fp();
+        code[at++] = enc_pop_fp_pc();
+        return at - start;
+    }
+
+    /* if */
+    if (match_kw(cur, "if")) {
+        return compile_if(code, at, cur);
+    }
+
+    /* int decl */
+    if (match_kw(cur, "int")) {
+        const char *name; int nlen;
+        if (!parse_ident(cur, &name, &nlen)) return -1;
+        int slot = alloc_local(name, nlen);
+        if (slot < 0) return -1;
+        if (!match(cur, "=")) return -1;
+        int w = compile_expr(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        if (!match(cur, ";")) return -1;
+        code[at++] = enc_str_r0_fp_neg((slot + 1) * 4);
+        return at - start;
+    }
+
+    /* assign or expr-stmt — both start with an identifier or literal.
+     * Peek for "NAME =" specifically; everything else is a plain expr. */
+    const char *save_cur = *cur;
+    const char *name; int nlen;
+    if (parse_ident(cur, &name, &nlen)) {
+        skip_ws(cur);
+        if (**cur == '=' && (*cur)[1] != '=') {
+            (*cur)++;                            /* eat '=' */
+            int slot = find_local(name, nlen);
+            if (slot < 0) return -1;
+            int w = compile_expr(code, at, cur);
+            if (w < 0) return -1;
+            at += w;
+            if (!match(cur, ";")) return -1;
+            code[at++] = enc_str_r0_fp_neg((slot + 1) * 4);
+            return at - start;
+        }
+        /* Not "NAME =" — rewind and parse as expression-statement.
+         * That re-parses the identifier, but it's only one token. */
+        *cur = save_cur;
+    }
+
+    /* expr ";" — useful for side-effect calls like print_int(x); */
+    int w = compile_expr(code, at, cur);
+    if (w < 0) return -1;
+    at += w;
+    if (!match(cur, ";")) return -1;
+    return at - start;
+}
+
 int cc_mvp_compile_and_run(const char *src, long *retval, int *codesize)
 {
     const char *p = src;
-    if (!match(&p, "int"))    return -1;
-    if (!match(&p, "main"))   return -1;
-    if (!match(&p, "("))      return -1;
-    if (!match(&p, ")"))      return -1;
-    if (!match(&p, "{"))      return -1;
-    if (!match(&p, "return")) return -1;
+    if (!match_kw(&p, "int"))  return -1;
+    if (!match_kw(&p, "main")) return -1;
+    if (!match(&p, "("))       return -1;
+    if (!match(&p, ")"))       return -1;
 
     unsigned int *code = (unsigned int *)memget(4096);
     if (code == SYSERR_PTR || code == NULL) return -2;
 
-    /* Prologue saves fp+lr so the builtin BLX'd in the middle can
-     * return to us (it overwrites lr). */
+    reset_locals();
+
+    /* Prologue: save fp+lr, install frame pointer, reserve local-int
+     * area.  We don't know N (number of locals) yet — the body's
+     * `int x = ...;` calls allocate them as we go.  Reserve a fixed
+     * MAX_LOCALS*4 = 64 byte frame; unused slots are just dead space.
+     * That keeps SP alignment trivial and avoids a forward-patch. */
     int at = 0;
     code[at++] = enc_push_lr_fp();
+    code[at++] = enc_mov_fp_sp();
+    code[at++] = enc_sub_sp_imm(MAX_LOCALS * 4);
 
-    int w = compile_expr(code, at, &p);
-    if (w < 0) return -1;
+    /* Body is a single block.  Statements inside may include `return`,
+     * which emits its own epilogue (mov sp,fp ; pop {fp,pc}).  If the
+     * body falls off the end without returning we append a default
+     * `return 0` epilogue below. */
+    int w = compile_block(code, at, &p);
+    if (w < 0) { memfree(code, 4096); return -1; }
     at += w;
 
-    if (!match(&p, ";")) return -1;
-    if (!match(&p, "}")) return -1;
-
-    /* Epilogue: pop fp,pc — returns through pc with original lr. */
+    /* Default `return 0` for fall-through. */
+    code[at++] = enc_mov_imm8(0, 0);
+    code[at++] = enc_mov_sp_fp();
     code[at++] = enc_pop_fp_pc();
+
     *codesize = at * 4;
 
     long (*entry)(void) = (long (*)(void))code;
