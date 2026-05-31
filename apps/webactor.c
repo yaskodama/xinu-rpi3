@@ -36,7 +36,10 @@
  * stage-1 testing; the kernel.img is ~290 KB so a future commit needs
  * a streamed upload path that doesn't pre-allocate. */
 static char           upload_slot_name[64];
-static unsigned char  upload_slot_data[65536];
+/* 512 KB — bumped from 64 KB so a full xinu.boot (~305 KB) can be
+ * uploaded for the /kexec network-update path.  Lives in .bss so it
+ * doesn't inflate the on-disk binary, just runtime footprint. */
+static unsigned char  upload_slot_data[524288];
 static int            upload_slot_size = 0;
 
 void _upload_set(const char *name, const unsigned char *data, int size)
@@ -75,7 +78,10 @@ extern int  abcl_web_init(void);
 extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 
 #define WEBACTOR_PORT 8080
-#define WEB_BUFSZ     65536    /* was 1024 — bumped for /upload bodies (up
+#define WEB_BUFSZ     524288   /* 512 KB — was 64 KB; bumped to fit a full
+                                 * xinu.boot upload for /kexec network update.
+                                 * Earlier note (kept for context):
+                                 * was 1024 — bumped for /upload bodies (up
                                 * to ~64 KB).  Stack-resident in the server
                                 * thread; the thread is created with 64 KB
                                 * stack so this allocates the stack itself. */
@@ -474,7 +480,8 @@ thread webactor_server(void)
             {
                 /* Parse ?dst=NAME from URL */
                 static char upload_name[64];
-                static unsigned char upload_data[65536];
+                /* 512 KB so a full xinu.boot fits for /kexec network update */
+                static unsigned char upload_data[524288];
                 static int  upload_size = 0;
                 upload_name[0] = '\0';
                 const char *url = strchr(reqbuf, ' ');
@@ -905,6 +912,72 @@ thread webactor_server(void)
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
+            }
+            /* /kexec — jump into the most recent /upload payload as a new
+             * kernel.  This is the "network kernel update" loop:
+             *
+             *   1. Mac:  curl --data-binary @xinu.boot \
+             *               http://192.168.3.50:8080/upload
+             *   2. Mac:  curl -X POST http://192.168.3.50:8080/kexec
+             *   3. Pi 3: webactor responds 200, drains TCP, disables MMU,
+             *            calls kexec() which copies upload payload into
+             *            place at 0x8000 and jumps there.
+             *   4. New kernel boots fresh, re-enables MMU in platforminit,
+             *            comes back up on the same IP.
+             *
+             * Sanity-checks: upload slot must be non-empty and at least
+             * 32 KB (smaller is almost certainly not a kernel image).
+             * Bad uploads just hang Pi 3 (recovery via SD swap), same as
+             * a bricked /reboot — that's the cost of being a real
+             * network-update path.
+             *
+             * MMU disable BEFORE kexec because the next kernel's start.S
+             * expects MMU off; without it the second mmu_init double-
+             * configures TTBR0 from an already-enabled state and would
+             * almost certainly fault. */
+            if (0 == strncmp(reqbuf, "POST /kexec", 11) ||
+                0 == strncmp(reqbuf, "GET /kexec", 10))
+            {
+                extern syscall kexec(const void *, uint);
+                extern void mmu_disable(void);
+                int sz = upload_slot_size;
+                if (sz < 32 * 1024)
+                {
+                    static char kresp[200];
+                    int blen = sprintf(kresp + 100,
+                        "kexec refused: upload too small (%d B, need >= 32 KB)\r\n"
+                        "POST a kernel image to /upload first.\r\n", sz);
+                    int hlen = sprintf(kresp,
+                        "HTTP/1.0 400 Bad Request\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", blen);
+                    memcpy(kresp + hlen, kresp + 100, blen);
+                    write(tcpdev, kresp, hlen + blen);
+                    close(tcpdev);
+                    web_cur_tcpdev = -1;
+                    continue;
+                }
+                /* Respond OK BEFORE we kill ourselves — Mac needs the 200 */
+                static char kok[160];
+                int blen = sprintf(kok + 100,
+                    "kexec %d bytes — jumping...\r\n", sz);
+                int hlen = sprintf(kok,
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n"
+                    "\r\n", blen);
+                memcpy(kok + hlen, kok + 100, blen);
+                write(tcpdev, kok, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                /* Drain TCP to the wire so Mac sees the 200, then commit. */
+                sleep(50);
+                kprintf("[kexec] disabling MMU, jumping to upload (%d B)\r\n", sz);
+                mmu_disable();
+                kexec(upload_slot_data, (uint)sz);
+                /* defensive — kexec returns SYSERR if jump failed */
+                while (1) { }
             }
             /* /api/mmu:
              *   Report MMU enable state + SCTLR + TTBR0 + page-table base.

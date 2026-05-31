@@ -166,3 +166,27 @@ void mmu_init(void)
 
     mmu_enabled = 1;
 }
+
+/* Disable MMU.  Safe because the identity-map means VA==PA throughout —
+ * after we clear SCTLR.M, accesses go straight to PA and execution
+ * continues from the same instructions.  Caches were off so no flush
+ * is needed.  Required before kexec because the next-kernel's start.S
+ * expects MMU off (re-enables via its own platforminit/mmu_init). */
+void mmu_disable(void)
+{
+    if (!mmu_enabled) return;
+    asm volatile (
+        "mrc p15, 0, r1, c1, c0, 0\n"
+        "bic r1, r1, #(1 << 0)\n"           /* clear M */
+        "mcr p15, 0, r1, c1, c0, 0\n"
+        "isb\n"
+        "mov r1, #0\n"
+        "mcr p15, 0, r1, c8, c7, 0\n"       /* TLBIALL */
+        "dsb\n"
+        "isb\n"
+        :
+        :
+        : "r1", "memory"
+    );
+    mmu_enabled = 0;
+}
