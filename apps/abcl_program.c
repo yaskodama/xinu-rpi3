@@ -207,6 +207,33 @@ int abcl_object_class_id(int obj_id) {
   return objects[obj_id].class_id;
 }
 
+/* Render actor field as plain text into the caller's buf.  Returns
+ * bytes written.  Caller must pass cap >= ~80 (Xinu's libxc has no
+ * snprintf so we sprintf and trust the cap).  Used by webactor's
+ * /api/object-field since value_t is file-scope here. */
+int abcl_object_field_render(int obj_id, int field_idx, char *buf, int cap) {
+  value_t v;
+  if (cap < 80) { if (cap > 0) buf[0] = 0; return 0; }
+  if (abcl_object_field_get(obj_id, field_idx, &v) == 0)
+    return sprintf(buf, "out_of_range");
+  switch (v.tag) {
+    case V_NIL:   return sprintf(buf, "nil");
+    case V_INT:   return sprintf(buf, "int=%ld", v.i);
+    case V_FLOAT: return sprintf(buf, "float=%f", v.f);
+    case V_STR: {
+      /* Truncate the string to keep us under cap; sprintf is bounds-less. */
+      char tmp[48];
+      int i = 0;
+      const char *s = v.s ? v.s : "(null)";
+      while (s[i] && i < 47) { tmp[i] = s[i]; i++; }
+      tmp[i] = 0;
+      return sprintf(buf, "str=%s", tmp);
+    }
+    case V_OBJ:   return sprintf(buf, "obj_id=%d", v.obj_id);
+    default:      return sprintf(buf, "tag=%d", (int)v.tag);
+  }
+}
+
 /* H3 RPC: expose total live actor count so the dispatcher LIST command
    can answer without walking the table. */
 int abcl_n_objects(void) { return n_objects; }

@@ -211,6 +211,85 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/object-field?id=N&field=K — read actor N's field K.
+             * Pi 3 AIPL fields are value_t (int|float|string|...).  We
+             * render as decimal int (most common case); other types
+             * print as hex tag for now. */
+            if (0 == strncmp(reqbuf, "GET /api/object-field", 21) ||
+                0 == strncmp(reqbuf, "POST /api/object-field", 22))
+            {
+                int field_id = -1, field_idx = -1;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n')
+                        {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int klen = eq - p;
+                            int *target = NULL;
+                            if (klen == 2 && 0 == strncmp(p, "id", 2))
+                                target = &field_id;
+                            else if (klen == 5 && 0 == strncmp(p, "field", 5))
+                                target = &field_idx;
+                            if (target && *eq == '=')
+                            {
+                                *target = 0;
+                                const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                {
+                                    *target = (*target) * 10 + (*d - '0');
+                                    d++;
+                                }
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                static char fresp[400];
+                int blen;
+                if (field_id < 0 || field_idx < 0)
+                {
+                    blen = sprintf(fresp + 100,
+                                   "usage: /api/object-field?id=N&field=K\r\n");
+                }
+                else
+                {
+                    extern int abcl_object_field_render(int, int, char *, int);
+                    char fval[160];
+                    int rc = abcl_object_field_render(field_id, field_idx,
+                                                     fval, sizeof fval);
+                    if (rc < 0)
+                    {
+                        blen = sprintf(fresp + 100,
+                                       "id=%d field=%d: render error\r\n",
+                                       field_id, field_idx);
+                    }
+                    else
+                    {
+                        blen = sprintf(fresp + 100,
+                                       "id=%d field=%d %s\r\n",
+                                       field_id, field_idx, fval);
+                    }
+                }
+                int hlen = sprintf(fresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(fresp + hlen, fresp + 100, blen);
+                write(tcpdev, fresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/actor-send?to=N&m=METHOD[&v=STRING]:
              * deliver one message to any AIPL actor (not just the
              * single web_receiver actor that the bare /).  Pi 4
