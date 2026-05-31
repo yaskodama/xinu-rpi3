@@ -117,5 +117,15 @@ int platforminit(void)
     platform.serial_high = 0;  /* Used only if serial # not found in atags */
     parse_atag_list();
     bcm2835_power_init();
+    /* Enable identity-mapped MMU with region attributes:
+     *   RAM  = Normal cacheable RWX
+     *   MMIO = Device strongly-ordered RW-NX
+     * Must run AFTER bcm2835_power_init (which does MMIO peeks under
+     * the old "MMU off, all RAM RWX" rules) and BEFORE any thread
+     * starts (so the threads run under the MMU-enabled regime). */
+    {
+        extern void mmu_init(void);
+        mmu_init();
+    }
     return OK;
 }

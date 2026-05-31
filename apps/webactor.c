@@ -16,6 +16,7 @@
 
 #include <kernel.h>
 #include <stddef.h>
+#include <stdint.h>    /* uint32_t for /api/mmu route */
 #include <thread.h>
 #include <device.h>
 #include <ether.h>
@@ -901,6 +902,43 @@ thread webactor_server(void)
                                    "\r\n", blen);
                 memcpy(lresp + hlen, lresp + 100, blen);
                 write(tcpdev, lresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/mmu:
+             *   Report MMU enable state + SCTLR + TTBR0 + page-table base.
+             *   Lets a Mac-side script confirm the MMU stayed up after
+             *   each kernel update (a bricked MMU enable would not
+             *   respond at all, so seeing JSON means we won). */
+            if (0 == strncmp(reqbuf, "GET /api/mmu", 12) ||
+                0 == strncmp(reqbuf, "POST /api/mmu", 13))
+            {
+                extern int      mmu_is_enabled(void);
+                extern uint32_t mmu_read_sctlr(void);
+                extern uint32_t mmu_read_ttbr0(void);
+                extern uint32_t mmu_table_base(void);
+                static char mresp2[500];
+                uint32_t sctlr = mmu_read_sctlr();
+                int blen = sprintf(mresp2 + 100,
+                    "enabled=%d\n"
+                    "sctlr=0x%08x M=%d C=%d I=%d Z=%d\n"
+                    "ttbr0=0x%08x\n"
+                    "table_base=0x%08x\n",
+                    mmu_is_enabled(), sctlr,
+                    (sctlr >> 0)  & 1,
+                    (sctlr >> 2)  & 1,
+                    (sctlr >> 12) & 1,
+                    (sctlr >> 11) & 1,
+                    mmu_read_ttbr0(),
+                    mmu_table_base());
+                int hlen = sprintf(mresp2,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(mresp2 + hlen, mresp2 + 100, blen);
+                write(tcpdev, mresp2, hlen + blen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;

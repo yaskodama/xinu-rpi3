@@ -15,6 +15,7 @@ C_FILES = setupStack.c       \
           bcm2835_power.c    \
           dispatch.c         \
           kexec.c            \
+          mmu.c              \
           platforminit.c     \
           timer.c            \
           usb_dwc_hcd.c      \
