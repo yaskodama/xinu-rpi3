@@ -30,6 +30,27 @@
 #include <memory.h>    /* memlist for /api/memstat */
 #include "sd_block.h"  /* sd_init / sd_read_block for /sd-test route */
 
+/* Latest /upload payload — file-scope so /api/upload-info can read it
+ * back.  Single slot (last upload wins).  64 KB is generous enough for
+ * stage-1 testing; the kernel.img is ~290 KB so a future commit needs
+ * a streamed upload path that doesn't pre-allocate. */
+static char           upload_slot_name[64];
+static unsigned char  upload_slot_data[65536];
+static int            upload_slot_size = 0;
+
+void _upload_set(const char *name, const unsigned char *data, int size)
+{
+    int i;
+    for (i = 0; i < 63 && name[i]; i++) upload_slot_name[i] = name[i];
+    upload_slot_name[i] = '\0';
+    if (size > (int)sizeof(upload_slot_data)) size = sizeof(upload_slot_data);
+    for (i = 0; i < size; i++) upload_slot_data[i] = data[i];
+    upload_slot_size = size;
+}
+const char           *_upload_name(void) { return upload_slot_name; }
+const unsigned char  *_upload_data(void) { return upload_slot_data; }
+int                   _upload_size(void) { return upload_slot_size; }
+
 /* Convert a state code to a short name (mirrors Pi 4 wm_actors window
  * + the in-kernel ps shell command). */
 static const char *state_name(uchar s)
@@ -53,7 +74,10 @@ extern int  abcl_web_init(void);
 extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 
 #define WEBACTOR_PORT 8080
-#define WEB_BUFSZ     1024
+#define WEB_BUFSZ     65536    /* was 1024 — bumped for /upload bodies (up
+                                * to ~64 KB).  Stack-resident in the server
+                                * thread; the thread is created with 64 KB
+                                * stack so this allocates the stack itself. */
 
 /* Static network config used by the boot auto-start (webactor_autostart). */
 #define WEBACTOR_IP   "192.168.3.50"
@@ -110,7 +134,10 @@ thread webactor_server(void)
     struct netif   *interface;
     struct netaddr *host;
     ushort tcpdev;
-    char   reqbuf[WEB_BUFSZ];
+    /* Static (not on the 8 KB thread stack) so a 64 KB upload body fits.
+     * Single-instance webactor_server thread means no concurrency on this
+     * buffer — every request is read+dispatched serially. */
+    static char reqbuf[WEB_BUFSZ];
     char   msg[256];
     int    n;
     static const char resp[] =
@@ -211,6 +238,113 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /upload?dst=NAME — receive a binary file POST body and
+             * store in the upload slot.  Pi 4 has nothing equivalent;
+             * this is the Pi 3-side groundwork for eventual kernel.img
+             * network update.  Maximum size = WEB_BUFSZ (64 KB) minus
+             * the headers — sufficient for small payloads.  Larger
+             * (kernel-sized) uploads will need a separate streamed
+             * reader, deferred to a future commit. */
+            if (0 == strncmp(reqbuf, "POST /upload", 12) ||
+                0 == strncmp(reqbuf, "GET /upload",  11))
+            {
+                /* Parse ?dst=NAME from URL */
+                static char upload_name[64];
+                static unsigned char upload_data[65536];
+                static int  upload_size = 0;
+                upload_name[0] = '\0';
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        const char *d = strstr(q, "dst=");
+                        if (NULL != d)
+                        {
+                            d += 4;
+                            int i = 0;
+                            while (*d && *d != '&' && *d != ' ' &&
+                                   *d != '\r' && *d != '\n' && i < 63)
+                            {
+                                upload_name[i++] = *d++;
+                            }
+                            upload_name[i] = '\0';
+                        }
+                    }
+                }
+
+                /* Find header_end + body span in reqbuf */
+                int header_end_local = -1;
+                {
+                    char *p = strstr(reqbuf, "\r\n\r\n");
+                    if (NULL != p) header_end_local = (int)(p - reqbuf) + 4;
+                }
+                int body_len = 0;
+                if (header_end_local >= 0 && header_end_local <= n)
+                {
+                    body_len = n - header_end_local;
+                    if (body_len > (int)sizeof(upload_data))
+                        body_len = sizeof(upload_data);
+                    memcpy(upload_data, reqbuf + header_end_local, body_len);
+                }
+                upload_size = body_len;
+
+                static char uresp[256];
+                int blen = sprintf(uresp + 100,
+                                   "uploaded dst=\"%s\" size=%d\r\n",
+                                   upload_name[0] ? upload_name : "(unnamed)",
+                                   upload_size);
+                int hlen = sprintf(uresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(uresp + hlen, uresp + 100, blen);
+                write(tcpdev, uresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+
+                /* Make the slot visible to /api/upload-info by promoting
+                 * the locals to file-scope.  Forward declarations live
+                 * outside the request loop — see _upload_meta() below. */
+                extern void _upload_set(const char *name, const unsigned char *data, int size);
+                _upload_set(upload_name, upload_data, upload_size);
+                continue;
+            }
+            /* /api/upload-info — name + size + first 32 bytes hex of the
+             * most recently received /upload payload.  Quick sanity check
+             * that what Mac sent is what Pi 3 received intact. */
+            if (0 == strncmp(reqbuf, "GET /api/upload-info", 20) ||
+                0 == strncmp(reqbuf, "POST /api/upload-info", 21))
+            {
+                extern const char *_upload_name(void);
+                extern const unsigned char *_upload_data(void);
+                extern int   _upload_size(void);
+                const unsigned char *d = _upload_data();
+                int sz = _upload_size();
+                int show = sz < 32 ? sz : 32;
+                static char iresp[700];
+                int blen = sprintf(iresp + 100,
+                                   "name=\"%s\"\nsize=%d\nfirst%d=",
+                                   _upload_name(), sz, show);
+                int i;
+                for (i = 0; i < show; i++)
+                {
+                    blen += sprintf(iresp + 100 + blen, "%02x", d[i]);
+                }
+                blen += sprintf(iresp + 100 + blen, "\n");
+                int hlen = sprintf(iresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(iresp + hlen, iresp + 100, blen);
+                write(tcpdev, iresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/object-field?id=N&field=K — read actor N's field K.
              * Pi 3 AIPL fields are value_t (int|float|string|...).  We
              * render as decimal int (most common case); other types
