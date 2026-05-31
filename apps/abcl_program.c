@@ -521,16 +521,22 @@ static int _abcl_cap = 0;
 #define CLASS_Fork 0
 #define CLASS_Philosopher 1
 #define CLASS_WebReceiver 2   /* web-bridge demo actor (apps/webactor.c) */
+#define CLASS_Dispatcher 3    /* load-balancer router */
+#define CLASS_Worker 4        /* load-balancer worker (compute target) */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
 #define ABCL_PRIO_Philosopher 20
 #define ABCL_PRIO_WebReceiver 20
+#define ABCL_PRIO_Dispatcher 25   /* routing is fast — keep ahead of workers */
+#define ABCL_PRIO_Worker 22       /* one above philosophers so submit() lands */
 static int abcl_class_prio(int class_id) {
   switch (class_id) {
   case CLASS_Fork: return ABCL_PRIO_Fork;
   case CLASS_Philosopher: return ABCL_PRIO_Philosopher;
   case CLASS_WebReceiver: return ABCL_PRIO_WebReceiver;
+  case CLASS_Dispatcher: return ABCL_PRIO_Dispatcher;
+  case CLASS_Worker:     return ABCL_PRIO_Worker;
   default: return INITPRIO;
   }
 }
@@ -539,12 +545,16 @@ const char* abcl_class_name(int class_id) {
   case CLASS_Fork: return "Fork";
   case CLASS_Philosopher: return "Philosopher";
   case CLASS_WebReceiver: return "WebReceiver";
+  case CLASS_Dispatcher: return "Dispatcher";
+  case CLASS_Worker:     return "Worker";
   default: return "?";
   }
 }
 
 static void dispatch_Fork(int, int, const char*, value_t*, int);
 static void dispatch_Philosopher(int, int, const char*, value_t*, int);
+static void dispatch_Dispatcher(int, int, const char*, value_t*, int);
+static void dispatch_Worker(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -558,6 +568,10 @@ static int g_f3 = -1;
 static int g_f4 = -1;
 static int g_p4 = -1;
 static int g_p5 = -1;
+/* load-balancer globals (set in aipl_main, read by webactor via accessors) */
+#define LB_N_WORKERS 4
+static int g_loadbal_disp = -1;
+static int g_loadbal_w[LB_N_WORKERS] = { -1, -1, -1, -1 };
 
 enum { F_Fork_holder, F_Fork__N };
 
@@ -691,11 +705,302 @@ static void dispatch_WebReceiver(int self_id, int sender_id, const char* method,
   /* "init" and anything else: no-op */
 }
 
+/* ============================================================
+ * Load-balancer: Dispatcher + Worker classes.
+ *
+ *   Dispatcher.register_workers(w0, w1, w2, w3)
+ *     Tell the dispatcher which Worker objects it owns.  Sent once
+ *     at boot.  Up to LB_N_WORKERS (4) — extras are ignored.
+ *
+ *   Dispatcher.submit(work_ms, task_id)
+ *     Pick the worker with the LEAST outstanding load, increment its
+ *     load counter, and forward compute(work_ms, task_id) to it.
+ *     Round-robin would be simpler but doesn't react to existing
+ *     backlog; least-loaded keeps the slowest worker from piling up.
+ *
+ *   Dispatcher.done(worker_idx, task_id, result)
+ *     Called by a Worker when it finishes a task.  Decrements that
+ *     worker's load counter, bumps the dispatcher's completed counter,
+ *     and logs the completion to serial.
+ *
+ *   Worker.bind(my_idx, dispatcher_id)
+ *     Tell the worker its own slot index AND who to send `done` to.
+ *
+ *   Worker.compute(work_ms, task_id)
+ *     Simulate work: sleep work_ms, then `result = work_ms*7 + task_id`
+ *     (deterministic, easy to verify Mac-side).  Updates own counters,
+ *     then enqueues done(my_idx, task_id, result) to the dispatcher.
+ *
+ * Priorities: Dispatcher=25 (highest) so routing decisions don't get
+ * starved by Workers (22) or Philosophers (20).  Workers run above
+ * Philosophers so a /api/loadbal/submit burst gets serviced even when
+ * the dining demo is at full chatter.
+ * ============================================================ */
+
+enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
+       F_Disp_load0, F_Disp_load1, F_Disp_load2, F_Disp_load3,
+       F_Disp_submitted, F_Disp_completed, F_Disp__N };
+
+static void init_fields_Dispatcher(int self_id) {
+  int i;
+  for (i = 0; i < F_Disp__N; i++)
+    objects[self_id].fields[i] = mk_int(0L);
+}
+
+static void Dispatcher_register_workers(int self_id, int sender_id,
+                                        value_t* args, int n_args) {
+  (void)sender_id;
+  int count = 0;
+  if (n_args > 0) { objects[self_id].fields[F_Disp_w0] = mk_obj(args[0].obj_id); count++; }
+  if (n_args > 1) { objects[self_id].fields[F_Disp_w1] = mk_obj(args[1].obj_id); count++; }
+  if (n_args > 2) { objects[self_id].fields[F_Disp_w2] = mk_obj(args[2].obj_id); count++; }
+  if (n_args > 3) { objects[self_id].fields[F_Disp_w3] = mk_obj(args[3].obj_id); count++; }
+  objects[self_id].fields[F_Disp_n] = mk_int((long)count);
+  wait(print_mu);
+  kprintf("[loadbal] dispatcher %d: registered %d workers\r\n", self_id, count);
+  signal(print_mu);
+}
+
+static void Dispatcher_submit(int self_id, int sender_id,
+                              value_t* args, int n_args) {
+  (void)sender_id;
+  long work_ms = (n_args > 0) ? args[0].i : 100L;
+  long task_id = (n_args > 1) ? args[1].i : 0L;
+  int n = (int)objects[self_id].fields[F_Disp_n].i;
+  if (n <= 0) {
+    wait(print_mu);
+    kprintf("[loadbal] submit dropped: no workers registered\r\n");
+    signal(print_mu);
+    return;
+  }
+  /* Find lowest-load worker.  Unrolled because we only support up to 4. */
+  int  best = 0;
+  long best_load = objects[self_id].fields[F_Disp_load0].i;
+  if (n > 1 && objects[self_id].fields[F_Disp_load1].i < best_load) {
+    best = 1; best_load = objects[self_id].fields[F_Disp_load1].i;
+  }
+  if (n > 2 && objects[self_id].fields[F_Disp_load2].i < best_load) {
+    best = 2; best_load = objects[self_id].fields[F_Disp_load2].i;
+  }
+  if (n > 3 && objects[self_id].fields[F_Disp_load3].i < best_load) {
+    best = 3; best_load = objects[self_id].fields[F_Disp_load3].i;
+  }
+  int worker_obj = 0;
+  switch (best) {
+  case 0: worker_obj = objects[self_id].fields[F_Disp_w0].obj_id; break;
+  case 1: worker_obj = objects[self_id].fields[F_Disp_w1].obj_id; break;
+  case 2: worker_obj = objects[self_id].fields[F_Disp_w2].obj_id; break;
+  case 3: worker_obj = objects[self_id].fields[F_Disp_w3].obj_id; break;
+  }
+  switch (best) {
+  case 0: objects[self_id].fields[F_Disp_load0] = mk_int(best_load + 1); break;
+  case 1: objects[self_id].fields[F_Disp_load1] = mk_int(best_load + 1); break;
+  case 2: objects[self_id].fields[F_Disp_load2] = mk_int(best_load + 1); break;
+  case 3: objects[self_id].fields[F_Disp_load3] = mk_int(best_load + 1); break;
+  }
+  objects[self_id].fields[F_Disp_submitted] =
+    mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
+
+  wait(print_mu);
+  kprintf("[loadbal] dispatch task=%ld -> worker idx=%d obj=%d (load %ld->%ld)\r\n",
+          task_id, best, worker_obj, best_load, best_load + 1);
+  signal(print_mu);
+
+  enqueue(self_id, worker_obj, "compute", 2,
+          (value_t[]){ mk_int(work_ms), mk_int(task_id) });
+}
+
+static void Dispatcher_done(int self_id, int sender_id,
+                            value_t* args, int n_args) {
+  (void)sender_id;
+  long widx    = (n_args > 0) ? args[0].i : -1L;
+  long task_id = (n_args > 1) ? args[1].i : -1L;
+  long result  = (n_args > 2) ? args[2].i : 0L;
+  switch ((int)widx) {
+  case 0: objects[self_id].fields[F_Disp_load0] =
+            mk_int(objects[self_id].fields[F_Disp_load0].i - 1); break;
+  case 1: objects[self_id].fields[F_Disp_load1] =
+            mk_int(objects[self_id].fields[F_Disp_load1].i - 1); break;
+  case 2: objects[self_id].fields[F_Disp_load2] =
+            mk_int(objects[self_id].fields[F_Disp_load2].i - 1); break;
+  case 3: objects[self_id].fields[F_Disp_load3] =
+            mk_int(objects[self_id].fields[F_Disp_load3].i - 1); break;
+  default: break;
+  }
+  objects[self_id].fields[F_Disp_completed] =
+    mk_int(objects[self_id].fields[F_Disp_completed].i + 1);
+  wait(print_mu);
+  kprintf("[loadbal] complete task=%ld worker=%ld result=%ld (done=%ld/%ld)\r\n",
+          task_id, widx, result,
+          objects[self_id].fields[F_Disp_completed].i,
+          objects[self_id].fields[F_Disp_submitted].i);
+  signal(print_mu);
+}
+
+static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
+                                value_t* args, int n_args) {
+  if (strcmp(method, "register_workers") == 0)
+  { Dispatcher_register_workers(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "submit") == 0)
+  { Dispatcher_submit(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "done") == 0)
+  { Dispatcher_done(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "init") == 0) return;
+}
+
+enum { F_Worker_my_idx, F_Worker_dispatcher, F_Worker_done,
+       F_Worker_busy_ms, F_Worker_last_n, F_Worker_last_result,
+       F_Worker__N };
+
+static void init_fields_Worker(int self_id) {
+  int i;
+  for (i = 0; i < F_Worker__N; i++)
+    objects[self_id].fields[i] = mk_int(0L);
+}
+
+static void Worker_bind(int self_id, int sender_id,
+                        value_t* args, int n_args) {
+  (void)sender_id;
+  if (n_args < 2) return;
+  objects[self_id].fields[F_Worker_my_idx]     = mk_int(args[0].i);
+  objects[self_id].fields[F_Worker_dispatcher] = mk_obj(args[1].obj_id);
+  wait(print_mu);
+  kprintf("[loadbal] worker %d bound idx=%ld dispatcher=%d\r\n",
+          self_id, args[0].i, args[1].obj_id);
+  signal(print_mu);
+}
+
+static void Worker_compute(int self_id, int sender_id,
+                           value_t* args, int n_args) {
+  (void)sender_id;
+  long work_ms = (n_args > 0) ? args[0].i : 0L;
+  long task_id = (n_args > 1) ? args[1].i : 0L;
+  long idx     = objects[self_id].fields[F_Worker_my_idx].i;
+  int  disp    = objects[self_id].fields[F_Worker_dispatcher].obj_id;
+
+  wait(print_mu);
+  kprintf("[loadbal] worker idx=%ld obj=%d task=%ld start (%ld ms)\r\n",
+          idx, self_id, task_id, work_ms);
+  signal(print_mu);
+
+  if (work_ms > 0) sleep((uint)work_ms);
+
+  long result = work_ms * 7L + task_id;
+  objects[self_id].fields[F_Worker_last_n]      = mk_int(work_ms);
+  objects[self_id].fields[F_Worker_last_result] = mk_int(result);
+  objects[self_id].fields[F_Worker_done] =
+    mk_int(objects[self_id].fields[F_Worker_done].i + 1);
+  objects[self_id].fields[F_Worker_busy_ms] =
+    mk_int(objects[self_id].fields[F_Worker_busy_ms].i + work_ms);
+
+  wait(print_mu);
+  kprintf("[loadbal] worker idx=%ld task=%ld done result=%ld\r\n",
+          idx, task_id, result);
+  signal(print_mu);
+
+  enqueue(self_id, disp, "done", 3,
+          (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(result) });
+}
+
+static void dispatch_Worker(int self_id, int sender_id, const char* method,
+                            value_t* args, int n_args) {
+  if (strcmp(method, "bind") == 0)
+  { Worker_bind(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "compute") == 0)
+  { Worker_compute(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "init") == 0) return;
+}
+
+/* === accessors used by apps/webactor.c =================================== */
+int abcl_loadbal_dispatcher_id(void) { return g_loadbal_disp; }
+int abcl_loadbal_worker_count(void)  { return LB_N_WORKERS; }
+int abcl_loadbal_worker_id(int idx) {
+  if (idx < 0 || idx >= LB_N_WORKERS) return -1;
+  return g_loadbal_w[idx];
+}
+void abcl_loadbal_submit(int work_ms, int task_id) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "submit", 2,
+               (value_t[]){ mk_int((long)work_ms), mk_int((long)task_id) });
+}
+
+/* One-shot bootstrap of the load-balancer actors.  Safe to call multiple
+ * times — only the first call creates the actors.  Called from
+ * webactor_autostart so the load-balancer exists even when aipl_main
+ * isn't running (the default boot path runs only the AIPL-RPC + HTTP
+ * servers, not the full dining demo). */
+static int g_loadbal_inited = 0;
+void abcl_loadbal_init(void) {
+  if (g_loadbal_inited) return;
+  /* Runtime mutexes must already be up — abcl_web_init() / abcl_rt_init()
+   * sets them.  We don't call abcl_rt_init_once() here so the caller
+   * controls ordering. */
+  int i;
+  g_loadbal_disp = alloc_obj(CLASS_Dispatcher, 0, NULL);
+  for (i = 0; i < LB_N_WORKERS; i++)
+    g_loadbal_w[i] = alloc_obj(CLASS_Worker, 0, NULL);
+  /* Spawn the threads BEFORE sending bind/register so the messages
+   * have a thread to consume them. */
+  spawn_actor(g_loadbal_disp);
+  for (i = 0; i < LB_N_WORKERS; i++) spawn_actor(g_loadbal_w[i]);
+  /* Bind each worker to its slot + dispatcher (queued) */
+  for (i = 0; i < LB_N_WORKERS; i++) {
+    abcl_enqueue(-1, g_loadbal_w[i], "bind", 2,
+                 (value_t[]){ mk_int((long)i), mk_obj(g_loadbal_disp) });
+  }
+  /* Register all workers in dispatcher */
+  abcl_enqueue(-1, g_loadbal_disp, "register_workers", LB_N_WORKERS,
+               (value_t[]){ mk_obj(g_loadbal_w[0]), mk_obj(g_loadbal_w[1]),
+                            mk_obj(g_loadbal_w[2]), mk_obj(g_loadbal_w[3]) });
+  g_loadbal_inited = 1;
+  wait(print_mu);
+  kprintf("[loadbal] init done: dispatcher=%d workers=%d,%d,%d,%d\r\n",
+          g_loadbal_disp,
+          g_loadbal_w[0], g_loadbal_w[1], g_loadbal_w[2], g_loadbal_w[3]);
+  signal(print_mu);
+}
+
+/* Fills `buf` with a one-line-per-row snapshot of dispatcher + workers.
+ * Caller-allocated; cap must be >= 512.  Returns bytes written. */
+int abcl_loadbal_stats(char *buf, int cap) {
+  if (cap < 512 || g_loadbal_disp < 0) {
+    return sprintf(buf, "loadbal not initialized\n");
+  }
+  int d = g_loadbal_disp;
+  int n = (int)objects[d].fields[F_Disp_n].i;
+  int blen = sprintf(buf,
+    "dispatcher obj=%d workers=%d submitted=%ld completed=%ld\n"
+    "loads: w0=%ld w1=%ld w2=%ld w3=%ld\n",
+    d, n,
+    objects[d].fields[F_Disp_submitted].i,
+    objects[d].fields[F_Disp_completed].i,
+    objects[d].fields[F_Disp_load0].i,
+    objects[d].fields[F_Disp_load1].i,
+    objects[d].fields[F_Disp_load2].i,
+    objects[d].fields[F_Disp_load3].i);
+  int i;
+  blen += sprintf(buf + blen,
+                  "idx obj done busy_ms last_n last_result\n");
+  for (i = 0; i < LB_N_WORKERS; i++) {
+    int wid = g_loadbal_w[i];
+    if (wid < 0) continue;
+    blen += sprintf(buf + blen, "%d %d %ld %ld %ld %ld\n",
+      i, wid,
+      objects[wid].fields[F_Worker_done].i,
+      objects[wid].fields[F_Worker_busy_ms].i,
+      objects[wid].fields[F_Worker_last_n].i,
+      objects[wid].fields[F_Worker_last_result].i);
+  }
+  return blen;
+}
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
   case CLASS_Philosopher: dispatch_Philosopher(self_id, sender_id, method, args, n_args); break;
   case CLASS_WebReceiver: dispatch_WebReceiver(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Dispatcher: dispatch_Dispatcher(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Worker:     dispatch_Worker(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -705,6 +1010,8 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_Fork: init_fields_Fork(self_id); break;
   case CLASS_Philosopher: init_fields_Philosopher(self_id); break;
   case CLASS_WebReceiver: break;   /* no fields */
+  case CLASS_Dispatcher: init_fields_Dispatcher(self_id); break;
+  case CLASS_Worker:     init_fields_Worker(self_id);     break;
   default: break;
   }
 }
@@ -897,6 +1204,9 @@ thread aipl_main(void) {
   g_f4 = alloc_obj(CLASS_Fork, 0, NULL);
   g_p4 = alloc_obj(CLASS_Philosopher, 3, (value_t[]){mk_int((long)(4L)), mk_obj((int)(g_f2)), mk_obj((int)(g_f3))});
   g_p5 = alloc_obj(CLASS_Philosopher, 3, (value_t[]){mk_int((long)(5L)), mk_obj((int)(g_f3)), mk_obj((int)(g_f4))});
+  /* Load-balancer (Dispatcher + Workers) is bootstrapped separately
+   * by abcl_loadbal_init() — invoked from webactor_autostart so it
+   * exists even when aipl_main isn't part of the boot path. */
   /* phase 2: spawn actors */
   {
     int i, total;

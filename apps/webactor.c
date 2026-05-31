@@ -834,6 +834,96 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/loadbal/submit?n=K&ms=M:
+             *   Enqueue K compute tasks via the Dispatcher; each takes
+             *   ms milliseconds.  Dispatcher routes to the least-loaded
+             *   Worker, so K tasks across W workers takes roughly
+             *   ceil(K/W)*ms wall-clock instead of K*ms serial.
+             *   K defaults to LB_N_WORKERS, ms defaults to 200. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/submit", 23) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/submit", 24))
+            {
+                extern void abcl_loadbal_submit(int, int);
+                extern int  abcl_loadbal_worker_count(void);
+                const char *url = strchr(reqbuf, ' ');
+                int n_tasks = abcl_loadbal_worker_count();
+                int work_ms = 200;
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n')
+                        {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int klen = eq - p;
+                            if (klen == 1 && *p == 'n' && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                n_tasks = v;
+                            }
+                            else if (klen == 2 && 0 == strncmp(p, "ms", 2) && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                work_ms = v;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                if (n_tasks < 1)   n_tasks = 1;
+                if (n_tasks > 64)  n_tasks = 64;     /* cap so we don't flood */
+                if (work_ms < 0)   work_ms = 0;
+                if (work_ms > 5000)work_ms = 5000;
+                int i;
+                for (i = 1; i <= n_tasks; i++)
+                {
+                    abcl_loadbal_submit(work_ms, i);
+                }
+                static char lresp[300];
+                int blen = sprintf(lresp + 100,
+                                   "submitted n=%d ms=%d (see /api/loadbal/stats)\r\n",
+                                   n_tasks, work_ms);
+                int hlen = sprintf(lresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(lresp + hlen, lresp + 100, blen);
+                write(tcpdev, lresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/stats: dispatcher + per-worker counters.
+             * Used by Mac scripts to verify even distribution. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/stats", 22) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/stats", 23))
+            {
+                extern int abcl_loadbal_stats(char *, int);
+                static char sresp[1024];
+                int blen = abcl_loadbal_stats(sresp + 200, 800);
+                int hlen = sprintf(sresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(sresp + hlen, sresp + 200, blen);
+                write(tcpdev, sresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /sd-test: read LBA 0 (MBR) and report first 16 bytes hex.
              * Sanity check that the in-kernel SD driver can read the same
              * card the firmware booted us from. */
@@ -1019,6 +1109,12 @@ thread webactor_autostart(void)
             kprintf("[webactor] autostart: HTTP server up on port %d\r\n",
                     WEBACTOR_PORT);
         }
+    }
+    /* Spin up the load-balancer (1 Dispatcher + 4 Workers) so the
+     * /api/loadbal/* routes work without needing aipl_main. */
+    {
+        extern void abcl_loadbal_init(void);
+        abcl_loadbal_init();
     }
     return OK;
 }
