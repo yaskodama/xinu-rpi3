@@ -88,8 +88,27 @@ struct tcpPseudo
 
 #define TCP_PSEUDO_LEN  12
 
-/* Buffer lengths */
-#define TCP_IBLEN 16384  /**< Size of input buffer, must be multiple of 8 */
+/* Buffer lengths.
+ *
+ * IBLEN bumped 16 KB → 64 KB-ish to cut per-cycle overhead on /upload.
+ * Each "fill buffer → window=0 → drain → ack → refill" cycle takes
+ * ~3-5 s on this Pi 3 (TCP/USB-eth overhead).  Bigger buffer = fewer
+ * cycles per upload.
+ *
+ * IBLEN must be ≤ TCP_MAX_WND because tcpSendWindow does
+ *   ushort window = TCP_IBLEN - icount;
+ * Set IBLEN to exactly 65536 and the initial icount=0 case overflows
+ * to window=0 — the very first SYN+ACK advertises a zero window and
+ * the connection deadlocks before any data flows.  Verified this
+ * empirically: a build with IBLEN=65536 boots but every HTTP
+ * connection hangs immediately (kernel responds to ping, but no TCP
+ * traffic completes).  Using 65528 (8 KB-aligned, just below the
+ * 65535 ushort cap) avoids the overflow.
+ *
+ * Memory cost per TCB: in[64KB] + imark[64KB] + out[16KB] = 144 KB.
+ * NTCP=7 → ~1 MB total static (was 336 KB).  Pi 3 has 1 GB free; this
+ * is noise. */
+#define TCP_IBLEN 65528  /**< Size of input buffer, must be multiple of 8 */
 #define TCP_OBLEN 16384  /**< Size of output buffer */
 
 /* Enable the "gracious ACK" path in tcpRead.c: when user-space drains
