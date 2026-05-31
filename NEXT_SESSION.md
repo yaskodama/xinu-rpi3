@@ -9,19 +9,20 @@
 - ✅ 起動 + `xsh$` 対話シェル (シリアル UART0 / HDMI 両方)
 - ✅ HDMI フレームバッファ + 窓システム (Pi5 から移植) + USB キーボード/マウス
 - ✅ **USB ethernet (LAN78xx)** — ping ~3ms, TCP 双方向動作
-- ✅ **AIPL ランタイム** (philosopher/web/dispatcher/worker 等 6 actor 並列)
-- ✅ **HTTP server (port 8080)** — 16+ ルートで introspection + 操作
+- ✅ **AIPL ランタイム** (philosopher/web/dispatcher/worker/collector で 7 actor 並列)
+- ✅ **HTTP server (port 8080)** — 25+ ルートで introspection + 操作
 - ✅ **AIPL-RPC server (port 5555)** — Mac から SPAWN/COMPILE 等
 - ✅ **C JIT (cc_mvp Stage 5)** — Turing-complete に近い structured C を ARM32 機械語に変換+実行
-- ✅ **負荷分散アクター** — Dispatcher + 4 Workers, sleep & JIT 両モード
+- ✅ **負荷分散アクター** — Dispatcher + 4 Workers, sleep & JIT 両モード, pause/resume + per-task tracking + cancellation + 429 backpressure + latency histogram
+- ✅ **Global actor GC (Collector actor)** — 周期 sweep、infrastructure protect、HTTP で configure/enable/sweep_now
 - ✅ **MMU enable** — identity-map, RAM/MMIO 領域属性分離
 - ✅ **Network kernel update** — `/upload` + `/kexec` で SD swap 不要のカーネル入れ替え
 - ✅ TCP upload ~26 KB/s (IBLEN bump 後)
 
 **2026-05-27**: ethernet ping 完全動作 (LAN78xx ドライバ + DWC NAK 修正)
-**2026-06-01**: 上記の AIPL/JIT/loadbal/MMU/kexec/TCP 高速化を一気に積み上げ
+**2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1 + GC actor を一気に積み上げ (30 commits)
 
-## 2026-06-01 セッション概要 (24 commits)
+## 2026-06-01 セッション概要 (30 commits)
 
 ```
 3f9fb9e  cc_mvp MVP — int main() { return CONST; }
@@ -37,7 +38,13 @@ e0cfc09  cc_mvp Stage 5 — comparison operators + while loops
 93f3f95  dnsmasq path + version.h refresh
 84f47c0  /kexec — network kernel update via HTTP, no SD swap
 72495d5  /upload chunked body reader + TCP_GRACIOUSACK (1.37×)
-451fd15  TCP_IBLEN 16 KB → 65528 (5.4× upload speedup, fix ushort wrap)  ← 最新
+451fd15  TCP_IBLEN 16 KB → 65528 (5.4× upload speedup, fix ushort wrap)
+b2e0137  NEXT_SESSION refresh (2026-06-01 24 commits)
+fbcc192  README English fork overview
+b7e5b5e  loadbal — pause/resume + per-task tracking + enabled mask
+5e63d31  loadbal Tier 1 — cancellation + 429 backpressure + latency histogram
+11cd126  global actor GC implemented as actor (CLASS_Collector)
+9c89aad  version.h refresh                                      ← 最新
 ```
 
 ## 重要な追加機能 (このセッション)
@@ -67,7 +74,30 @@ HTTP: `POST /compile` with C source as body。
 - `CLASS_Dispatcher` (3) — 最少負荷 worker に `compute` 転送 (sleep mode)、round-robin で
   `compute_jit` 転送 (JIT mode)
 - `CLASS_Worker` (4) × 4 — sleep または JIT で並列処理、結果を `done` で dispatcher に返却
-- `LB_N_WORKERS = 4` (MAX_OBJECTS=16 のうち bootstrap 6 + 余裕10)
+- `LB_N_WORKERS = 4` (MAX_OBJECTS=16 のうち bootstrap 7 + 余裕9)
+
+**production 機能 (b7e5b5e + 5e63d31)**:
+- **Pause/resume drain**: `set_enabled(idx, on)` で worker 一時停止、dispatcher が skip。
+  `F_Disp_enabled` mask field (bit i = worker i 有効) で管理。in-flight タスクは完了する。
+- **Per-task tracking**: `lb_tasks[64]` circular buffer に submit_ms/done_ms/result/state 保持。
+  Mac は fire-and-forget して後で `/api/loadbal/task?id=N` で query 可能。
+- **Cancellation**: `cancel_task(id)` で state を CANCELLED に。Worker は chunked sleep (50ms 毎)
+  で state を polling、abort 可能。JIT は pre-flight check のみ (compile+exec は同期)。
+- **429 backpressure**: `LB_WORKER_QUEUE_MAX=8` 超えた worker しか無ければ `/submit` /`jit` は
+  HTTP 429 + `Retry-After: 1` 返却 (mailbox 飽和を防ぐ)。
+- **Latency histogram**: Worker毎 7 bucket (<50/50-99/100-199/200-499/500-999/1k-2k/≥2k ms)。
+  Dispatcher_done が done時に elapsed_ms 計算 → 該当 bucket を増分 → `/api/loadbal/stats` で表示。
+
+### Global Actor GC (`apps/abcl_program.c` — CLASS_Collector)
+- `CLASS_Collector` (5) — actor として実装された GC、独自 mailbox + dispatch loop
+- **Heartbeat thread** (`abcl_gc_heartbeat`) — 1s 周期で Collector に "tick" message 送信
+- Collector.tick は `period_ms` 経過判定 → `abcl_gc_sweep(threshold_ms)` 呼び出し
+- Fields: period_ms (default 5000)、threshold_ms (default 30000)、enabled、sweep_count、
+  swept_total、last_swept_n、last_scanned_n、last_sweep_ticks
+- Methods: tick / configure / enable / sweep_now / init
+- Priority `ABCL_PRIO_Collector=26` (Dispatcher 25 より高い、starve 防止)
+- Bootstrap (`abcl_gc_actor_init`) で WebReceiver/Dispatcher/Workers/Collector を全て
+  `abcl_object_protect(1)` に → mis-set threshold で runtime を reap 不能
 - HTTP: `/api/loadbal/submit?n=K&ms=M`, `/api/loadbal/jit?n=K&prog=P`, `/api/loadbal/stats`
 - stress test 実績: 256 sleep tasks (4 burst) + 64 JIT tasks、drops=0、各 worker 完全均等分散
 
@@ -112,21 +142,37 @@ POST /upload?dst=NAME                  — store request body in upload slot (51
 GET  /api/upload-info                  — last upload metadata + first 32 B hex
 POST /kexec                            — jump to last /upload (network kernel update)
 GET  /api/mmu                          — MMU SCTLR/TTBR0 dump
+
+# Actor introspection
 GET  /api/actors                       — AIPL actor inventory (id class tid started dead enq deq drops)
 GET  /api/actor-age?id=N               — ms since last mailbox activity
 POST /api/actor-kill?id=N              — kill an actor
-POST /gc?threshold_ms=N[&dry=0|1]      — sweep actors idle > threshold
+POST /gc?threshold_ms=N[&dry=0|1]      — one-shot sweep (manual, on webactor thread)
 POST /api/actor-send?to=N&m=METHOD&v=  — inject message into any actor's mailbox
 GET  /api/object-field?id=N&field=K    — peek actor field
 GET  /api/threads                      — thrtab dump
 GET  /api/memstat                      — free bytes
-GET  /api/loadbal/stats                — dispatcher + worker counters
-POST /api/loadbal/submit?n=K&ms=M      — submit K sleep tasks of M ms
-POST /api/loadbal/jit?n=K&prog=P       — submit K JIT tasks (prog = static C source index)
+
+# Load-balancer
+GET  /api/loadbal/stats                — dispatcher + workers + enabled_mask + per-worker histogram
+POST /api/loadbal/submit?n=K&ms=M      — submit K sleep tasks (returns 429 when saturated)
+POST /api/loadbal/jit?n=K&prog=P       — submit K JIT tasks (returns 429 when saturated)
+POST /api/loadbal/pause?w=N            — pause worker N (drain mode)
+POST /api/loadbal/resume?w=N           — resume worker N
+GET  /api/loadbal/task?id=N            — query task by id (last 64 retained)
+POST /api/loadbal/cancel?id=N          — mark task as cancelled (worker aborts on chunk boundary)
+
+# GC actor (periodic global actor sweep)
+GET  /api/gc-actor/stats               — period/threshold + sweep_count + counters
+POST /api/gc-actor/configure?period=N&threshold=M
+POST /api/gc-actor/enable?on=0|1
+POST /api/gc-actor/sweep_now           — force immediate sweep
+
+# JIT + misc
 POST /compile                          — compile + run C source (body = source)
 GET  /mmio-read?addr=0xN               — peek 32-bit register
 POST /reboot                           — watchdog reset (re-load from SD)
-GET  /sd-test                          — read LBA 0 (sanity, doesn't currently work — controller mismatch)
+GET  /sd-test                          — read LBA 0 (doesn't currently work — controller mismatch)
 ```
 
 ## カーネル更新フロー — 2 通り
@@ -164,8 +210,11 @@ backup kernel:
 ### 中優先
 - **SDHOST driver port** — BCM2837 のデフォルト SD コントローラ (EMMC でなく SDHOST @ 0x3F202000)
   → 現 `apps/sd_block.c` は EMMC 前提で動かない。永続的な network kernel write には必須
-- **JIT 拡張** — 比較 + 論理 (`&&`/`||`), unary, ポインタ/配列、関数定義 (1関数→複数関数)、
+- **JIT 拡張** — 論理 (`&&`/`||`), unary, ポインタ/配列、関数定義 (1関数→複数関数)、
   value_t builtin (v_int_of, v_add, v_eq 等) → aipl2c 出力を JIT で実行できる
+- **Load-balancer Tier 2/3 機能**:
+  - sticky routing (consistent hash by key)、priority queues、retry on failure、
+    worker kill+restart、worker pool dynamic resize、speculative execution、scatter-gather
 
 ### 低優先 / 未着手
 - per-process VAS + TTBR0 swap (要 mmu_disable + context save 拡張)
@@ -182,8 +231,10 @@ backup kernel:
 
 ```
 apps/cc_mvp.c                            — C JIT (Stage 5)
-apps/abcl_program.c                      — + Dispatcher / Worker / loadbal helpers
+apps/abcl_program.c                      — + Dispatcher / Worker / Collector
+                                           + lb_tasks tracking + histogram + GC actor
 apps/webactor.c                          — + 多数の /api routes, /kexec, chunked reader
+                                           + 429 backpressure + /api/gc-actor/*
 apps/sd_block.c                          — SD driver (動かない、SDHOST が必要)
 system/platforms/arm-rpi3/mmu.c          — MMU enable/disable
 system/platforms/arm-rpi3/Makerules      — + mmu.c
