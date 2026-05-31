@@ -238,6 +238,63 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/actor-kill?id=N — force-kill AIPL actor N by killing
+             * its Xinu worker thread.  Pi 4 equivalent: cc_actor_kill /
+             * /gc with low threshold.  Pi 3 AIPL actor slots don't
+             * recycle (n_objects monotonically grows), so this only
+             * tears down the thread; the slot stays as "dead".  Useful
+             * for cleaning up wedged actors without rebooting. */
+            if (0 == strncmp(reqbuf, "GET /api/actor-kill", 19) ||
+                0 == strncmp(reqbuf, "POST /api/actor-kill", 20))
+            {
+                int kid = -1;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *p = strstr(url, "id=");
+                    if (NULL != p)
+                    {
+                        p += 3;
+                        kid = 0;
+                        while (*p >= '0' && *p <= '9')
+                        {
+                            kid = kid * 10 + (*p - '0');
+                            p++;
+                        }
+                    }
+                }
+                extern int abcl_n_objects(void);
+                extern int abcl_object_tid(int);
+                static char kresp[200];
+                int blen;
+                if (kid < 0)
+                {
+                    blen = sprintf(kresp + 100,
+                                   "usage: /api/actor-kill?id=N\r\n");
+                }
+                else if (kid >= abcl_n_objects())
+                {
+                    blen = sprintf(kresp + 100, "no such actor %d\r\n", kid);
+                }
+                else
+                {
+                    int tid = abcl_object_tid(kid);
+                    int rc = (tid >= 0) ? kill((tid_typ)tid) : -1;
+                    blen = sprintf(kresp + 100,
+                                   "actor=%d tid=%d kill_rc=%d\r\n",
+                                   kid, tid, rc);
+                }
+                int hlen = sprintf(kresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(kresp + hlen, kresp + 100, blen);
+                write(tcpdev, kresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /mmio-read?addr=0xN — peek a 32-bit register.  No fault
              * catching on Pi 3 (no setjmp/longjmp safety net like Pi 4's
              * safe_mmio_read32) so a bad address will hard-fault the
