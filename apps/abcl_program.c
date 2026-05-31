@@ -154,6 +154,13 @@ typedef struct {
   int       started;
   volatile int dead;     /* set by abcl_actor_suicide(): the actor's worker
                             thread exits after the current dispatch returns */
+  /* Activity timestamps for the GC sweep — both stamped on each enq/deq
+   * so a "zombie" actor (no recent mailbox activity AND no progress
+   * processing what's queued) shows up as old by either metric. */
+  volatile unsigned long last_enq_ticks;
+  volatile unsigned long last_deq_ticks;
+  unsigned long          birth_ticks;
+  volatile int           protected_from_gc;
 } object_t;
 
 static object_t objects[MAX_OBJECTS];
@@ -271,6 +278,55 @@ int abcl_object_dead(int obj_id) {
   return objects[obj_id].dead;
 }
 
+/* GC support: age = ms since the more recent of last_enq / last_deq.
+ * On the 100 Hz Xinu clock, each clkticks unit is 10 ms.  Returns -1
+ * for an invalid id. */
+long abcl_object_age_ms(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  unsigned long now = clkticks;
+  unsigned long e = objects[obj_id].last_enq_ticks;
+  unsigned long d = objects[obj_id].last_deq_ticks;
+  unsigned long last = (e > d) ? e : d;
+  return (long)((now - last) * 10);
+}
+
+void abcl_object_protect(int obj_id, int on) {
+  if (obj_id < 0 || obj_id >= n_objects) return;
+  objects[obj_id].protected_from_gc = on ? 1 : 0;
+}
+
+int abcl_object_protected(int obj_id) {
+  if (obj_id < 0 || obj_id >= n_objects) return 0;
+  return objects[obj_id].protected_from_gc;
+}
+
+/* GC sweep: iterate live actors, force-kill those older than threshold
+ * (unless protected).  dry_run=1 reports without killing.  Returns
+ * count of kills. */
+int abcl_gc_sweep(long threshold_ms, int dry_run, int *out_scanned) {
+  int killed = 0, scanned = 0;
+  int i;
+  for (i = 0; i < n_objects; i++) {
+    if (objects[i].dead) continue;
+    if (!objects[i].started) continue;
+    scanned++;
+    if (objects[i].protected_from_gc) continue;
+    long age = abcl_object_age_ms(i);
+    if (age >= 0 && age >= threshold_ms) {
+      if (!dry_run) {
+        tid_typ t = objects[i].tid;
+        if (t > 0) {
+          kill(t);
+          objects[i].dead = 1;
+        }
+      }
+      killed++;
+    }
+  }
+  if (out_scanned) *out_scanned = scanned;
+  return killed;
+}
+
 /* 自殺関数: the actor terminates itself.  Sets the dead flag so its worker
  * thread (abcl_actor_main) leaves its dispatch loop after the current
  * message and exits.  Callable from a generated method via self_id. */
@@ -341,6 +397,10 @@ void abcl_enqueue(int sender, int receiver, const char *method,
                   int n_args, value_t *args) {
   if (receiver < 0 || receiver >= n_objects) return;
   abcl_log_first_send(receiver, method);
+  /* Stamp activity timestamp early (under the same critical section is
+   * not strictly needed since both clkticks read + the field are
+   * single-word writes — the GC sweep tolerates a one-tick fuzz). */
+  objects[receiver].last_enq_ticks = clkticks;
   mailbox_t *mb = &objects[receiver].mbox;
 #ifdef _XINU_PLATFORM_ARM_RPI3_
   /* Pi3 (Cortex-A53 with MMU / L1 D-cache OFF => strongly-ordered memory):
@@ -660,6 +720,11 @@ static int alloc_obj(int class_id, int n_args, value_t* args) {
   init_fields(class_id, id);
   mailbox_init(&objects[id].mbox);
   objects[id].started = 0;
+  objects[id].dead = 0;
+  objects[id].birth_ticks    = clkticks;
+  objects[id].last_enq_ticks = clkticks;
+  objects[id].last_deq_ticks = clkticks;
+  objects[id].protected_from_gc = 0;
   enqueue(-1, id, "init", n_args, args);
   return id;
 }
@@ -744,6 +809,8 @@ thread abcl_actor_main(int self_id) {
     __atomic_store_n(&mb->slot_seq[slot], pos + (uint32_t)MAX_MAILBOX, __ATOMIC_RELEASE);
     __atomic_store_n(&mb->deq, pos + 1, __ATOMIC_RELEASE);
 #endif
+    /* Stamp dequeue activity (GC sweep "age" = now - max(last_enq, last_deq)). */
+    objects[self_id].last_deq_ticks = clkticks;
     abcl_log_first_recv(self_id, m.method);
     wait(counter_mu);
     idx = ++messages_processed;

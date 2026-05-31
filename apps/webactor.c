@@ -238,6 +238,90 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/actor-age?id=N — ms since the actor's last mailbox
+             * activity (enq or deq).  Pi 4 equivalent: cc_actor_age. */
+            if (0 == strncmp(reqbuf, "GET /api/actor-age", 18) ||
+                0 == strncmp(reqbuf, "POST /api/actor-age", 19))
+            {
+                int aid = -1;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *p = strstr(url, "id=");
+                    if (NULL != p)
+                    {
+                        p += 3;
+                        aid = 0;
+                        while (*p >= '0' && *p <= '9')
+                            aid = aid * 10 + (*p++ - '0');
+                    }
+                }
+                extern long abcl_object_age_ms(int);
+                extern int  abcl_n_objects(void);
+                static char ageresp[200];
+                int blen;
+                if (aid < 0)
+                    blen = sprintf(ageresp + 100, "usage: /api/actor-age?id=N\r\n");
+                else if (aid >= abcl_n_objects())
+                    blen = sprintf(ageresp + 100, "no such actor %d\r\n", aid);
+                else
+                    blen = sprintf(ageresp + 100,
+                                   "actor=%d age_ms=%ld\r\n",
+                                   aid, abcl_object_age_ms(aid));
+                int hlen = sprintf(ageresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(ageresp + hlen, ageresp + 100, blen);
+                write(tcpdev, ageresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /gc?threshold_ms=N[&dry=0|1] — sweep actors older than
+             * threshold.  Pi 4 equivalent: /gc with same query params. */
+            if (0 == strncmp(reqbuf, "GET /gc", 7) ||
+                0 == strncmp(reqbuf, "POST /gc", 8))
+            {
+                long threshold = 5000;
+                int  dry = 0;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *p = strstr(url, "threshold_ms=");
+                    if (NULL != p)
+                    {
+                        p += 13; threshold = 0;
+                        while (*p >= '0' && *p <= '9')
+                            threshold = threshold * 10 + (*p++ - '0');
+                    }
+                    const char *q = strstr(url, "dry=");
+                    if (NULL != q)
+                    {
+                        q += 4;
+                        if (*q >= '0' && *q <= '9') dry = (*q - '0');
+                    }
+                }
+                extern int abcl_gc_sweep(long, int, int *);
+                int scanned = 0;
+                int killed  = abcl_gc_sweep(threshold, dry, &scanned);
+                static char gcresp[300];
+                int blen = sprintf(gcresp + 100,
+                                   "killed=%d scanned=%d threshold_ms=%ld%s\r\n",
+                                   killed, scanned, threshold,
+                                   dry ? " (dry-run)" : "");
+                int hlen = sprintf(gcresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(gcresp + hlen, gcresp + 100, blen);
+                write(tcpdev, gcresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/actor-kill?id=N — force-kill AIPL actor N by killing
              * its Xinu worker thread.  Pi 4 equivalent: cc_actor_kill /
              * /gc with low threshold.  Pi 3 AIPL actor slots don't
