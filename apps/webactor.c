@@ -211,6 +211,54 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /api/actors: AIPL actor inventory.  Each row:
+             *   obj_id class_id tid started dead enq deq drops
+             * (enq-deq = current mailbox backlog; drops = lost to full mbox).
+             * Pi 4 equivalent: /api/actors-gc (which also has GC marker).
+             * Pi 3 doesn't yet have the GC sweep so this is the read-only
+             * inventory only. */
+            if (0 == strncmp(reqbuf, "GET /api/actors", 15) ||
+                0 == strncmp(reqbuf, "POST /api/actors", 16))
+            {
+                extern int abcl_n_objects(void);
+                extern int abcl_object_class_id(int);
+                extern int abcl_object_tid(int);
+                extern int abcl_object_enq(int);
+                extern int abcl_object_deq(int);
+                extern int abcl_object_drops(int);
+                extern int abcl_object_started(int);
+                extern int abcl_object_dead(int);
+                static char aresp[2400];
+                int n = abcl_n_objects();
+                int blen = sprintf(aresp + 200,
+                                   "n_objects=%d\n"
+                                   "obj_id class_id tid started dead enq deq drops\n",
+                                   n);
+                int i;
+                for (i = 0; i < n; i++)
+                {
+                    blen += sprintf(aresp + 200 + blen,
+                                    "%d %d %d %d %d %d %d %d\n",
+                                    i, abcl_object_class_id(i),
+                                    abcl_object_tid(i),
+                                    abcl_object_started(i),
+                                    abcl_object_dead(i),
+                                    abcl_object_enq(i),
+                                    abcl_object_deq(i),
+                                    abcl_object_drops(i));
+                    if (blen > 1900) break;
+                }
+                int hlen = sprintf(aresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(aresp + hlen, aresp + 200, blen);
+                write(tcpdev, aresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/threads: dump thrtab as plain text (id state prio name).
              * Useful Mac-side introspection — mirrors the in-kernel `ps`
              * shell command (which only reaches the serial console). */
