@@ -1217,6 +1217,129 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/gc-actor/stats — periodic actor GC stats.
+             * /api/gc-actor/configure?period=N&threshold=M
+             * /api/gc-actor/enable?on=0|1
+             * /api/gc-actor/sweep_now — force immediate sweep
+             *
+             * Differs from the existing /gc route (which performs a
+             * one-shot manual sweep from the webactor thread): this
+             * talks to the Collector ACTOR, so the sweep runs in its
+             * own thread at the Collector priority (26, above the
+             * load-balancer dispatcher) and the configuration is
+             * persistent across HTTP requests. */
+            if (0 == strncmp(reqbuf, "GET /api/gc-actor/stats",  23) ||
+                0 == strncmp(reqbuf, "POST /api/gc-actor/stats", 24))
+            {
+                extern int abcl_gc_actor_stats(char *, int);
+                static char gresp[500];
+                int blen = abcl_gc_actor_stats(gresp + 100, 400);
+                int hlen = sprintf(gresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(gresp + hlen, gresp + 100, blen);
+                write(tcpdev, gresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/gc-actor/configure",  27) ||
+                0 == strncmp(reqbuf, "POST /api/gc-actor/configure", 28))
+            {
+                extern void abcl_gc_actor_configure(int, int);
+                int period = -1, threshold = -1;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n')
+                        {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int klen = eq - p;
+                            if (klen == 6 && 0 == strncmp(p, "period", 6)
+                                && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                period = v;
+                            }
+                            else if (klen == 9 && 0 == strncmp(p, "threshold", 9)
+                                     && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                threshold = v;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                abcl_gc_actor_configure(period, threshold);
+                static char cresp3[200];
+                int blen = sprintf(cresp3 + 100,
+                    "gc-actor configure period=%d threshold=%d\r\n",
+                    period, threshold);
+                int hlen = sprintf(cresp3,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(cresp3 + hlen, cresp3 + 100, blen);
+                write(tcpdev, cresp3, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/gc-actor/enable",  24) ||
+                0 == strncmp(reqbuf, "POST /api/gc-actor/enable", 25))
+            {
+                extern void abcl_gc_actor_enable(int);
+                int on = 1;
+                const char *q = strstr(reqbuf, "?on=");
+                if (NULL != q) on = (q[4] != '0');
+                abcl_gc_actor_enable(on);
+                static char eresp[150];
+                int blen = sprintf(eresp + 100,
+                    "gc-actor %s\r\n", on ? "ENABLED" : "PAUSED");
+                int hlen = sprintf(eresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(eresp + hlen, eresp + 100, blen);
+                write(tcpdev, eresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/gc-actor/sweep_now",  27) ||
+                0 == strncmp(reqbuf, "POST /api/gc-actor/sweep_now", 28))
+            {
+                extern void abcl_gc_actor_sweep_now(void);
+                abcl_gc_actor_sweep_now();
+                static const char ok2[] =
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 26\r\n"
+                    "\r\n"
+                    "gc-actor sweep_now queued\r\n";
+                write(tcpdev, (void *)ok2, sizeof(ok2) - 1);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/cancel?id=N — mark task as cancelled.
              *   Sleep-mode workers honor it on next 50 ms chunk boundary;
              *   JIT-mode workers honor it only BEFORE the JIT call (the
@@ -1506,6 +1629,15 @@ thread webactor_autostart(void)
     {
         extern void abcl_loadbal_init(void);
         abcl_loadbal_init();
+    }
+    /* Spin up the global actor GC actor.  Order matters — must come
+     * AFTER loadbal init so it can mark the Dispatcher/Workers as
+     * protected (otherwise its first sweep at the default 30 s
+     * threshold could reap them while they sat idle in the boot's
+     * first quiet minute). */
+    {
+        extern void abcl_gc_actor_init(void);
+        abcl_gc_actor_init();
     }
     return OK;
 }

@@ -523,6 +523,7 @@ static int _abcl_cap = 0;
 #define CLASS_WebReceiver 2   /* web-bridge demo actor (apps/webactor.c) */
 #define CLASS_Dispatcher 3    /* load-balancer router */
 #define CLASS_Worker 4        /* load-balancer worker (compute target) */
+#define CLASS_Collector 5     /* periodic actor GC */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
@@ -530,6 +531,7 @@ static int _abcl_cap = 0;
 #define ABCL_PRIO_WebReceiver 20
 #define ABCL_PRIO_Dispatcher 25   /* routing is fast — keep ahead of workers */
 #define ABCL_PRIO_Worker 22       /* one above philosophers so submit() lands */
+#define ABCL_PRIO_Collector 26    /* GC runs above dispatcher so sweeps land */
 static int abcl_class_prio(int class_id) {
   switch (class_id) {
   case CLASS_Fork: return ABCL_PRIO_Fork;
@@ -537,6 +539,7 @@ static int abcl_class_prio(int class_id) {
   case CLASS_WebReceiver: return ABCL_PRIO_WebReceiver;
   case CLASS_Dispatcher: return ABCL_PRIO_Dispatcher;
   case CLASS_Worker:     return ABCL_PRIO_Worker;
+  case CLASS_Collector:  return ABCL_PRIO_Collector;
   default: return INITPRIO;
   }
 }
@@ -547,6 +550,7 @@ const char* abcl_class_name(int class_id) {
   case CLASS_WebReceiver: return "WebReceiver";
   case CLASS_Dispatcher: return "Dispatcher";
   case CLASS_Worker:     return "Worker";
+  case CLASS_Collector:  return "Collector";
   default: return "?";
   }
 }
@@ -555,6 +559,7 @@ static void dispatch_Fork(int, int, const char*, value_t*, int);
 static void dispatch_Philosopher(int, int, const char*, value_t*, int);
 static void dispatch_Dispatcher(int, int, const char*, value_t*, int);
 static void dispatch_Worker(int, int, const char*, value_t*, int);
+static void dispatch_Collector(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -572,6 +577,12 @@ static int g_p5 = -1;
 #define LB_N_WORKERS 4
 static int g_loadbal_disp = -1;
 static int g_loadbal_w[LB_N_WORKERS] = { -1, -1, -1, -1 };
+
+/* Garbage-collector actor globals.  g_gc_actor is the Collector obj_id;
+ * the heartbeat thread sends "tick" to it every GC_HEARTBEAT_MS as long
+ * as the actor's F_GC_enabled field is non-zero. */
+static int g_gc_actor = -1;
+#define GC_HEARTBEAT_MS 1000   /* heartbeat poll granularity (ms) */
 
 enum { F_Fork_holder, F_Fork__N };
 
@@ -1407,6 +1418,214 @@ int abcl_loadbal_stats(char *buf, int cap) {
   return blen;
 }
 
+/* ============================================================
+ * Collector — periodic actor garbage-collector, implemented as
+ * an AIPL actor (not a kernel thread).  It owns a mailbox; an
+ * external heartbeat thread (abcl_gc_heartbeat) sends it "tick"
+ * messages at GC_HEARTBEAT_MS granularity, and tick handler
+ * decides whether `period_ms` has elapsed since the last sweep.
+ * When it does, it calls the existing abcl_gc_sweep() (which
+ * was already used by the manual /gc HTTP route).
+ *
+ * Configuration: tweak via Dispatcher-style messages —
+ *   configure(period_ms, threshold_ms)
+ *   enable(on)
+ *   sweep_now
+ * Reachable from Mac via /api/gc-actor/* HTTP routes.
+ *
+ * Critical actors (WebReceiver, Dispatcher, Workers, Collector)
+ * are explicitly protected_from_gc=1 right after creation so a
+ * mis-configured threshold can't reap the runtime itself.
+ * ============================================================ */
+
+enum { F_GC_period_ms, F_GC_threshold_ms, F_GC_enabled,
+       F_GC_last_sweep_ticks, F_GC_sweep_count, F_GC_swept_total,
+       F_GC_last_swept_n, F_GC_last_scanned_n,
+       F_GC__N };
+
+static void init_fields_Collector(int self_id) {
+  int i;
+  for (i = 0; i < F_GC__N; i++)
+    objects[self_id].fields[i] = mk_int(0L);
+  /* Reasonable defaults — Mac can override via /api/gc-actor/configure. */
+  objects[self_id].fields[F_GC_period_ms]    = mk_int(5000L);   /* 5 s */
+  objects[self_id].fields[F_GC_threshold_ms] = mk_int(30000L);  /* 30 s idle */
+  objects[self_id].fields[F_GC_enabled]      = mk_int(1L);
+}
+
+static void Collector_do_sweep(int self_id) {
+  long threshold = objects[self_id].fields[F_GC_threshold_ms].i;
+  if (threshold < 1000L) threshold = 1000L;     /* sanity floor */
+  int scanned = 0;
+  int killed  = abcl_gc_sweep(threshold, 0, &scanned);
+  objects[self_id].fields[F_GC_last_sweep_ticks] = mk_int((long)clkticks);
+  objects[self_id].fields[F_GC_sweep_count] =
+    mk_int(objects[self_id].fields[F_GC_sweep_count].i + 1);
+  objects[self_id].fields[F_GC_last_swept_n]  = mk_int((long)killed);
+  objects[self_id].fields[F_GC_last_scanned_n] = mk_int((long)scanned);
+  objects[self_id].fields[F_GC_swept_total] =
+    mk_int(objects[self_id].fields[F_GC_swept_total].i + killed);
+  wait(print_mu);
+  kprintf("[gc-actor] sweep killed=%d/%d threshold=%ldms (sweeps=%ld, total_killed=%ld)\r\n",
+          killed, scanned, threshold,
+          objects[self_id].fields[F_GC_sweep_count].i,
+          objects[self_id].fields[F_GC_swept_total].i);
+  signal(print_mu);
+}
+
+static void Collector_tick(int self_id, int sender_id,
+                           value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  if (!objects[self_id].fields[F_GC_enabled].i) return;
+  long now_ticks = (long)clkticks;
+  long last      = objects[self_id].fields[F_GC_last_sweep_ticks].i;
+  long period_ticks = objects[self_id].fields[F_GC_period_ms].i / 10;
+  if (period_ticks <= 0) period_ticks = 500;     /* 5 s floor */
+  if (now_ticks - last < period_ticks) return;   /* not yet */
+  Collector_do_sweep(self_id);
+}
+
+static void Collector_configure(int self_id, int sender_id,
+                                value_t* args, int n_args) {
+  (void)sender_id;
+  if (n_args >= 1 && args[0].i > 0)
+    objects[self_id].fields[F_GC_period_ms] = mk_int(args[0].i);
+  if (n_args >= 2 && args[1].i > 0)
+    objects[self_id].fields[F_GC_threshold_ms] = mk_int(args[1].i);
+  wait(print_mu);
+  kprintf("[gc-actor] configured period=%ldms threshold=%ldms\r\n",
+          objects[self_id].fields[F_GC_period_ms].i,
+          objects[self_id].fields[F_GC_threshold_ms].i);
+  signal(print_mu);
+}
+
+static void Collector_enable(int self_id, int sender_id,
+                             value_t* args, int n_args) {
+  (void)sender_id;
+  if (n_args < 1) return;
+  objects[self_id].fields[F_GC_enabled] = mk_int(args[0].i ? 1L : 0L);
+  wait(print_mu);
+  kprintf("[gc-actor] %s\r\n", args[0].i ? "ENABLED" : "PAUSED");
+  signal(print_mu);
+}
+
+static void Collector_sweep_now(int self_id, int sender_id,
+                                value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  Collector_do_sweep(self_id);
+}
+
+static void dispatch_Collector(int self_id, int sender_id, const char* method,
+                               value_t* args, int n_args) {
+  if (strcmp(method, "tick") == 0)
+  { Collector_tick(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "configure") == 0)
+  { Collector_configure(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "enable") == 0)
+  { Collector_enable(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "sweep_now") == 0)
+  { Collector_sweep_now(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "init") == 0) return;
+}
+
+/* GC heartbeat thread — sends "tick" to the Collector at
+ * GC_HEARTBEAT_MS intervals.  The actor itself decides whether
+ * to actually sweep, based on F_GC_period_ms vs time since last
+ * sweep.  Splitting heartbeat-frequency from sweep-frequency
+ * means re-configure() takes effect at the next heartbeat
+ * (no thread restart needed). */
+thread abcl_gc_heartbeat(void) {
+  while (!global_shutdown) {
+    sleep(GC_HEARTBEAT_MS);
+    if (g_gc_actor < 0) continue;
+    abcl_enqueue(-1, g_gc_actor, "tick", 0, NULL);
+  }
+  return OK;
+}
+
+/* === accessors for /api/gc-actor/* HTTP routes ========================= */
+int abcl_gc_actor_id(void) { return g_gc_actor; }
+
+void abcl_gc_actor_configure(int period_ms, int threshold_ms) {
+  if (g_gc_actor < 0) return;
+  abcl_enqueue(-1, g_gc_actor, "configure", 2,
+               (value_t[]){ mk_int((long)period_ms),
+                            mk_int((long)threshold_ms) });
+}
+
+void abcl_gc_actor_enable(int on) {
+  if (g_gc_actor < 0) return;
+  abcl_enqueue(-1, g_gc_actor, "enable", 1,
+               (value_t[]){ mk_int((long)on) });
+}
+
+void abcl_gc_actor_sweep_now(void) {
+  if (g_gc_actor < 0) return;
+  abcl_enqueue(-1, g_gc_actor, "sweep_now", 0, NULL);
+}
+
+int abcl_gc_actor_stats(char *buf, int cap) {
+  if (cap < 300) return 0;
+  if (g_gc_actor < 0) return sprintf(buf, "gc-actor not initialized\n");
+  int g = g_gc_actor;
+  long now_ms  = (long)(clkticks * 10);
+  long last_ms = objects[g].fields[F_GC_last_sweep_ticks].i * 10;
+  long since   = last_ms > 0 ? now_ms - last_ms : -1L;
+  return sprintf(buf,
+    "gc-actor obj=%d enabled=%ld\n"
+    "period_ms=%ld threshold_ms=%ld\n"
+    "sweep_count=%ld swept_total=%ld\n"
+    "last_swept=%ld last_scanned=%ld\n"
+    "now_ms=%ld last_sweep_ms=%ld since_last_ms=%ld\n",
+    g,
+    objects[g].fields[F_GC_enabled].i,
+    objects[g].fields[F_GC_period_ms].i,
+    objects[g].fields[F_GC_threshold_ms].i,
+    objects[g].fields[F_GC_sweep_count].i,
+    objects[g].fields[F_GC_swept_total].i,
+    objects[g].fields[F_GC_last_swept_n].i,
+    objects[g].fields[F_GC_last_scanned_n].i,
+    now_ms, last_ms, since);
+}
+
+/* Bootstrap.  Called from webactor_autostart alongside abcl_loadbal_init.
+ * Creates the Collector actor, protects all critical actors from being
+ * reaped, and spawns the heartbeat thread. */
+static int g_gc_inited = 0;
+void abcl_gc_actor_init(void) {
+  if (g_gc_inited) return;
+  g_gc_actor = alloc_obj(CLASS_Collector, 0, NULL);
+  spawn_actor(g_gc_actor);
+  /* Protect every infrastructure actor so a mis-set threshold cannot
+   * sweep the runtime itself.  We protect the Collector too — recursive
+   * suicide would be funny but unhelpful. */
+  abcl_object_protect(g_gc_actor, 1);
+  {
+    int i;
+    extern int abcl_loadbal_dispatcher_id(void);
+    extern int abcl_loadbal_worker_id(int);
+    int d = abcl_loadbal_dispatcher_id();
+    if (d >= 0) abcl_object_protect(d, 1);
+    for (i = 0; i < LB_N_WORKERS; i++) {
+      int w = abcl_loadbal_worker_id(i);
+      if (w >= 0) abcl_object_protect(w, 1);
+    }
+    /* WebReceiver is allocated by abcl_web_init in webactor.  It's
+     * always object 0 in the boot path so a hardcoded protect is fine. */
+    if (n_objects > 0 && objects[0].class_id == CLASS_WebReceiver)
+      abcl_object_protect(0, 1);
+  }
+  /* Spawn the heartbeat thread */
+  tid_typ htid = create((void*)abcl_gc_heartbeat, 4096, INITPRIO,
+                        "aipl-gc-hb", 0);
+  if (htid != SYSERR) ready(htid, RESCHED_NO);
+  g_gc_inited = 1;
+  wait(print_mu);
+  kprintf("[gc-actor] init done: obj=%d heartbeat tid=%d period=5000ms threshold=30000ms\r\n",
+          g_gc_actor, (int)htid);
+  signal(print_mu);
+}
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
@@ -1414,6 +1633,7 @@ static void dispatch(int self_id, int sender_id, const char* method, value_t* ar
   case CLASS_WebReceiver: dispatch_WebReceiver(self_id, sender_id, method, args, n_args); break;
   case CLASS_Dispatcher: dispatch_Dispatcher(self_id, sender_id, method, args, n_args); break;
   case CLASS_Worker:     dispatch_Worker(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Collector:  dispatch_Collector(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -1425,6 +1645,7 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_WebReceiver: break;   /* no fields */
   case CLASS_Dispatcher: init_fields_Dispatcher(self_id); break;
   case CLASS_Worker:     init_fields_Worker(self_id);     break;
+  case CLASS_Collector:  init_fields_Collector(self_id);  break;
   default: break;
   }
 }
