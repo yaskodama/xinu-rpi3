@@ -7,16 +7,197 @@
 実機 **Raspberry Pi 3 B+ (BCM2837)** 上で 32-bit Embedded Xinu が完全動作:
 
 - ✅ 起動 + `xsh$` 対話シェル (シリアル UART0 / HDMI 両方)
-- ✅ HDMI フレームバッファ + 窓システム (Pi5 から移植) + USB キーボード/マウス + `win` コマンド
-- ✅ **USB ethernet (LAN78xx = LAN7515 オンボード NIC) 完全動作**:
-  link / RX / TX / ARP / ICMP / **ping が正常レイテンシ (Mac→Pi ~10ms / 0% loss)**
+- ✅ HDMI フレームバッファ + 窓システム (Pi5 から移植) + USB キーボード/マウス
+- ✅ **USB ethernet (LAN78xx)** — ping ~3ms, TCP 双方向動作
+- ✅ **AIPL ランタイム** (philosopher/web/dispatcher/worker 等 6 actor 並列)
+- ✅ **HTTP server (port 8080)** — 16+ ルートで introspection + 操作
+- ✅ **AIPL-RPC server (port 5555)** — Mac から SPAWN/COMPILE 等
+- ✅ **C JIT (cc_mvp Stage 5)** — Turing-complete に近い structured C を ARM32 機械語に変換+実行
+- ✅ **負荷分散アクター** — Dispatcher + 4 Workers, sleep & JIT 両モード
+- ✅ **MMU enable** — identity-map, RAM/MMIO 領域属性分離
+- ✅ **Network kernel update** — `/upload` + `/kexec` で SD swap 不要のカーネル入れ替え
+- ✅ TCP upload ~26 KB/s (IBLEN bump 後)
 
-**この回 (2026-05-27) で ethernet の ping を一から動かしきった。** 下記「今回の修正連鎖」参照。
+**2026-05-27**: ethernet ping 完全動作 (LAN78xx ドライバ + DWC NAK 修正)
+**2026-06-01**: 上記の AIPL/JIT/loadbal/MMU/kexec/TCP 高速化を一気に積み上げ
 
-## コミット (PR #1 / `arm-rpi3-port`)
+## 2026-06-01 セッション概要 (24 commits)
 
 ```
-a49ed86  arm-rpi3: fix ~10s ping RTT — bulk endpoints must defer fast on NAK  ← 最新
+3f9fb9e  cc_mvp MVP — int main() { return CONST; }
+4a5d67a  + binop (+ -)
+f9384f8  + function call + builtin syms
+(introspection routes, /upload, /gc, /mmio-read, age tracking 等)
+bf7575e  load-balancer actors (Dispatcher + 4 Workers, least-loaded routing)
+d8d3c2c  + JIT × loadbal 統合 (compute_jit, round-robin, memfree leak fix)
+19c5050  cc_mvp Stage 4 — locals + multi-stmt + if/else
+e0cfc09  cc_mvp Stage 5 — comparison operators + while loops
+4d98e95  NEXT_SESSION URL update (GitHub repo rename)
+4979d0a  MMU enable — identity-map + region attributes (RAM vs MMIO)
+93f3f95  dnsmasq path + version.h refresh
+84f47c0  /kexec — network kernel update via HTTP, no SD swap
+72495d5  /upload chunked body reader + TCP_GRACIOUSACK (1.37×)
+451fd15  TCP_IBLEN 16 KB → 65528 (5.4× upload speedup, fix ushort wrap)  ← 最新
+```
+
+## 重要な追加機能 (このセッション)
+
+### C JIT (`apps/cc_mvp.c`) — Stage 5
+```c
+// 動作する例 — Turing-complete C subset:
+int main() {
+  int s = 0; int i = 1;
+  while (i <= 10) { s = s + i; i = i + 1; }
+  return s;          // -> 55 (140 B of ARM32 code)
+}
+```
+
+サポート: `int main()` + locals + `+ - == != < > <= >= = if/else while return` + builtin call。
+
+Builtin symbol 表 (`cc_syms[]`): `print_int`, `actor_count`, `actor_age(id)`, `now_ms`。
+新規 builtin 追加 = テーブルに 1 行追加するだけ。
+
+ARM32 codegen: identity-mapped RAM 上に `memget(4096)` → ARM32 命令を直接書き込み → 関数ポインタ
+キャストして即実行 → `memfree(4096)` (leak fix 済)。
+
+エントリ: `int cc_mvp_compile_and_run(const char *src, long *retval, int *codesize)`
+HTTP: `POST /compile` with C source as body。
+
+### 負荷分散アクター (`apps/abcl_program.c`)
+- `CLASS_Dispatcher` (3) — 最少負荷 worker に `compute` 転送 (sleep mode)、round-robin で
+  `compute_jit` 転送 (JIT mode)
+- `CLASS_Worker` (4) × 4 — sleep または JIT で並列処理、結果を `done` で dispatcher に返却
+- `LB_N_WORKERS = 4` (MAX_OBJECTS=16 のうち bootstrap 6 + 余裕10)
+- HTTP: `/api/loadbal/submit?n=K&ms=M`, `/api/loadbal/jit?n=K&prog=P`, `/api/loadbal/stats`
+- stress test 実績: 256 sleep tasks (4 burst) + 64 JIT tasks、drops=0、各 worker 完全均等分散
+
+### MMU (`system/platforms/arm-rpi3/mmu.c`) ★慎重要
+- ARMv7-A short-descriptor、16KB-aligned L1 page table (4096 sections × 1MB)
+- Identity map (VA==PA):
+  - 0x00000000 .. 0x3EFFFFFF: RAM Normal cacheable RWX (TEX=001 C=1 B=1)
+  - 0x3F000000 .. 0x3FFFFFFF: MMIO Device strongly-ordered RW-NX
+  - 0x40000000 .. 0x40FFFFFF: ARM local regs Device RW-NX
+- **SCTLR.M=1 のみ (C/I/Z は触らない)** — M+C+I+Z 同時 enable は Cortex-A53 で brick 実績あり
+  ([Pi 3 MMU enable hazard](../../.claude/projects/-Users-kodamay/memory/feedback-xinu-rpi3-mmu-enable-hazard.md) に記録)
+- `mmu_disable()` を kexec 前に呼ぶ必要あり (新 kernel start.S は MMU off 前提)
+- HTTP: `/api/mmu` で SCTLR/TTBR0/有効状態を確認
+
+### Network kernel update (`/kexec`)
+Mac → Pi 3 物理操作なしの kernel 更新ループ:
+```bash
+curl --data-binary @xinu.boot \
+     "http://192.168.3.50:8080/upload?dst=xinu.boot"   # ~11s for 305 KB
+curl -X POST http://192.168.3.50:8080/kexec            # jump
+# ~20s wait
+curl http://192.168.3.50:8080/api/mmu                  # 新 kernel 稼働確認
+```
+
+Pi 3 内部: `mmu_disable()` → `kexec()` stub at 0x7FE8 → upload を 0x8000+ にコピー → `mov pc, #0x8000`
+→ 新 kernel start.S → `platforminit` → `mmu_init` (MMU 再 enable) → `webactor_autostart`
+
+**Volatile**: 電源 OFF で SD 再 load に戻る (永続化は要 SDHOST driver port)。
+
+### TCP 高速化 (`include/tcp.h`)
+- `TCP_IBLEN`: 16384 → **65528** (65535 ushort cap 直下、8の倍数)
+  - **65536 は brick** (`tcpSendWindow.c:24` の `ushort window = TCP_IBLEN - icount` で wrap → window=0
+    advertise → 全 TCP 死亡)
+- `TCP_GRACIOUSACK`: define (drain 時の window update ack を送って sender 停止を解除)
+- Upload `305 KB`: 91s → **11.5s** (~8× 累計、26 KB/s)
+
+## 主要 HTTP routes (port 8080)
+
+```
+GET  /                                 — bare-/ delivers to AIPL web_receiver
+POST /upload?dst=NAME                  — store request body in upload slot (512 KB max)
+GET  /api/upload-info                  — last upload metadata + first 32 B hex
+POST /kexec                            — jump to last /upload (network kernel update)
+GET  /api/mmu                          — MMU SCTLR/TTBR0 dump
+GET  /api/actors                       — AIPL actor inventory (id class tid started dead enq deq drops)
+GET  /api/actor-age?id=N               — ms since last mailbox activity
+POST /api/actor-kill?id=N              — kill an actor
+POST /gc?threshold_ms=N[&dry=0|1]      — sweep actors idle > threshold
+POST /api/actor-send?to=N&m=METHOD&v=  — inject message into any actor's mailbox
+GET  /api/object-field?id=N&field=K    — peek actor field
+GET  /api/threads                      — thrtab dump
+GET  /api/memstat                      — free bytes
+GET  /api/loadbal/stats                — dispatcher + worker counters
+POST /api/loadbal/submit?n=K&ms=M      — submit K sleep tasks of M ms
+POST /api/loadbal/jit?n=K&prog=P       — submit K JIT tasks (prog = static C source index)
+POST /compile                          — compile + run C source (body = source)
+GET  /mmio-read?addr=0xN               — peek 32-bit register
+POST /reboot                           — watchdog reset (re-load from SD)
+GET  /sd-test                          — read LBA 0 (sanity, doesn't currently work — controller mismatch)
+```
+
+## カーネル更新フロー — 2 通り
+
+### A) Network update (推奨、~11s + ~20s = 30s 程度)
+```bash
+make PLATFORM=arm-rpi3   # in compile/
+curl --data-binary @xinu.boot "http://192.168.3.50:8080/upload?dst=xinu.boot"
+curl -X POST http://192.168.3.50:8080/kexec
+sleep 25
+curl http://192.168.3.50:8080/api/mmu   # 動作確認
+```
+
+### B) SD swap (brick 復旧 + 永続化)
+```bash
+# Pi 3 から SD 取り出し → Mac に挿入 → /Volumes/XINU mount
+cp xinu.boot /Volumes/XINU/kernel.img
+cp xinu.boot /Users/kodamay/tftpboot/kernel.img    # tftp も同期しておく
+sync && diskutil eject /Volumes/XINU
+# SD を Pi 3 に戻して電源 ON
+```
+
+backup kernel:
+- `/Users/kodamay/tftpboot/kernel.img.pre-mmu-bak` (304648 B、MMU 無し、究極の fallback)
+- `/Users/kodamay/tftpboot/kernel.img.pre-kexec-bak` (305224 B、MMU only、kexec 無し)
+- `/Users/kodamay/tftpboot/kernel.img` (現行 build)
+
+## 既知の制約 / 次の候補作業
+
+### 高優先
+- **D-cache 有効化** — 現状 `SCTLR.C=0`、cacheable RAM 属性は inert。Cortex-A53 D-cache set/way
+  invalidate loop (4-way × 128 set × 64 B 一括 DCISW) を mmu.c に追加 → `SCTLR.C=1` で性能向上
+- **I-cache 有効化** — 同様に ICIALLU 後 `SCTLR.I=1`。これも性能寄与大
+
+### 中優先
+- **SDHOST driver port** — BCM2837 のデフォルト SD コントローラ (EMMC でなく SDHOST @ 0x3F202000)
+  → 現 `apps/sd_block.c` は EMMC 前提で動かない。永続的な network kernel write には必須
+- **JIT 拡張** — 比較 + 論理 (`&&`/`||`), unary, ポインタ/配列、関数定義 (1関数→複数関数)、
+  value_t builtin (v_int_of, v_add, v_eq 等) → aipl2c 出力を JIT で実行できる
+
+### 低優先 / 未着手
+- per-process VAS + TTBR0 swap (要 mmu_disable + context save 拡張)
+- demand paging (要 SD block I/O + fault handler)
+- USB エンドポイントを増やす (`MAX_RX_REQUESTS=1` のまま)、高スループット時の挙動評価
+- ICMP echo 応答は `icmpDaemon` (prio 30) 経由非同期、負荷時挙動未評価
+- telnet pseudo device の子スレッド printf 欠落問題は前回未解決 (このセッションでは未着手)
+
+### 永続性の注釈
+- `/kexec` は volatile — 電源 OFF で SD reload に戻る
+- SD への書き込みは SDHOST driver 完成までは物理 swap 必須
+
+## 重要なファイル (このセッションで追加/変更)
+
+```
+apps/cc_mvp.c                            — C JIT (Stage 5)
+apps/abcl_program.c                      — + Dispatcher / Worker / loadbal helpers
+apps/webactor.c                          — + 多数の /api routes, /kexec, chunked reader
+apps/sd_block.c                          — SD driver (動かない、SDHOST が必要)
+system/platforms/arm-rpi3/mmu.c          — MMU enable/disable
+system/platforms/arm-rpi3/Makerules      — + mmu.c
+system/platforms/arm-rpi3/platforminit.c — + mmu_init() 呼び出し
+include/tcp.h                            — TCP_IBLEN=65528 + TCP_GRACIOUSACK
+```
+
+## 過去セッションの記録 (2026-05-27、ethernet + telnet)
+
+下記は前回セッションの作業ログ。**全て解決済 or 別 issue** として残置。
+
+### コミット (PR #1 / `arm-rpi3-port` の ethernet 系)
+```
+a49ed86  arm-rpi3: fix ~10s ping RTT — bulk endpoints must defer fast on NAK
 a020953  arm-rpi3: fix LAN78xx ping — MAF offset, burst cap, fixed MAC, async open
 9d13796  arm-rpi3: re-enable ETH0 open at boot
 7aeec1e  arm-rpi3: LAN78xx (LAN7515) USB ethernet driver
@@ -25,140 +206,69 @@ c6ecdc1  arm-rpi3: window system (ported from Pi5) + USB mouse + `win`
 1837e74  arm-rpi3: enable HDMI framebuffer output
 ```
 
-push 済み。診断用 kprintf は全て除去済み。
+### ethernet が動かなかった 3 つの真因 (動作する設定)
 
-### 未コミットで温存しているもの (この作業と無関係)
-- `apps/abcl_program.c` — AIPL の lock-free MPSC リングバッファ作業 (344+/305-)。**触らない**。
-- `include/version.h` — ビルド自動生成 (毎ビルド変わる)。コミット不要。
+1. **`BURST_CAP=0` で CPU 飢餓** — `HW_CFG_MEF` + `USB_CFG_BIR` + `BURST_CAP=0x25` 必須
+2. **MAF レジスタオフセット誤り** — `MAF_HI_0/LO_0` は `0x400/0x404` (not 0x150/0x154)
+3. **bulk NAK defer の UB** — `(1 << (bInterval-1))` で bInterval=0 だと UB → 巨大 defer。
+   bulk/control は defer=1ms 固定
 
-## 今回の修正連鎖 (ethernet が動かなかった 3 つの真因) ★最重要
-
-`davidxyz/xinuPi` (Pi1/Pi3 smsc9512, 動作実績) と比較 → **dwc は完全同一**、差は ethernet 設定。
-動く smsc9512 は `HW_CFG_MEF|HW_CFG_BIR|HW_CFG_BCE` + 非ゼロ `BURST_CAP` を設定していた。
-
-1. **`BURST_CAP=0` (飢餓の真因)** — `lan78xx.c`。MEF 有効 + BURST_CAP=0 だとデバイスが
-   空 bulk-IN を連発 → RX 完了コールバックが無条件即再投入 → タイトループで CPU 飢餓
-   → **ETH0 を開いた瞬間シェルが死ぬ**。
-   修正: `HW_CFG_MEF` + `USB_CFG_BIR` + `BURST_CAP = DEFAULT_HS_BURST_CAP_SIZE/HS_PKT_SIZE (0x25)`。
-
-2. **MAF レジスタオフセット誤り (ping の真因)** — `lan78xx.h`。`MAF_HI_0/LO_0` を
-   `0x150/0x154` と書いていたが正しくは **`0x400/0x404`** (MAF_BASE=0x400)。MAF[0]=自分の MAC
-   が一度も設定されず、RFE DA_PERFECT が自分宛 unicast に一切マッチせず **全 unicast ドロップ**
-   (broadcast だけ通る)。→ ARP 応答/ICMP echo を受信できず ping 不成立。
-   修正: `MAF_HI_0=0x400 / MAF_LO_0=0x404`。
-
-3. **bulk defer 間隔の未定義動作 (RTT ~10s の真因)** — `usb_dwc_hcd.c` の `defer_xfer_thread`。
-   NAK 再試行間隔を interrupt 用の周期公式 `(1 << (bInterval-1))/USB_UFRAMES_PER_MS` で計算。
-   bulk は bInterval=0 → **`1 << -1` (UB)** → 巨大な defer → bulk-IN が数秒滞留 → RTT ~10-16s。
-   修正: **`!usb_is_interrupt_request(req)` (bulk/control) は defer=1ms 固定**。interrupt は従来通り。
-
-### その他の修正 (commit a020953)
-- **固定 MAC `b8:27:eb:c0:ff:ee`** (`etherInit.c`) — `platform.serial_*`=0 だと `randomEthAddr`
-  が `srand(clkcount())` で毎起動ランダム → peer の ARP キャッシュが無効化。rpi3 は固定値に。
-- **ETH0 open を別スレッド化** (`main.c` `eth_open_all`, 64KB スタック) — `etherOpen` →
-  `smsc9512_wait_device_attached` は timeout 無し wait なので、inline だと USB 列挙待ちで
-  main (=シェル起動) がブロックする。8KB スタックだと lan78xx_open の深い chain で overflow。
-- **no-promisc** — `RFE_CTL = BCAST_EN | DA_PERFECT` (UCAST_EN は外す)。UCAST_EN は全 unicast
-  受信でコンソールを劣化させ、ping も直さない (問題は filter でなく MAF オフセットだった)。
-
-## LAN78xx 確定構成 (動作する設定値)
+### LAN78xx 確定構成
 - `RFE_CTL = BCAST_EN(0x400) | DA_PERFECT(0x2)` (no UCAST_EN)
 - `HW_CFG |= MEF(0x10)`、`USB_CFG0 |= BIR(0x40)`
-- `BURST_CAP = 0x25` (= 18944/512)、`BULK_IN_DLY = 0x800`
+- `BURST_CAP = 0x25`、`BULK_IN_DLY = 0x800`
 - `FCT_RX_FIFO_END=0x27, FCT_TX_FIFO_END=0x11`
-- MAF[0] = 自分の MAC @ **0x400/0x404** + `MAF_HI_AF_EN=0x80000000`
-- RX_ADDRL/H = 0x11C/0x118 (これは元から正しい)
-- VID 0x0424 / PID 0x7800、bRequest 0xA0(write)/0xA1(read)、ID_REV=0x78000002
-- RX header 10 byte (RX_CMD_A/B/C, len=RX_CMD_A&0x3FFF, FCS は MAC_RX FCS_STRIP で除去済)
-- TX header: TX_CMD_A(len|FCS bit22) + TX_CMD_B、8 byte
+- MAF[0] = 自分の MAC @ 0x400/0x404 + `MAF_HI_AF_EN=0x80000000`
+- VID 0x0424 / PID 0x7800、bRequest 0xA0(write)/0xA1(read)
+- 固定 MAC `b8:27:eb:c0:ff:ee`
 
-## 実機テスト手順 & 落とし穴 ★
+### telnet pseudo device の未解決問題
+子スレッド (xsh_help 等) の printf 出力がクライアントに届くのが間欠的。
+シェルスレッド出力は届く。`fdesc[1]=26=telnetdev` 設定は正しいのに `telnetWrite` に到達しない。
+- 関連: `telnet.h`, `device/telnet/telnetWrite.c`, `telnetRead.c`, `telnetServer.c`
+- `TELNET_TRACE` で `telnet.h` の `//#define TRACE_TELNET 1` 有効化可能
+- 次の手: `xsh_help` に「コマンド一覧 printf 到達 + その時の gettid()/stdout」トレース、
+  `fputc/putc` (lib/libxc) に子スレッド書き込みトレース
 
-ビルド: `cd compile && make PLATFORM=arm-rpi3` → `xinu.boot` 生成。
-焼く: USB/SD を Mac に挿す → `cp xinu.boot /Volumes/XINU/kernel.img && sync && diskutil eject`
-→ Pi に戻して電源再投入 (ユーザに依頼)。
+## 実機テスト手順 + 落とし穴
 
-★**シリアル読み取り** (Python termios, B115200):
-- macOS の USB-TTL は再接続で**デバイス名が変わる** (`-120`↔`-1120`)。
-  **毎回 `ls /dev/cu.usbserial-*` で確認**。盲目デバッグで長時間ハマった主因。
-- 送信は遅く char-by-char (~25-30ms/char) で送る (Pi UART RX ドロップ回避)。
-- ★**`rxf#` 等の ISR からの出力が出ても「シェルが応答する」とは限らない**
-  (ISR 出力はスレッド飢餓中でも出る)。応答確認は必ず `help` 等を送ってエコーを見る。
-- インライン Python が前回分シリアルポートを掴むことがある → `pkill -f usbserial` で kill。
+### Build + Flash
+```bash
+cd compile && make PLATFORM=arm-rpi3   # → xinu.boot (~305 KB)
+# Network update なら /upload + /kexec (上記 A)
+# Physical なら SD swap (上記 B)
+```
 
-★**Mac↔Pi ネットワーク**: Pi はルータの LAN ポート、Mac は同ルータの WiFi (192.168.3.202)。
-同一 /24。Pi に静的 IP: `netup ETH0 192.168.3.50 255.255.255.0 192.168.3.1`。
-Mac から `ping 192.168.3.50`。Mac ファイアウォールは無効 (確認済)。
-パケットレベル確認は Mac で `sudo tcpdump -ni en0 host 192.168.3.50` (要 sudo, `!` 前置で実行)。
+### シリアル読み取り (Python termios, B115200)
+- macOS USB-TTL は再接続で**デバイス名が変わる** (`-120`↔`-1120`)。
+  毎回 `ls /dev/cu.usbserial-*` 確認
+- 送信は char-by-char (~25-30ms/char) で送る (Pi UART RX ドロップ回避)
+- `rxf#` 等 ISR からの出力が出ても**シェル応答とは限らない**。応答確認は `help` 等でエコー確認
+- 前回分が掴んでいたら `pkill -f usbserial`
 
-## 既知の制約 / 次の候補作業
+### ネットワーク
+- Pi はルータ LAN、Mac は同ルータ WiFi (192.168.3.202)、同一 /24
+- Pi 静的 IP: `192.168.3.50` (`netup` は自動)
+- Mac から ping `192.168.3.50`
+- パケット観察: `sudo tcpdump -ni en0 host 192.168.3.50`
 
-- `ps` / `help` コマンドはシリアルに出力が出ない (ping/netup は出る)。未調査の脇issue。
-- `MAX_RX_REQUESTS=1` のまま (smsc9512 流用)。高スループット時は増やす余地あり。
-- ICMP echo 応答は icmpDaemon (prio 30) 経由の非同期パス。負荷時の挙動は未評価。
-- **TCP 実機疎通テスト済 (2026-05-27)**: ✅ **TCP 双方向データ転送は完全動作**。
-  - Pi `nc -l 192.168.3.50 9999` リッスン → Mac `echo ... | nc 192.168.3.50 9999` → 文字列が
-    Pi シリアルに着信 (Mac→Pi 生 TCP データ OK)。
-  - `telnetserver` 起動 → Mac `nc 192.168.3.50 23`: **接続成立 (port 23) + telnet ネゴ +
-    プロンプト `xsh$` 受信 + 入力エコー** が TCP 上で動作 (Pi→Mac データ OK)。
-  - ⚠️ **残課題 = telnet リモートシェルが完全には使えない** (中核の TCP/TX/RX は正常):
-    ★まず **TX-wedge 説は誤りと判明** — `smsc9512_tx_complete` に診断を入れて計測したところ
-    **TX は GET→HAVE→DONE(st=0) で全て完了**(telnet コマンド中も #111-120 が揃う)、ping も
-    2/2 0%loss ~10ms で安定。**TX/RX/生TCP は完全動作**。
-    ★telnet シェル側の症状: ❶ コマンド**出力**(例 `help` の一覧)がクライアントにもシリアルにも
-    出ない(プロンプト/入力エコーは届く) ❷ 接続が 1〜2 回でタイムアウトしだす(telnetServer の
-    accept スレッド枯渇)。`telnetWrite/Flush/Server`・shell の fd 引継ぎ(`thrtab[child].fdesc[1]
-    =stdout=telnetdev`, ready 前に設定)・`telnetRead` の EOF 伝播 — **コード検査では全て正しい**
-    のに実機で出力が消える。盲目シリアル + 再起動ループ + サーバ枯渇で原因特定に至らず。
-  - ★★**tcpdump で真因特定 (2026-05-27)**: 問題は telnet シェルでなく **TCP スタックの接続管理**。
-    `sudo tcpdump -ni en0 -X 'tcp port 23 and host 192.168.3.50'` で観測:
-    Pi(.50:23)→Mac の **SYN-ACK の seq が 2820 と極小・接続ごとに増加** → Mac が **RST** 連発、
-    Pi は死んだ接続に SYN-ACK を出し続け **telnetServer がスピン** → 新規接続(別 port)の SYN に
-    **一切 SYN-ACK を返さない**(=accept されず connect timeout)。
-  - ★関係する定数 (`include/tcp.h`): **`TCP_SEQINCR=904`** (ISS を接続毎に +904 だけ増やす=小さく
-    予測可能。`tcpSetup.c` の `tcpIss()` は `clktime`(秒) 起点 + 904)、**`TCP_TWOMSL=5000`** (TIME_WAIT
-    わずか 5 秒)。**小さい ISS + 短い TIME_WAIT + 高速再接続** → seq/TIME_WAIT 衝突 → RST。
-  - ★★**適用済み修正 (commit `3f5b6de`)**: ① `tcpSetup.c tcpIss()` を `clkticks<<10`+乱数base+
-    接続毎bump で ISS を広く分散 (接続が安定・再接続枯渇が改善) ② `telnetWrite.c` の **osem リーク**
-    (flush 失敗時 signal せず return → 以降全出力ブロック) を修正 ③ `telnetFlush.c` の早期 return が
-    **restore(im) 漏れ** (割り込み無効のまま=フリーズ要因) を修正 ④ `telnetControl.c` FLUSH に osem
-    排他追加。→ **シェルスレッドの出力 (起動バナー等) はクライアントに届くようになった**。
-  - ⚠️ **未解決の残課題**: telnet で**子コマンドスレッドの出力** (`help` の一覧等) がクライアントに
-    届くのが**間欠的** (実行ごとに変動: あるときバナーまで届き、あるときプロンプトのみ)。
-    子スレッド fd は正しく telnetdev (=26、`[xsh_help: stdout=26]` で確認)。シェルスレッド出力は
-    届くが子スレッド出力は届きにくい = **telnet デバイスと子スレッド実行のタイミング依存の並行性
-    問題**。osem/flush/restore を直しても完全には解消せず。盲目シリアル+再起動ループでは収束せず。
-  - ★★**TELNET_TRACE で判明 (2026-05-27)**: `telnet.h` の `TRACE_TELNET` を有効化 (kprintf ベースに
-    改善済み) し telnetFlush にトレースを入れて telnet help を観測:
-    - `[tn t24] flush ostart=0 state=2 phw=19` が 200ms 毎に連続 = telnetServer(tid24)の flush ループ。
-      **ostart が常に 0** = **子スレッド(help)の出力が telnetWrite に一切バッファされていない**
-      (子スレッドからの flush も皆無)。→ **子の printf が telnetWrite/device 26 に到達していない**
-      ことを確定 (子の fdesc[1]=26=telnetdev は `[xsh_help: stdout=26]` で確認済みなのに)。
-    - `[tn t30] Read error` + 以前のエコー破損 ("helpp"/"hellp") = **telnet 入力経路(telnetRead)も
-      バグ**。help が破損入力/誤 nargs で別パスに入り出力しない可能性。
-  - ★結論: telnet 疑似デバイスは**入力・出力の両経路にバグ**。断片修正でなく **telnet (telnetRead/
-    telnetWrite/telnetServer の osem/buffer 所有権 + shell の child fd/printf 経路) の包括的見直し**が要る。
-    `route/memstat/ps` のシリアル無出力は別件 (`help` はシリアルでは出力する)。
-  - ★★**telnetWrite 入口 tid トレースで確定 (2026-05-27)**: telnet help 中に telnetWrite を呼ぶのは
-    **シェルスレッド(tid32)のみ** (内容は prompt/echo の `.xhelp..help..x..x` だけ。help の
-    コマンド一覧は皆無)。**help の子スレッド(tid33+)からの telnetWrite 呼び出しは一件も無い**。
-    → **help 子スレッドの printf がそもそも telnetWrite に到達していない** (telnetWrite より上流の
-    問題)。子の fdesc[1]=26=telnetdev は確認済みなのに、シェル(32)の fputc(26) は telnetWrite に
-    届き子の fputc(26) は届かない = printf→fputc→putc→telnetPutc 経路にスレッド固有の何かがある、
-    または help 子がコマンド一覧 printf に到達していない (破損入力で別パス/早期return)。
-    (`[tn t32] Read error` も観測 — 接続クローズ由来の可能性)。
-  - ★次の手: `xsh_help` に「コマンド一覧 printf 到達 + その時の gettid()/stdout」トレースを足し
-    (a) help 子が printf を実行するか (b) fputc が dev26 へ向かうか を確定。さらに `fputc/putc`
-    (lib/libxc) で子スレッドの書き込みが telnetPutc に届くか追う。または telnet 実装の包括見直し。
-  - ★TELNET_TRACE の使い方: `include/telnet.h` の `//#define TRACE_TELNET 1` を有効化 (kprintf で
-    シリアルに `[tn tN] ...`)。
-- 関連プロジェクト: `xinu-rpi5` (Pi5 AArch64, 別repo) は窓システムの移植元。
+### HTTP 経由のデバッグ (推奨)
+シリアル不安定なので HTTP 経由が現実的:
+- `/api/actors`, `/api/threads`, `/api/memstat` で実行時状態
+- `/api/mmu` で MMU 状態
+- `/api/loadbal/stats` で負荷分散
+- `/compile` で JIT 動作確認
 
-## 主要ファイル
-- `device/smsc9512/lan78xx.c` / `lan78xx.h` — LAN78xx ドライバ本体
-- `device/smsc9512/etherInit.c / etherOpen.c / etherInterrupt.c` — chiptype で smsc9512/LAN78xx 分岐
-- `device/smsc9512/etherInterrupt.c` `smsc9512_rx_complete` / `lan78xx_rx_complete_parse` — RX
-- `system/platforms/arm-rpi3/usb_dwc_hcd.c` `defer_xfer_thread` — NAK 再試行 (RTT 修正箇所)
-- `system/main.c` `eth_open_all` + spawn — ETH0 非同期 open
-- `compile/platforms/arm-rpi3/xinu.conf` — デバイス構成
-- メモリ: `~/.claude/.../memory/project_xinu_rpi3_port.md` に全経緯
+### kexec brick 復旧
+1. Pi 3 電源 OFF (コードも数秒抜く — USB controller 放電)
+2. SD swap → backup kernel 焼く
+3. 電源 ON → 復旧確認
+
+## メモリ (~/.claude/.../memory/)
+- `project-xinu-raz-pi3-evolution.md` — このプロジェクト全体
+- `feedback-xinu-rpi3-mmu-enable-hazard.md` — MMU enable で SCTLR.M only にする理由 (brick 教訓)
+- `feedback-xinu-rpi4-flash-verify-workflow.md` — Pi 4 用だが思想は共通
+
+## 関連リポジトリ
+- `xinu-rpi5` (Pi5 AArch64、別 repo) — 窓システムの移植元
+- `xinu-rpi4` (Pi 4 AArch64、別 repo) — AIPL ランタイムの上流、機能パリティの参照先
