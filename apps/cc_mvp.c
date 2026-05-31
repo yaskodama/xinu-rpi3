@@ -5,15 +5,18 @@
  *
  * Grammar:
  *   program     = "int" "main" "(" ")" "{" stmt* "}"
- *   stmt        = decl_stmt | assign_stmt | if_stmt | return_stmt
- *               | expr_stmt | block
+ *   stmt        = decl_stmt | assign_stmt | if_stmt | while_stmt
+ *               | return_stmt | expr_stmt | block
  *   decl_stmt   = "int" NAME "=" expr ";"
  *   assign_stmt = NAME "=" expr ";"
  *   if_stmt     = "if" "(" expr ")" stmt ("else" stmt)?
+ *   while_stmt  = "while" "(" expr ")" stmt
  *   return_stmt = "return" expr ";"
  *   expr_stmt   = expr ";"
  *   block       = "{" stmt* "}"
- *   expr        = primary ( ("+" | "-") primary )*
+ *   expr        = relational ( ("==" | "!=") relational )*
+ *   relational  = additive   ( ("<=" | ">=" | "<" | ">") additive )*
+ *   additive    = primary    ( ("+" | "-") primary )*
  *   primary     = INT_LITERAL
  *               | NAME "(" args? ")"           // function call
  *               | NAME                          // local-var load
@@ -181,8 +184,23 @@ static unsigned int enc_str_r0_fp_neg(int off)
     return 0xE50B0000u | (off & 0xFFF);
 }
 static unsigned int enc_cmp_r0_imm0(void) { return 0xE3500000u; }   /* cmp r0, #0 */
+static unsigned int enc_cmp_r1_r0(void)   { return 0xE1510000u; }   /* cmp r1, r0 */
 static unsigned int enc_beq_placeholder(void) { return 0x0A000000u; } /* offset=0 */
 static unsigned int enc_b_placeholder(void)   { return 0xEA000000u; } /* offset=0 */
+
+/* MOV{cond} r0, #1 — used to materialise the boolean result of a
+ * comparison.  cond is the 4-bit ARM condition code (EQ=0, NE=1,
+ * GE=A, LT=B, GT=C, LE=D).  Pattern: (cond<<28) | 0x03A00001. */
+static unsigned int enc_mov_cond_r0_1(unsigned int cond)
+{
+    return (cond << 28) | 0x03A00001u;
+}
+#define COND_EQ 0x0u
+#define COND_NE 0x1u
+#define COND_GE 0xAu
+#define COND_LT 0xBu
+#define COND_GT 0xCu
+#define COND_LE 0xDu
 
 /* Patch a previously-emitted B/Bcc at code[br_at] so it branches to
  * code[target_at].  ARM imm24 = (target_pc - branch_pc - 8) / 4, where
@@ -365,7 +383,8 @@ static int compile_primary(unsigned int *code, int at, const char **cur)
     return emit_const(code, at, 0, n);
 }
 
-static int compile_expr(unsigned int *code, int at, const char **cur)
+/* additive = primary ( ("+" | "-") primary )* */
+static int compile_additive(unsigned int *code, int at, const char **cur)
 {
     int start = at;
     int w = compile_primary(code, at, cur);
@@ -381,6 +400,73 @@ static int compile_expr(unsigned int *code, int at, const char **cur)
         at += w;
         code[at++] = enc_ldr_pop(1);
         code[at++] = (op == '+') ? enc_add_r0_r1_r0() : enc_sub_r0_r1_r0();
+    }
+    return at - start;
+}
+
+/* Emit `cmp r1, r0 ; mov r0, #0 ; mov{cond} r0, #1` so r0 becomes
+ * 1 if (left CMP right) is true under `cond`, else 0.  Left is in r1
+ * (just popped), right is in r0 (just computed). */
+static int emit_cmp_set(unsigned int *code, int at, unsigned int cond)
+{
+    code[at++] = enc_cmp_r1_r0();
+    code[at++] = enc_mov_imm8(0, 0);
+    code[at++] = enc_mov_cond_r0_1(cond);
+    return 3;
+}
+
+/* relational = additive ( ("<=" | ">=" | "<" | ">") additive )*
+ *
+ * Multi-char operators must be checked BEFORE the single-char ones
+ * or "<=" would mis-lex as "<" + "=". */
+static int compile_relational(unsigned int *code, int at, const char **cur)
+{
+    int start = at;
+    int w = compile_additive(code, at, cur);
+    if (w < 0) return -1;
+    at += w;
+    while (1) {
+        skip_ws(cur);
+        const char *p = *cur;
+        unsigned int cond;
+        int oplen;
+        if (p[0] == '<' && p[1] == '=') { cond = COND_LE; oplen = 2; }
+        else if (p[0] == '>' && p[1] == '=') { cond = COND_GE; oplen = 2; }
+        else if (p[0] == '<') { cond = COND_LT; oplen = 1; }
+        else if (p[0] == '>') { cond = COND_GT; oplen = 1; }
+        else break;
+        *cur = p + oplen;
+        code[at++] = enc_str_push_r0();
+        w = compile_additive(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        code[at++] = enc_ldr_pop(1);
+        at += emit_cmp_set(code, at, cond);
+    }
+    return at - start;
+}
+
+/* expr = relational ( ("==" | "!=") relational )* */
+static int compile_expr(unsigned int *code, int at, const char **cur)
+{
+    int start = at;
+    int w = compile_relational(code, at, cur);
+    if (w < 0) return -1;
+    at += w;
+    while (1) {
+        skip_ws(cur);
+        const char *p = *cur;
+        unsigned int cond;
+        if      (p[0] == '=' && p[1] == '=') cond = COND_EQ;
+        else if (p[0] == '!' && p[1] == '=') cond = COND_NE;
+        else break;
+        *cur = p + 2;
+        code[at++] = enc_str_push_r0();
+        w = compile_relational(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        code[at++] = enc_ldr_pop(1);
+        at += emit_cmp_set(code, at, cond);
     }
     return at - start;
 }
@@ -484,6 +570,37 @@ static int compile_stmt(unsigned int *code, int at, const char **cur)
     /* if */
     if (match_kw(cur, "if")) {
         return compile_if(code, at, cur);
+    }
+
+    /* while (cond) stmt
+     *
+     *   L_top:
+     *     compile cond  -> r0
+     *     cmp r0, #0
+     *     beq L_end           <- placeholder, patched after body
+     *     compile body
+     *     b L_top             <- backward branch, offset known now
+     *   L_end:
+     */
+    if (match_kw(cur, "while")) {
+        if (!match(cur, "(")) return -1;
+        int top_at = at;
+        int w = compile_expr(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        if (!match(cur, ")")) return -1;
+        code[at++] = enc_cmp_r0_imm0();
+        int beq_at = at;
+        code[at++] = enc_beq_placeholder();
+        w = compile_stmt(code, at, cur);
+        if (w < 0) return -1;
+        at += w;
+        /* Emit backward B to L_top, then patch the placeholder at b_at. */
+        int b_at = at;
+        code[at++] = enc_b_placeholder();
+        patch_branch(code, b_at, top_at);
+        patch_branch(code, beq_at, at);
+        return at - start;
     }
 
     /* int decl */
