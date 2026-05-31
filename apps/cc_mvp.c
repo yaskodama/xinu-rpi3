@@ -370,5 +370,10 @@ int cc_mvp_compile_and_run(const char *src, long *retval, int *codesize)
 
     long (*entry)(void) = (long (*)(void))code;
     *retval = entry();
+    /* Execution complete — entry() returned, no live use of `code` remains.
+     * Free the 4 KB JIT buffer so per-call cost is bounded.  Without this
+     * every compile leaks 4 KB; load-balancer workers blow through tens
+     * of MB in a stress test. */
+    memfree(code, 4096);
     return 0;
 }

@@ -905,6 +905,82 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/loadbal/jit?n=K&prog=P:
+             *   Like /api/loadbal/submit but the worker JIT-compiles a
+             *   small C source and executes it (no sleep — wall-clock
+             *   is dominated by JIT codegen + execution).  P selects
+             *   from a static program table; default 4 (now_ms +
+             *   actor_count, two builtin calls).  Round-robins task_id
+             *   1..K across the workers via the least-loaded picker.
+             *
+             *   Same caps as /submit: n<=64, prog>=0. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/jit", 20) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/jit", 21))
+            {
+                extern void abcl_loadbal_submit_jit(int, int);
+                extern int  abcl_loadbal_worker_count(void);
+                extern int  abcl_loadbal_n_progs(void);
+                const char *url = strchr(reqbuf, ' ');
+                int n_tasks = abcl_loadbal_worker_count();
+                int prog_id = 4;       /* default: 2-builtin program */
+                if (NULL != url)
+                {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q)
+                    {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n')
+                        {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int klen = eq - p;
+                            if (klen == 1 && *p == 'n' && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                n_tasks = v;
+                            }
+                            else if (klen == 4 && 0 == strncmp(p, "prog", 4)
+                                     && *eq == '=')
+                            {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                prog_id = v;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                if (n_tasks < 1)  n_tasks = 1;
+                if (n_tasks > 64) n_tasks = 64;
+                if (prog_id < 0)                              prog_id = 0;
+                if (prog_id >= abcl_loadbal_n_progs())        prog_id = 0;
+                int i;
+                for (i = 1; i <= n_tasks; i++)
+                {
+                    abcl_loadbal_submit_jit(prog_id, i);
+                }
+                static char jresp[300];
+                int blen = sprintf(jresp + 100,
+                                   "jit-submitted n=%d prog=%d (see /api/loadbal/stats)\r\n",
+                                   n_tasks, prog_id);
+                int hlen = sprintf(jresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(jresp + hlen, jresp + 100, blen);
+                write(tcpdev, jresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/stats: dispatcher + per-worker counters.
              * Used by Mac scripts to verify even distribution. */
             if (0 == strncmp(reqbuf, "GET /api/loadbal/stats", 22) ||

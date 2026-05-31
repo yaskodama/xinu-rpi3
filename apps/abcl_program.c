@@ -739,7 +739,9 @@ static void dispatch_WebReceiver(int self_id, int sender_id, const char* method,
 
 enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
        F_Disp_load0, F_Disp_load1, F_Disp_load2, F_Disp_load3,
-       F_Disp_submitted, F_Disp_completed, F_Disp__N };
+       F_Disp_submitted, F_Disp_completed,
+       F_Disp_rr,                     /* round-robin cursor for submit_jit */
+       F_Disp__N };
 
 static void init_fields_Dispatcher(int self_id) {
   int i;
@@ -837,12 +839,60 @@ static void Dispatcher_done(int self_id, int sender_id,
   signal(print_mu);
 }
 
+/* Routes a JIT job using round-robin instead of least-loaded.
+ *
+ * For sleep-based `submit` the work is slower than dispatch, so by the
+ * time the second submit arrives worker 0 still has load=1 and worker 1
+ * wins — distribution looks even.
+ *
+ * For JIT, each task is fast enough that the worker often finishes (and
+ * sends `done` decrementing its load) BEFORE the next submit arrives.
+ * Least-loaded then breaks ties in favour of slot 0, so every JIT task
+ * lands on the same worker.  Round-robin sidesteps this and gives an
+ * honest demonstration of 4 worker threads JIT-compiling in parallel. */
+static void Dispatcher_submit_jit(int self_id, int sender_id,
+                                  value_t* args, int n_args) {
+  (void)sender_id;
+  long prog_id = (n_args > 0) ? args[0].i : 0L;
+  long task_id = (n_args > 1) ? args[1].i : 0L;
+  int n = (int)objects[self_id].fields[F_Disp_n].i;
+  if (n <= 0) return;
+  int slot = (int)(objects[self_id].fields[F_Disp_rr].i % n);
+  objects[self_id].fields[F_Disp_rr] =
+    mk_int(objects[self_id].fields[F_Disp_rr].i + 1);
+  int worker_obj = 0;
+  switch (slot) {
+  case 0: worker_obj = objects[self_id].fields[F_Disp_w0].obj_id; break;
+  case 1: worker_obj = objects[self_id].fields[F_Disp_w1].obj_id; break;
+  case 2: worker_obj = objects[self_id].fields[F_Disp_w2].obj_id; break;
+  case 3: worker_obj = objects[self_id].fields[F_Disp_w3].obj_id; break;
+  }
+  /* Bump the load array too so /api/loadbal/stats stays meaningful and
+   * Dispatcher_done's decrement matches up. */
+  switch (slot) {
+  case 0: objects[self_id].fields[F_Disp_load0] =
+            mk_int(objects[self_id].fields[F_Disp_load0].i + 1); break;
+  case 1: objects[self_id].fields[F_Disp_load1] =
+            mk_int(objects[self_id].fields[F_Disp_load1].i + 1); break;
+  case 2: objects[self_id].fields[F_Disp_load2] =
+            mk_int(objects[self_id].fields[F_Disp_load2].i + 1); break;
+  case 3: objects[self_id].fields[F_Disp_load3] =
+            mk_int(objects[self_id].fields[F_Disp_load3].i + 1); break;
+  }
+  objects[self_id].fields[F_Disp_submitted] =
+    mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
+  enqueue(self_id, worker_obj, "compute_jit", 2,
+          (value_t[]){ mk_int(prog_id), mk_int(task_id) });
+}
+
 static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
                                 value_t* args, int n_args) {
   if (strcmp(method, "register_workers") == 0)
   { Dispatcher_register_workers(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "submit") == 0)
   { Dispatcher_submit(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "submit_jit") == 0)
+  { Dispatcher_submit_jit(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "done") == 0)
   { Dispatcher_done(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
@@ -902,12 +952,65 @@ static void Worker_compute(int self_id, int sender_id,
           (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(result) });
 }
 
+/* Static JIT-test programs.  cc_mvp doesn't have local vars yet so the
+ * source must be self-contained (literals + builtin calls only).
+ * Each worker JIT-compiles+executes one of these per task, exercising
+ * memget/memfree, codegen, and the builtin-call ABI under load. */
+static const char *jit_progs[] = {
+  "int main() { return 42; }",                              /* trivial */
+  "int main() { return 100 + 23; }",                        /* binop  */
+  "int main() { return now_ms(); }",                        /* builtin */
+  "int main() { return actor_count() + 1000; }",            /* builtin+binop */
+  "int main() { return now_ms() + actor_count(); }",        /* 2 builtins */
+};
+#define N_JIT_PROGS ((int)(sizeof(jit_progs) / sizeof(jit_progs[0])))
+
+static void Worker_compute_jit(int self_id, int sender_id,
+                               value_t* args, int n_args) {
+  (void)sender_id;
+  long prog_id = (n_args > 0) ? args[0].i : 0L;
+  long task_id = (n_args > 1) ? args[1].i : 0L;
+  if (prog_id < 0 || prog_id >= N_JIT_PROGS) prog_id = 0;
+  long idx  = objects[self_id].fields[F_Worker_my_idx].i;
+  int  disp = objects[self_id].fields[F_Worker_dispatcher].obj_id;
+
+  extern int cc_mvp_compile_and_run(const char *, long *, int *);
+  long result = 0;
+  int  code_size = 0;
+  int  rc = cc_mvp_compile_and_run(jit_progs[(int)prog_id],
+                                   &result, &code_size);
+
+  wait(print_mu);
+  if (rc == 0) {
+    kprintf("[loadbal/jit] worker idx=%ld task=%ld prog=%ld result=%ld bytes=%d\r\n",
+            idx, task_id, prog_id, result, code_size);
+  } else {
+    kprintf("[loadbal/jit] worker idx=%ld task=%ld prog=%ld FAILED rc=%d\r\n",
+            idx, task_id, prog_id, rc);
+    result = -1;
+  }
+  signal(print_mu);
+
+  objects[self_id].fields[F_Worker_last_n]      = mk_int(prog_id);
+  objects[self_id].fields[F_Worker_last_result] = mk_int(result);
+  objects[self_id].fields[F_Worker_done] =
+    mk_int(objects[self_id].fields[F_Worker_done].i + 1);
+  /* For JIT tasks, busy_ms re-purposed as cumulative code bytes emitted. */
+  objects[self_id].fields[F_Worker_busy_ms] =
+    mk_int(objects[self_id].fields[F_Worker_busy_ms].i + code_size);
+
+  enqueue(self_id, disp, "done", 3,
+          (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(result) });
+}
+
 static void dispatch_Worker(int self_id, int sender_id, const char* method,
                             value_t* args, int n_args) {
   if (strcmp(method, "bind") == 0)
   { Worker_bind(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "compute") == 0)
   { Worker_compute(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "compute_jit") == 0)
+  { Worker_compute_jit(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
@@ -923,6 +1026,13 @@ void abcl_loadbal_submit(int work_ms, int task_id) {
   abcl_enqueue(-1, g_loadbal_disp, "submit", 2,
                (value_t[]){ mk_int((long)work_ms), mk_int((long)task_id) });
 }
+
+void abcl_loadbal_submit_jit(int prog_id, int task_id) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "submit_jit", 2,
+               (value_t[]){ mk_int((long)prog_id), mk_int((long)task_id) });
+}
+int abcl_loadbal_n_progs(void) { return N_JIT_PROGS; }
 
 /* One-shot bootstrap of the load-balancer actors.  Safe to call multiple
  * times — only the first call creates the actors.  Called from
