@@ -1,6 +1,6 @@
 # NEXT_SESSION — xinu-raz / arm-rpi3 (Raspberry Pi 3 B+ 実機移植)
 
-最終更新: 2026-05-27 / ブランチ `arm-rpi3-port` / repo `github.com/yaskodama/xinu-rpi`
+最終更新: 2026-06-01 / ブランチ `arm-rpi3-port` / repo `github.com/yaskodama/xinu-rpi3`
 
 ## 現状サマリ ✅
 
