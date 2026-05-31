@@ -238,6 +238,40 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* POST /compile — body is C source.  MVP: only the trivial
+             * program "int main() { return N; }".  Emits ARM32 (movw/movt
+             * + bx lr) into a fresh kmalloc buffer, calls it, returns
+             * "rc=<status> ret=<value> size=<bytes>".  Pi 4 equivalent
+             * is /compile with a much richer cc.c.  Pi 3 codegen will
+             * grow over future commits. */
+            if (0 == strncmp(reqbuf, "POST /compile", 13) ||
+                0 == strncmp(reqbuf, "GET /compile",  12))
+            {
+                /* body starts after header_end */
+                int hend = -1;
+                {
+                    char *p = strstr(reqbuf, "\r\n\r\n");
+                    if (NULL != p) hend = (int)(p - reqbuf) + 4;
+                }
+                const char *body = (hend >= 0) ? reqbuf + hend : reqbuf;
+                extern int cc_mvp_compile_and_run(const char *, long *, int *);
+                long ret = 0;
+                int  sz = 0;
+                int  rc = cc_mvp_compile_and_run(body, &ret, &sz);
+                static char cresp[300];
+                int blen = sprintf(cresp + 100,
+                                   "rc=%d ret=%ld code_size=%d\n", rc, ret, sz);
+                int hlen = sprintf(cresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(cresp + hlen, cresp + 100, blen);
+                write(tcpdev, cresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/actor-age?id=N — ms since the actor's last mailbox
              * activity (enq or deq).  Pi 4 equivalent: cc_actor_age. */
             if (0 == strncmp(reqbuf, "GET /api/actor-age", 18) ||
