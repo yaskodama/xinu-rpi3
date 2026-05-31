@@ -1013,6 +1013,100 @@ static void Dispatcher_set_enabled(int self_id, int sender_id,
   signal(print_mu);
 }
 
+/* Sticky routing: caller passes a precomputed hash, dispatcher maps
+ * hash%n_workers to a slot.  Same hash -> same slot (so a cluster of
+ * tasks sharing a key all land on the same worker, useful for cache
+ * locality or stateful workers).  If that slot is paused, walk
+ * forward to the next enabled one — preserves sticky semantics when
+ * the target is alive, gracefully degrades when not. */
+static void Dispatcher_submit_sticky(int self_id, int sender_id,
+                                     value_t* args, int n_args) {
+  (void)sender_id;
+  long work_ms  = (n_args > 0) ? args[0].i : 100L;
+  long task_id  = (n_args > 1) ? args[1].i : 0L;
+  long key_hash = (n_args > 2) ? args[2].i : 0L;
+  int n = (int)objects[self_id].fields[F_Disp_n].i;
+  if (n <= 0) return;
+  long mask = objects[self_id].fields[F_Disp_enabled].i;
+  unsigned long h = (unsigned long)(key_hash < 0 ? -key_hash : key_hash);
+  int slot = (int)(h % (unsigned long)n);
+  int tries;
+  for (tries = 0; tries < n; tries++) {
+    if ((mask >> slot) & 1L) break;
+    slot = (slot + 1) % n;
+  }
+  if (!((mask >> slot) & 1L)) {
+    wait(print_mu);
+    kprintf("[loadbal] submit_sticky dropped task=%ld key_hash=%ld: all paused\r\n",
+            task_id, key_hash);
+    signal(print_mu);
+    return;
+  }
+  int worker_obj = dispatcher_worker_obj(self_id, slot);
+  dispatcher_bump_load(self_id, slot, +1);
+  objects[self_id].fields[F_Disp_submitted] =
+    mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
+  lb_task_alloc((int)task_id, 's', (int)work_ms, worker_obj);
+  wait(print_mu);
+  kprintf("[loadbal] sticky task=%ld key_hash=%ld -> worker idx=%d obj=%d\r\n",
+          task_id, key_hash, slot, worker_obj);
+  signal(print_mu);
+  enqueue(self_id, worker_obj, "compute", 2,
+          (value_t[]){ mk_int(work_ms), mk_int(task_id) });
+}
+
+/* Worker restart — kill old thread, allocate fresh actor, swap into
+ * the dispatcher's worker slot.  Uses a NEW obj_id (n_objects bumps),
+ * which is permanent — restarting all 4 workers consumes 4 of the 9
+ * post-boot MAX_OBJECTS=16 budget.  Acceptable for occasional ops
+ * use; a long-running restart loop would exhaust the table.
+ *
+ * Pending tasks in the old worker's mailbox are LOST (still counted
+ * as submitted-not-completed forever).  Done-callbacks from the old
+ * worker after kill are also lost.  The load counter is reset to 0
+ * for the slot to reflect the fresh start. */
+static void Dispatcher_restart_worker(int self_id, int sender_id,
+                                      value_t* args, int n_args) {
+  (void)sender_id;
+  if (n_args < 1) return;
+  long slot = args[0].i;
+  if (slot < 0 || slot >= LB_N_WORKERS) return;
+  if (n_objects >= MAX_OBJECTS) {
+    wait(print_mu);
+    kprintf("[loadbal] restart_worker idx=%ld FAILED: actor table full (%d/%d)\r\n",
+            slot, n_objects, MAX_OBJECTS);
+    signal(print_mu);
+    return;
+  }
+  int old_obj = dispatcher_worker_obj(self_id, (int)slot);
+  if (old_obj > 0 && objects[old_obj].tid > 0 && !objects[old_obj].dead) {
+    kill(objects[old_obj].tid);
+    objects[old_obj].dead = 1;
+  }
+  int new_obj = alloc_obj(CLASS_Worker, 0, NULL);
+  abcl_object_protect(new_obj, 1);
+  spawn_actor(new_obj);
+  /* Swap into dispatcher's slot + reset load counter. */
+  switch ((int)slot) {
+  case 0: objects[self_id].fields[F_Disp_w0] = mk_obj(new_obj);
+          objects[self_id].fields[F_Disp_load0] = mk_int(0L); break;
+  case 1: objects[self_id].fields[F_Disp_w1] = mk_obj(new_obj);
+          objects[self_id].fields[F_Disp_load1] = mk_int(0L); break;
+  case 2: objects[self_id].fields[F_Disp_w2] = mk_obj(new_obj);
+          objects[self_id].fields[F_Disp_load2] = mk_int(0L); break;
+  case 3: objects[self_id].fields[F_Disp_w3] = mk_obj(new_obj);
+          objects[self_id].fields[F_Disp_load3] = mk_int(0L); break;
+  }
+  g_loadbal_w[(int)slot] = new_obj;
+  /* Bind the fresh worker so it knows its slot index + dispatcher. */
+  abcl_enqueue(-1, new_obj, "bind", 2,
+               (value_t[]){ mk_int(slot), mk_obj(self_id) });
+  wait(print_mu);
+  kprintf("[loadbal] worker idx=%ld restarted: old_obj=%d -> new_obj=%d\r\n",
+          slot, old_obj, new_obj);
+  signal(print_mu);
+}
+
 /* Routes a JIT job using round-robin instead of least-loaded.
  *
  * For sleep-based `submit` the work is slower than dispatch, so by the
@@ -1068,12 +1162,16 @@ static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
   { Dispatcher_submit(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "submit_jit") == 0)
   { Dispatcher_submit_jit(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "submit_sticky") == 0)
+  { Dispatcher_submit_sticky(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "done") == 0)
   { Dispatcher_done(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "set_enabled") == 0)
   { Dispatcher_set_enabled(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "cancel_task") == 0)
   { Dispatcher_cancel_task(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "restart_worker") == 0)
+  { Dispatcher_restart_worker(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
@@ -1281,6 +1379,30 @@ void abcl_loadbal_cancel(int task_id) {
   if (g_loadbal_disp < 0) return;
   abcl_enqueue(-1, g_loadbal_disp, "cancel_task", 1,
                (value_t[]){ mk_int((long)task_id) });
+}
+
+void abcl_loadbal_submit_sticky(int work_ms, int task_id, int key_hash) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "submit_sticky", 3,
+               (value_t[]){ mk_int((long)work_ms),
+                            mk_int((long)task_id),
+                            mk_int((long)key_hash) });
+}
+
+void abcl_loadbal_restart_worker(int slot) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "restart_worker", 1,
+               (value_t[]){ mk_int((long)slot) });
+}
+
+/* djb2 — small portable string hash for sticky routing keys.
+ * Caller passes the resulting int to abcl_loadbal_submit_sticky. */
+int abcl_loadbal_hash_key(const char *s, int len) {
+  unsigned long h = 5381;
+  int i;
+  for (i = 0; i < len; i++)
+    h = (h * 33u) + (unsigned char)s[i];
+  return (int)(h & 0x7FFFFFFFu);
 }
 
 /* HTTP backpressure check.  Returns 1 if at least one enabled worker

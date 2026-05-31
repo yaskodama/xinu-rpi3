@@ -887,8 +887,14 @@ thread webactor_server(void)
              *   Worker, so K tasks across W workers takes roughly
              *   ceil(K/W)*ms wall-clock instead of K*ms serial.
              *   K defaults to LB_N_WORKERS, ms defaults to 200. */
-            if (0 == strncmp(reqbuf, "GET /api/loadbal/submit", 23) ||
-                0 == strncmp(reqbuf, "POST /api/loadbal/submit", 24))
+            /* Match exact "submit" — reject "submit-sticky" / "submit_jit"
+             * prefix-collisions by checking the char after "submit" is a
+             * URL boundary (? or space).  Without this, /submit-sticky
+             * silently fell through to non-sticky distribution. */
+            if (((0 == strncmp(reqbuf, "GET /api/loadbal/submit",  23) &&
+                  (reqbuf[23] == '?' || reqbuf[23] == ' ')) ||
+                 (0 == strncmp(reqbuf, "POST /api/loadbal/submit", 24) &&
+                  (reqbuf[24] == '?' || reqbuf[24] == ' '))))
             {
                 extern void abcl_loadbal_submit(int, int);
                 extern int  abcl_loadbal_worker_count(void);
@@ -1213,6 +1219,142 @@ thread webactor_server(void)
                                    "\r\n", blen);
                 memcpy(presp + hlen, presp + 100, blen);
                 write(tcpdev, presp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/submit-sticky?n=K&ms=M&key=NAME
+             *   Sticky routing: all K tasks of the same key hash to the
+             *   SAME worker (slot = djb2(key) % n_workers).  Useful for
+             *   stateful workers or cache-locality patterns.  If the
+             *   target slot is paused, walks forward to the next enabled
+             *   worker (best-effort sticky).  Per-task task_id = 1..K
+             *   like /submit, but all share one key_hash. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/submit-sticky",  30) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/submit-sticky", 31))
+            {
+                extern int  abcl_loadbal_worker_count(void);
+                extern void abcl_loadbal_submit_sticky(int, int, int);
+                extern int  abcl_loadbal_hash_key(const char *, int);
+                extern int  abcl_loadbal_can_accept(void);
+                int n_tasks = abcl_loadbal_worker_count();
+                int work_ms = 200;
+                char key[64] = "default";
+                int  klen = 7;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url) {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q) {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int kl = eq - p;
+                            if (kl == 1 && *p == 'n' && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                n_tasks = v;
+                            } else if (kl == 2 && 0 == strncmp(p, "ms", 2) && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                work_ms = v;
+                            } else if (kl == 3 && 0 == strncmp(p, "key", 3) && *eq == '=') {
+                                int kvlen = amp - (eq + 1);
+                                if (kvlen > 63) kvlen = 63;
+                                memcpy(key, eq + 1, kvlen);
+                                key[kvlen] = '\0';
+                                klen = kvlen;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                if (n_tasks < 1)   n_tasks = 1;
+                if (n_tasks > 64)  n_tasks = 64;
+                if (work_ms < 0)   work_ms = 0;
+                if (work_ms > 5000)work_ms = 5000;
+                if (!abcl_loadbal_can_accept()) {
+                    static char busy3[200];
+                    int bb = sprintf(busy3 + 100,
+                        "loadbal saturated (all workers at queue cap)\r\n");
+                    int hh = sprintf(busy3,
+                        "HTTP/1.0 429 Too Many Requests\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Retry-After: 1\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", bb);
+                    memcpy(busy3 + hh, busy3 + 100, bb);
+                    write(tcpdev, busy3, hh + bb);
+                    close(tcpdev);
+                    web_cur_tcpdev = -1;
+                    continue;
+                }
+                int hash = abcl_loadbal_hash_key(key, klen);
+                int i;
+                for (i = 1; i <= n_tasks; i++) {
+                    abcl_loadbal_submit_sticky(work_ms, i, hash);
+                }
+                static char sresp2[300];
+                int blen = sprintf(sresp2 + 100,
+                    "sticky-submitted n=%d ms=%d key=\"%s\" hash=%d "
+                    "(routed to slot=%d)\r\n",
+                    n_tasks, work_ms, key, hash,
+                    hash % (n_tasks > 0 ? abcl_loadbal_worker_count() : 1));
+                int hlen = sprintf(sresp2,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(sresp2 + hlen, sresp2 + 100, blen);
+                write(tcpdev, sresp2, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/restart?w=N — kill + respawn worker N.
+             *   Uses a new obj_id (n_objects bumps).  MAX_OBJECTS=16 cap
+             *   means ~9 restarts before the table fills.  Pending tasks
+             *   in the old worker's mailbox are LOST and stay in
+             *   submitted-not-completed forever (visible as the gap in
+             *   /api/loadbal/stats).  Load counter resets to 0. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/restart",  24) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/restart", 25))
+            {
+                extern void abcl_loadbal_restart_worker(int);
+                int widx = -1;
+                const char *q = strstr(reqbuf, "?w=");
+                if (NULL != q) {
+                    q += 3;
+                    widx = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        widx = widx * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                static char rresp[200];
+                int blen;
+                if (widx < 0 || widx >= 4) {
+                    blen = sprintf(rresp + 100,
+                        "usage: /api/loadbal/restart?w=0..3\r\n");
+                } else {
+                    abcl_loadbal_restart_worker(widx);
+                    blen = sprintf(rresp + 100,
+                        "restart_worker idx=%d queued — poll /api/actors "
+                        "to see new obj_id\r\n", widx);
+                }
+                int hlen = sprintf(rresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(rresp + hlen, rresp + 100, blen);
+                write(tcpdev, rresp, hlen + blen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
