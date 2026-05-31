@@ -238,6 +238,54 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* /mmio-read?addr=0xN — peek a 32-bit register.  No fault
+             * catching on Pi 3 (no setjmp/longjmp safety net like Pi 4's
+             * safe_mmio_read32) so a bad address will hard-fault the
+             * kernel — only use for known-mapped registers.  Default
+             * addr 0x3F202000 (SDHOST CMD register on BCM2837). */
+            if (0 == strncmp(reqbuf, "GET /mmio-read", 14) ||
+                0 == strncmp(reqbuf, "POST /mmio-read", 15))
+            {
+                unsigned long addr = 0x3F202000UL;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url)
+                {
+                    const char *p = strstr(url, "addr=");
+                    if (NULL != p)
+                    {
+                        p += 5;
+                        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+                        addr = 0;
+                        while (*p && *p != '&' && *p != ' ' &&
+                               *p != '\r' && *p != '\n')
+                        {
+                            char c = *p++;
+                            unsigned int d;
+                            if (c >= '0' && c <= '9') d = c - '0';
+                            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                            else break;
+                            addr = (addr << 4) | d;
+                        }
+                    }
+                }
+                volatile unsigned int *p = (volatile unsigned int *)addr;
+                unsigned int v = *p;
+                static char mresp[300];
+                int blen = sprintf(mresp + 100,
+                                   "addr=0x%08lx val=0x%08x\r\n",
+                                   addr, v);
+                int hlen = sprintf(mresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(mresp + hlen, mresp + 100, blen);
+                write(tcpdev, mresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /upload?dst=NAME — receive a binary file POST body and
              * store in the upload slot.  Pi 4 has nothing equivalent;
              * this is the Pi 3-side groundwork for eventual kernel.img
