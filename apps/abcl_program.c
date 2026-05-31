@@ -755,6 +755,14 @@ enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
  * is already 64-deep so 64 in-flight is a reasonable working set. */
 #define LB_TASKS_MAX 64
 
+/* Per-task state for cancellation tracking.
+ *   P = pending / running (worker should run it)
+ *   D = done (worker finished and reported back)
+ *   C = cancelled (worker should abort if still in chunked sleep) */
+#define LB_STATE_PENDING   'P'
+#define LB_STATE_DONE      'D'
+#define LB_STATE_CANCELLED 'C'
+
 typedef struct {
   int  task_id;        /* monotonic from dispatcher; 0 = empty slot */
   int  worker_obj;     /* dispatched-to worker obj_id, -1 if pending */
@@ -762,8 +770,19 @@ typedef struct {
   long done_ms;        /* 0 while pending */
   long result;
   char kind;           /* 's' = sleep compute, 'j' = JIT compute */
+  char state;          /* LB_STATE_* */
   int  param;          /* work_ms or prog_id */
 } lb_task_t;
+
+/* Per-worker queue cap.  Used by the HTTP layer (via
+ * abcl_loadbal_can_accept) to return 429 instead of letting the
+ * dispatcher mailbox absorb arbitrary backlog. */
+#define LB_WORKER_QUEUE_MAX 8
+
+/* Forward decl — lb_latency_bucket uses F_Worker_hist_K constants
+ * which aren't declared until the Worker class definition further
+ * down, but Dispatcher_done (earlier in the file) needs to call it. */
+static int lb_latency_bucket(long elapsed_ms);
 
 static lb_task_t lb_tasks[LB_TASKS_MAX];
 static int       lb_tasks_next = 0;     /* round-robin write cursor */
@@ -778,6 +797,7 @@ static lb_task_t* lb_task_alloc(int task_id, char kind, int param,
   t->done_ms    = 0;
   t->result     = 0;
   t->kind       = kind;
+  t->state      = LB_STATE_PENDING;
   t->param      = param;
   return t;
 }
@@ -907,17 +927,58 @@ static void Dispatcher_done(int self_id, int sender_id,
   dispatcher_bump_load(self_id, (int)widx, -1);
   objects[self_id].fields[F_Disp_completed] =
     mk_int(objects[self_id].fields[F_Disp_completed].i + 1);
-  /* Stamp the task table — visible via /api/loadbal/task?id=N. */
+  /* Stamp the task table + bump that worker's latency-histogram
+   * bucket — visible via /api/loadbal/stats. */
   lb_task_t *t = lb_task_lookup((int)task_id);
+  long elapsed = 0;
   if (NULL != t) {
     t->done_ms = (long)(clkticks * 10);
     t->result  = result;
+    /* Don't overwrite a CANCELLED state — the worker explicitly
+     * acknowledged the cancel.  Otherwise mark DONE. */
+    if (t->state != LB_STATE_CANCELLED) t->state = LB_STATE_DONE;
+    elapsed = t->done_ms - t->submit_ms;
+    if (elapsed < 0) elapsed = 0;
+    int worker_obj = dispatcher_worker_obj(self_id, (int)widx);
+    if (worker_obj >= 0) {
+      int bkt = lb_latency_bucket(elapsed);
+      objects[worker_obj].fields[bkt] =
+        mk_int(objects[worker_obj].fields[bkt].i + 1);
+    }
   }
   wait(print_mu);
-  kprintf("[loadbal] complete task=%ld worker=%ld result=%ld (done=%ld/%ld)\r\n",
-          task_id, widx, result,
+  kprintf("[loadbal] complete task=%ld worker=%ld result=%ld elapsed=%ld (done=%ld/%ld)\r\n",
+          task_id, widx, result, elapsed,
           objects[self_id].fields[F_Disp_completed].i,
           objects[self_id].fields[F_Disp_submitted].i);
+  signal(print_mu);
+}
+
+/* Mark a task CANCELLED.  The worker's compute loop polls task state
+ * during its chunked sleep — see Worker_compute.  For JIT tasks
+ * cancel only catches the BEFORE-compile window because the JIT call
+ * itself is synchronous.  HTTP: POST /api/loadbal/cancel?id=N */
+static void Dispatcher_cancel_task(int self_id, int sender_id,
+                                   value_t* args, int n_args) {
+  (void)self_id; (void)sender_id;
+  if (n_args < 1) return;
+  long task_id = args[0].i;
+  lb_task_t *t = lb_task_lookup((int)task_id);
+  if (NULL == t || t->task_id == 0) {
+    wait(print_mu);
+    kprintf("[loadbal] cancel: task %ld not in table\r\n", task_id);
+    signal(print_mu);
+    return;
+  }
+  if (t->state == LB_STATE_DONE) {
+    wait(print_mu);
+    kprintf("[loadbal] cancel: task %ld already DONE — ignored\r\n", task_id);
+    signal(print_mu);
+    return;
+  }
+  t->state = LB_STATE_CANCELLED;
+  wait(print_mu);
+  kprintf("[loadbal] cancel: task %ld marked CANCELLED\r\n", task_id);
   signal(print_mu);
 }
 
@@ -1000,12 +1061,36 @@ static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
   { Dispatcher_done(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "set_enabled") == 0)
   { Dispatcher_set_enabled(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "cancel_task") == 0)
+  { Dispatcher_cancel_task(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
 enum { F_Worker_my_idx, F_Worker_dispatcher, F_Worker_done,
        F_Worker_busy_ms, F_Worker_last_n, F_Worker_last_result,
+       /* Latency histogram: 7 buckets.  Caller (Dispatcher_done)
+        * computes elapsed_ms = done_ms - submit_ms and bumps the
+        * right bucket on the worker.  These give a coarse p50/p95
+        * read without a full sorted list. */
+       F_Worker_hist_0,   /* <50 ms */
+       F_Worker_hist_1,   /* 50-99 ms */
+       F_Worker_hist_2,   /* 100-199 ms */
+       F_Worker_hist_3,   /* 200-499 ms */
+       F_Worker_hist_4,   /* 500-999 ms */
+       F_Worker_hist_5,   /* 1000-1999 ms */
+       F_Worker_hist_6,   /* >=2000 ms */
        F_Worker__N };
+
+/* Map elapsed_ms to a histogram bucket field index (F_Worker_hist_0..6). */
+static int lb_latency_bucket(long elapsed_ms) {
+  if (elapsed_ms < 50)   return F_Worker_hist_0;
+  if (elapsed_ms < 100)  return F_Worker_hist_1;
+  if (elapsed_ms < 200)  return F_Worker_hist_2;
+  if (elapsed_ms < 500)  return F_Worker_hist_3;
+  if (elapsed_ms < 1000) return F_Worker_hist_4;
+  if (elapsed_ms < 2000) return F_Worker_hist_5;
+  return F_Worker_hist_6;
+}
 
 static void init_fields_Worker(int self_id) {
   int i;
@@ -1038,19 +1123,39 @@ static void Worker_compute(int self_id, int sender_id,
           idx, self_id, task_id, work_ms);
   signal(print_mu);
 
-  if (work_ms > 0) sleep((uint)work_ms);
+  /* Chunked sleep so /api/loadbal/cancel?id=N can interrupt mid-task.
+   * 50 ms chunks give cancel a worst-case ~50 ms reaction time, which
+   * is fine alongside our HTTP RTT of ~5 ms.  task_aborted flips to 1
+   * if the task table entry is marked CANCELLED. */
+  int  task_aborted = 0;
+  long slept = 0;
+  while (slept < work_ms) {
+    lb_task_t *t = lb_task_lookup((int)task_id);
+    if (NULL != t && t->state == LB_STATE_CANCELLED) {
+      task_aborted = 1;
+      break;
+    }
+    long chunk = (work_ms - slept) > 50 ? 50 : (work_ms - slept);
+    sleep((uint)chunk);
+    slept += chunk;
+  }
 
-  long result = work_ms * 7L + task_id;
+  long result = task_aborted ? -1L : (work_ms * 7L + task_id);
   objects[self_id].fields[F_Worker_last_n]      = mk_int(work_ms);
   objects[self_id].fields[F_Worker_last_result] = mk_int(result);
   objects[self_id].fields[F_Worker_done] =
     mk_int(objects[self_id].fields[F_Worker_done].i + 1);
   objects[self_id].fields[F_Worker_busy_ms] =
-    mk_int(objects[self_id].fields[F_Worker_busy_ms].i + work_ms);
+    mk_int(objects[self_id].fields[F_Worker_busy_ms].i + slept);
 
   wait(print_mu);
-  kprintf("[loadbal] worker idx=%ld task=%ld done result=%ld\r\n",
-          idx, task_id, result);
+  if (task_aborted) {
+    kprintf("[loadbal] worker idx=%ld task=%ld CANCELLED at %ld/%ld ms\r\n",
+            idx, task_id, slept, work_ms);
+  } else {
+    kprintf("[loadbal] worker idx=%ld task=%ld done result=%ld\r\n",
+            idx, task_id, result);
+  }
   signal(print_mu);
 
   enqueue(self_id, disp, "done", 3,
@@ -1078,6 +1183,22 @@ static void Worker_compute_jit(int self_id, int sender_id,
   if (prog_id < 0 || prog_id >= N_JIT_PROGS) prog_id = 0;
   long idx  = objects[self_id].fields[F_Worker_my_idx].i;
   int  disp = objects[self_id].fields[F_Worker_dispatcher].obj_id;
+
+  /* Cancellation window: only effective BEFORE the JIT call.  The
+   * compile+execute itself is synchronous and cannot be interrupted
+   * from the dispatcher side. */
+  {
+    lb_task_t *t = lb_task_lookup((int)task_id);
+    if (NULL != t && t->state == LB_STATE_CANCELLED) {
+      wait(print_mu);
+      kprintf("[loadbal/jit] worker idx=%ld task=%ld CANCELLED before run\r\n",
+              idx, task_id);
+      signal(print_mu);
+      enqueue(self_id, disp, "done", 3,
+              (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(-1L) });
+      return;
+    }
+  }
 
   extern int cc_mvp_compile_and_run(const char *, long *, int *);
   long result = 0;
@@ -1145,6 +1266,35 @@ void abcl_loadbal_set_enabled(int worker_idx, int on) {
                (value_t[]){ mk_int((long)worker_idx), mk_int((long)on) });
 }
 
+void abcl_loadbal_cancel(int task_id) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "cancel_task", 1,
+               (value_t[]){ mk_int((long)task_id) });
+}
+
+/* HTTP backpressure check.  Returns 1 if at least one enabled worker
+ * has load < LB_WORKER_QUEUE_MAX, else 0.  Inherently racey (load may
+ * change between this check and the subsequent submit) but good
+ * enough to refuse runaway submitters at the HTTP boundary. */
+int abcl_loadbal_can_accept(void) {
+  if (g_loadbal_disp < 0) return 0;
+  int  d = g_loadbal_disp;
+  int  n = (int)objects[d].fields[F_Disp_n].i;
+  long mask = objects[d].fields[F_Disp_enabled].i;
+  long loads[4] = {
+    objects[d].fields[F_Disp_load0].i,
+    objects[d].fields[F_Disp_load1].i,
+    objects[d].fields[F_Disp_load2].i,
+    objects[d].fields[F_Disp_load3].i,
+  };
+  int i;
+  for (i = 0; i < n && i < 4; i++) {
+    if (!((mask >> i) & 1L)) continue;
+    if (loads[i] < LB_WORKER_QUEUE_MAX) return 1;
+  }
+  return 0;
+}
+
 /* Fill `buf` with one task row for /api/loadbal/task?id=N.
  * Returns bytes written, or 0 if no such task. */
 int abcl_loadbal_task_info(int task_id, char *buf, int cap) {
@@ -1154,14 +1304,17 @@ int abcl_loadbal_task_info(int task_id, char *buf, int cap) {
     return sprintf(buf, "task_id=%d not_found\n", task_id);
   }
   long elapsed = (t->done_ms > 0) ? (t->done_ms - t->submit_ms) : -1L;
+  const char *state_str =
+    (t->state == LB_STATE_CANCELLED) ? "CANCELLED" :
+    (t->state == LB_STATE_DONE     ) ? "DONE"      :
+                                       "PENDING";
   return sprintf(buf,
     "task_id=%d worker_obj=%d kind=%c param=%d\n"
     "submit_ms=%ld done_ms=%ld elapsed_ms=%ld\n"
     "state=%s result=%ld\n",
     t->task_id, t->worker_obj, t->kind, t->param,
     t->submit_ms, t->done_ms, elapsed,
-    (t->done_ms > 0) ? "DONE" : "PENDING",
-    t->result);
+    state_str, t->result);
 }
 
 /* One-shot bootstrap of the load-balancer actors.  Safe to call multiple
@@ -1233,6 +1386,23 @@ int abcl_loadbal_stats(char *buf, int cap) {
       objects[wid].fields[F_Worker_busy_ms].i,
       objects[wid].fields[F_Worker_last_n].i,
       objects[wid].fields[F_Worker_last_result].i);
+  }
+  /* Latency histograms — bucket counts per worker.  Buckets:
+   *   b0:<50  b1:50-99  b2:100-199  b3:200-499  b4:500-999
+   *   b5:1000-1999  b6:>=2000  (all ms) */
+  blen += sprintf(buf + blen,
+    "idx hist_lt50 50-99 100-199 200-499 500-999 1k-2k ge2k\n");
+  for (i = 0; i < LB_N_WORKERS; i++) {
+    int wid = g_loadbal_w[i];
+    if (wid < 0) continue;
+    blen += sprintf(buf + blen, "%d %ld %ld %ld %ld %ld %ld %ld\n", i,
+      objects[wid].fields[F_Worker_hist_0].i,
+      objects[wid].fields[F_Worker_hist_1].i,
+      objects[wid].fields[F_Worker_hist_2].i,
+      objects[wid].fields[F_Worker_hist_3].i,
+      objects[wid].fields[F_Worker_hist_4].i,
+      objects[wid].fields[F_Worker_hist_5].i,
+      objects[wid].fields[F_Worker_hist_6].i);
   }
   return blen;
 }

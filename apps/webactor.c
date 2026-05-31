@@ -932,6 +932,28 @@ thread webactor_server(void)
                 if (n_tasks > 64)  n_tasks = 64;     /* cap so we don't flood */
                 if (work_ms < 0)   work_ms = 0;
                 if (work_ms > 5000)work_ms = 5000;
+                /* Backpressure: refuse with HTTP 429 if every enabled
+                 * worker is already at the per-worker queue cap.  Lets
+                 * the caller back off instead of letting the dispatcher
+                 * mailbox absorb unbounded backlog. */
+                extern int abcl_loadbal_can_accept(void);
+                if (!abcl_loadbal_can_accept())
+                {
+                    static char busy[200];
+                    int bb = sprintf(busy + 100,
+                        "loadbal saturated (all workers at queue cap)\r\n");
+                    int hh = sprintf(busy,
+                        "HTTP/1.0 429 Too Many Requests\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Retry-After: 1\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", bb);
+                    memcpy(busy + hh, busy + 100, bb);
+                    write(tcpdev, busy, hh + bb);
+                    close(tcpdev);
+                    web_cur_tcpdev = -1;
+                    continue;
+                }
                 int i;
                 for (i = 1; i <= n_tasks; i++)
                 {
@@ -1111,6 +1133,25 @@ thread webactor_server(void)
                 if (n_tasks > 64) n_tasks = 64;
                 if (prog_id < 0)                              prog_id = 0;
                 if (prog_id >= abcl_loadbal_n_progs())        prog_id = 0;
+                /* Same backpressure path as /api/loadbal/submit. */
+                extern int abcl_loadbal_can_accept(void);
+                if (!abcl_loadbal_can_accept())
+                {
+                    static char jbusy[200];
+                    int bb = sprintf(jbusy + 100,
+                        "loadbal saturated (all workers at queue cap)\r\n");
+                    int hh = sprintf(jbusy,
+                        "HTTP/1.0 429 Too Many Requests\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Retry-After: 1\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", bb);
+                    memcpy(jbusy + hh, jbusy + 100, bb);
+                    write(tcpdev, jbusy, hh + bb);
+                    close(tcpdev);
+                    web_cur_tcpdev = -1;
+                    continue;
+                }
                 int i;
                 for (i = 1; i <= n_tasks; i++)
                 {
@@ -1172,6 +1213,49 @@ thread webactor_server(void)
                                    "\r\n", blen);
                 memcpy(presp + hlen, presp + 100, blen);
                 write(tcpdev, presp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/cancel?id=N — mark task as cancelled.
+             *   Sleep-mode workers honor it on next 50 ms chunk boundary;
+             *   JIT-mode workers honor it only BEFORE the JIT call (the
+             *   compile + execute itself is uninterruptible).
+             *   A cancelled task still reports back via done() so the
+             *   load counter stays consistent.  Task table state moves
+             *   PENDING -> CANCELLED -> (done message keeps it CANCELLED,
+             *   not DONE — see Dispatcher_done). */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/cancel",  23) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/cancel", 24))
+            {
+                extern void abcl_loadbal_cancel(int);
+                int task_id = 0;
+                const char *q = strstr(reqbuf, "?id=");
+                if (NULL != q) {
+                    q += 4;
+                    while (*q >= '0' && *q <= '9') {
+                        task_id = task_id * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                static char cresp2[200];
+                int blen;
+                if (task_id <= 0) {
+                    blen = sprintf(cresp2 + 100,
+                        "usage: /api/loadbal/cancel?id=N (N > 0)\r\n");
+                } else {
+                    abcl_loadbal_cancel(task_id);
+                    blen = sprintf(cresp2 + 100,
+                        "cancel requested for task=%d (poll /task?id=%d for state)\r\n",
+                        task_id, task_id);
+                }
+                int hlen = sprintf(cresp2,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(cresp2 + hlen, cresp2 + 100, blen);
+                write(tcpdev, cresp2, hlen + blen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
