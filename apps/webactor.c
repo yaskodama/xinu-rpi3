@@ -1131,6 +1131,87 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/loadbal/pause?w=N  — pause worker N (drain mode)
+             * /api/loadbal/resume?w=N — resume worker N
+             *   Paused worker takes no new dispatches; in-flight tasks
+             *   still complete normally (load decrement via done).
+             *   Use to gracefully retire a worker for an experiment or
+             *   to test the dispatcher's "all paused" branch. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/pause",   22) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/pause",  23) ||
+                0 == strncmp(reqbuf, "GET /api/loadbal/resume",  23) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/resume", 24))
+            {
+                extern void abcl_loadbal_set_enabled(int, int);
+                int on = (NULL != strstr(reqbuf, "resume")) ? 1 : 0;
+                int widx = -1;
+                const char *q = strstr(reqbuf, "?w=");
+                if (NULL != q) {
+                    q += 3;
+                    widx = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        widx = widx * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                static char presp[200];
+                int blen;
+                if (widx < 0 || widx >= 4) {
+                    blen = sprintf(presp + 100,
+                        "usage: /api/loadbal/{pause,resume}?w=0..3\r\n");
+                } else {
+                    abcl_loadbal_set_enabled(widx, on);
+                    blen = sprintf(presp + 100,
+                        "worker idx=%d set to %s\r\n",
+                        widx, on ? "ENABLED" : "PAUSED");
+                }
+                int hlen = sprintf(presp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(presp + hlen, presp + 100, blen);
+                write(tcpdev, presp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/task?id=N — query task by id (last 64 retained).
+             *   Returns submit_ms / done_ms / elapsed_ms / state / result.
+             *   Caller submits via /submit or /jit (which prints the id
+             *   range), then polls /task?id= for completion. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/task",  21) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/task", 22))
+            {
+                extern int abcl_loadbal_task_info(int, char *, int);
+                int task_id = 0;
+                const char *q = strstr(reqbuf, "?id=");
+                if (NULL != q) {
+                    q += 4;
+                    while (*q >= '0' && *q <= '9') {
+                        task_id = task_id * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                static char tresp2[500];
+                int blen;
+                if (task_id <= 0) {
+                    blen = sprintf(tresp2 + 100,
+                        "usage: /api/loadbal/task?id=N (N > 0)\r\n");
+                } else {
+                    blen = abcl_loadbal_task_info(task_id, tresp2 + 100, 400);
+                }
+                int hlen = sprintf(tresp2,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(tresp2 + hlen, tresp2 + 100, blen);
+                write(tcpdev, tresp2, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/stats: dispatcher + per-worker counters.
              * Used by Mac scripts to verify even distribution. */
             if (0 == strncmp(reqbuf, "GET /api/loadbal/stats", 22) ||

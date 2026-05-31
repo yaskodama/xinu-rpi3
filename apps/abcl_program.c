@@ -741,12 +741,61 @@ enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
        F_Disp_load0, F_Disp_load1, F_Disp_load2, F_Disp_load3,
        F_Disp_submitted, F_Disp_completed,
        F_Disp_rr,                     /* round-robin cursor for submit_jit */
+       F_Disp_enabled,                /* bitmask: bit i = worker i enabled */
        F_Disp__N };
+
+/* === Task tracking table ===========================================
+ * Production load-balancers let callers fire-and-forget then ask
+ * later "what happened to task #N?".  We keep a small circular
+ * buffer of the most recent LB_TASKS_MAX submissions plus their
+ * outcomes (submit-time, done-time, worker, result).
+ *
+ * Lookup is a linear scan; with N=64 that's trivially fast at the
+ * scale we run.  Bigger N would want a hash, but the actor mailbox
+ * is already 64-deep so 64 in-flight is a reasonable working set. */
+#define LB_TASKS_MAX 64
+
+typedef struct {
+  int  task_id;        /* monotonic from dispatcher; 0 = empty slot */
+  int  worker_obj;     /* dispatched-to worker obj_id, -1 if pending */
+  long submit_ms;      /* clkticks*10 when dispatched */
+  long done_ms;        /* 0 while pending */
+  long result;
+  char kind;           /* 's' = sleep compute, 'j' = JIT compute */
+  int  param;          /* work_ms or prog_id */
+} lb_task_t;
+
+static lb_task_t lb_tasks[LB_TASKS_MAX];
+static int       lb_tasks_next = 0;     /* round-robin write cursor */
+
+static lb_task_t* lb_task_alloc(int task_id, char kind, int param,
+                                int worker_obj) {
+  lb_task_t *t = &lb_tasks[lb_tasks_next];
+  lb_tasks_next = (lb_tasks_next + 1) % LB_TASKS_MAX;
+  t->task_id    = task_id;
+  t->worker_obj = worker_obj;
+  t->submit_ms  = (long)(clkticks * 10);
+  t->done_ms    = 0;
+  t->result     = 0;
+  t->kind       = kind;
+  t->param      = param;
+  return t;
+}
+
+static lb_task_t* lb_task_lookup(int task_id) {
+  int i;
+  for (i = 0; i < LB_TASKS_MAX; i++) {
+    if (lb_tasks[i].task_id == task_id) return &lb_tasks[i];
+  }
+  return NULL;
+}
 
 static void init_fields_Dispatcher(int self_id) {
   int i;
   for (i = 0; i < F_Disp__N; i++)
     objects[self_id].fields[i] = mk_int(0L);
+  /* Default: all workers enabled (bit 0..3 set). */
+  objects[self_id].fields[F_Disp_enabled] = mk_int(0xFL);
 }
 
 static void Dispatcher_register_workers(int self_id, int sender_id,
@@ -763,49 +812,86 @@ static void Dispatcher_register_workers(int self_id, int sender_id,
   signal(print_mu);
 }
 
+/* Pick the lowest-load worker that is also enabled in F_Disp_enabled.
+ * Returns slot index (0..n-1), or -1 if no worker is enabled. */
+static int dispatcher_pick_least_loaded(int self_id) {
+  int n = (int)objects[self_id].fields[F_Disp_n].i;
+  long mask = objects[self_id].fields[F_Disp_enabled].i;
+  int  best = -1;
+  long best_load = 0;
+  int  i;
+  long loads[4] = {
+    objects[self_id].fields[F_Disp_load0].i,
+    objects[self_id].fields[F_Disp_load1].i,
+    objects[self_id].fields[F_Disp_load2].i,
+    objects[self_id].fields[F_Disp_load3].i,
+  };
+  for (i = 0; i < n && i < 4; i++) {
+    if (!((mask >> i) & 1L)) continue;            /* paused — skip */
+    if (best < 0 || loads[i] < best_load) {
+      best = i; best_load = loads[i];
+    }
+  }
+  return best;
+}
+
+static int dispatcher_worker_obj(int self_id, int slot) {
+  switch (slot) {
+  case 0: return objects[self_id].fields[F_Disp_w0].obj_id;
+  case 1: return objects[self_id].fields[F_Disp_w1].obj_id;
+  case 2: return objects[self_id].fields[F_Disp_w2].obj_id;
+  case 3: return objects[self_id].fields[F_Disp_w3].obj_id;
+  }
+  return -1;
+}
+
+static void dispatcher_bump_load(int self_id, int slot, long delta) {
+  switch (slot) {
+  case 0: objects[self_id].fields[F_Disp_load0] =
+            mk_int(objects[self_id].fields[F_Disp_load0].i + delta); break;
+  case 1: objects[self_id].fields[F_Disp_load1] =
+            mk_int(objects[self_id].fields[F_Disp_load1].i + delta); break;
+  case 2: objects[self_id].fields[F_Disp_load2] =
+            mk_int(objects[self_id].fields[F_Disp_load2].i + delta); break;
+  case 3: objects[self_id].fields[F_Disp_load3] =
+            mk_int(objects[self_id].fields[F_Disp_load3].i + delta); break;
+  }
+}
+
 static void Dispatcher_submit(int self_id, int sender_id,
                               value_t* args, int n_args) {
   (void)sender_id;
   long work_ms = (n_args > 0) ? args[0].i : 100L;
   long task_id = (n_args > 1) ? args[1].i : 0L;
-  int n = (int)objects[self_id].fields[F_Disp_n].i;
-  if (n <= 0) {
+  if ((int)objects[self_id].fields[F_Disp_n].i <= 0) {
     wait(print_mu);
     kprintf("[loadbal] submit dropped: no workers registered\r\n");
     signal(print_mu);
     return;
   }
-  /* Find lowest-load worker.  Unrolled because we only support up to 4. */
-  int  best = 0;
-  long best_load = objects[self_id].fields[F_Disp_load0].i;
-  if (n > 1 && objects[self_id].fields[F_Disp_load1].i < best_load) {
-    best = 1; best_load = objects[self_id].fields[F_Disp_load1].i;
+  int best = dispatcher_pick_least_loaded(self_id);
+  if (best < 0) {
+    wait(print_mu);
+    kprintf("[loadbal] submit dropped task=%ld: all workers paused\r\n",
+            task_id);
+    signal(print_mu);
+    return;
   }
-  if (n > 2 && objects[self_id].fields[F_Disp_load2].i < best_load) {
-    best = 2; best_load = objects[self_id].fields[F_Disp_load2].i;
-  }
-  if (n > 3 && objects[self_id].fields[F_Disp_load3].i < best_load) {
-    best = 3; best_load = objects[self_id].fields[F_Disp_load3].i;
-  }
-  int worker_obj = 0;
-  switch (best) {
-  case 0: worker_obj = objects[self_id].fields[F_Disp_w0].obj_id; break;
-  case 1: worker_obj = objects[self_id].fields[F_Disp_w1].obj_id; break;
-  case 2: worker_obj = objects[self_id].fields[F_Disp_w2].obj_id; break;
-  case 3: worker_obj = objects[self_id].fields[F_Disp_w3].obj_id; break;
-  }
-  switch (best) {
-  case 0: objects[self_id].fields[F_Disp_load0] = mk_int(best_load + 1); break;
-  case 1: objects[self_id].fields[F_Disp_load1] = mk_int(best_load + 1); break;
-  case 2: objects[self_id].fields[F_Disp_load2] = mk_int(best_load + 1); break;
-  case 3: objects[self_id].fields[F_Disp_load3] = mk_int(best_load + 1); break;
-  }
+  int worker_obj = dispatcher_worker_obj(self_id, best);
+  long old_load = (best == 0) ? objects[self_id].fields[F_Disp_load0].i
+                : (best == 1) ? objects[self_id].fields[F_Disp_load1].i
+                : (best == 2) ? objects[self_id].fields[F_Disp_load2].i
+                              : objects[self_id].fields[F_Disp_load3].i;
+  dispatcher_bump_load(self_id, best, +1);
   objects[self_id].fields[F_Disp_submitted] =
     mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
 
+  /* Record task for /api/loadbal/task?id= later. */
+  lb_task_alloc((int)task_id, 's', (int)work_ms, worker_obj);
+
   wait(print_mu);
   kprintf("[loadbal] dispatch task=%ld -> worker idx=%d obj=%d (load %ld->%ld)\r\n",
-          task_id, best, worker_obj, best_load, best_load + 1);
+          task_id, best, worker_obj, old_load, old_load + 1);
   signal(print_mu);
 
   enqueue(self_id, worker_obj, "compute", 2,
@@ -818,24 +904,40 @@ static void Dispatcher_done(int self_id, int sender_id,
   long widx    = (n_args > 0) ? args[0].i : -1L;
   long task_id = (n_args > 1) ? args[1].i : -1L;
   long result  = (n_args > 2) ? args[2].i : 0L;
-  switch ((int)widx) {
-  case 0: objects[self_id].fields[F_Disp_load0] =
-            mk_int(objects[self_id].fields[F_Disp_load0].i - 1); break;
-  case 1: objects[self_id].fields[F_Disp_load1] =
-            mk_int(objects[self_id].fields[F_Disp_load1].i - 1); break;
-  case 2: objects[self_id].fields[F_Disp_load2] =
-            mk_int(objects[self_id].fields[F_Disp_load2].i - 1); break;
-  case 3: objects[self_id].fields[F_Disp_load3] =
-            mk_int(objects[self_id].fields[F_Disp_load3].i - 1); break;
-  default: break;
-  }
+  dispatcher_bump_load(self_id, (int)widx, -1);
   objects[self_id].fields[F_Disp_completed] =
     mk_int(objects[self_id].fields[F_Disp_completed].i + 1);
+  /* Stamp the task table — visible via /api/loadbal/task?id=N. */
+  lb_task_t *t = lb_task_lookup((int)task_id);
+  if (NULL != t) {
+    t->done_ms = (long)(clkticks * 10);
+    t->result  = result;
+  }
   wait(print_mu);
   kprintf("[loadbal] complete task=%ld worker=%ld result=%ld (done=%ld/%ld)\r\n",
           task_id, widx, result,
           objects[self_id].fields[F_Disp_completed].i,
           objects[self_id].fields[F_Disp_submitted].i);
+  signal(print_mu);
+}
+
+/* Toggle a worker's enabled bit.  args[0] = slot, args[1] = on (0/1).
+ * Paused workers receive no new dispatches; in-flight tasks complete
+ * normally (load counter still decrements via done). */
+static void Dispatcher_set_enabled(int self_id, int sender_id,
+                                   value_t* args, int n_args) {
+  (void)sender_id;
+  if (n_args < 2) return;
+  long slot = args[0].i;
+  long on   = args[1].i;
+  if (slot < 0 || slot >= LB_N_WORKERS) return;
+  long mask = objects[self_id].fields[F_Disp_enabled].i;
+  if (on) mask |=  (1L << slot);
+  else    mask &= ~(1L << slot);
+  objects[self_id].fields[F_Disp_enabled] = mk_int(mask);
+  wait(print_mu);
+  kprintf("[loadbal] worker idx=%ld %s (mask=0x%lx)\r\n",
+          slot, on ? "RESUMED" : "PAUSED", mask);
   signal(print_mu);
 }
 
@@ -857,30 +959,31 @@ static void Dispatcher_submit_jit(int self_id, int sender_id,
   long task_id = (n_args > 1) ? args[1].i : 0L;
   int n = (int)objects[self_id].fields[F_Disp_n].i;
   if (n <= 0) return;
-  int slot = (int)(objects[self_id].fields[F_Disp_rr].i % n);
-  objects[self_id].fields[F_Disp_rr] =
-    mk_int(objects[self_id].fields[F_Disp_rr].i + 1);
-  int worker_obj = 0;
-  switch (slot) {
-  case 0: worker_obj = objects[self_id].fields[F_Disp_w0].obj_id; break;
-  case 1: worker_obj = objects[self_id].fields[F_Disp_w1].obj_id; break;
-  case 2: worker_obj = objects[self_id].fields[F_Disp_w2].obj_id; break;
-  case 3: worker_obj = objects[self_id].fields[F_Disp_w3].obj_id; break;
+  long mask = objects[self_id].fields[F_Disp_enabled].i;
+  /* Round-robin among ENABLED workers only — paused workers are
+   * skipped so a /api/loadbal/pause during a JIT burst still drains
+   * cleanly to the survivors. */
+  int slot = -1, tries;
+  for (tries = 0; tries < n; tries++) {
+    int s = (int)(objects[self_id].fields[F_Disp_rr].i % n);
+    objects[self_id].fields[F_Disp_rr] =
+      mk_int(objects[self_id].fields[F_Disp_rr].i + 1);
+    if ((mask >> s) & 1L) { slot = s; break; }
   }
-  /* Bump the load array too so /api/loadbal/stats stays meaningful and
-   * Dispatcher_done's decrement matches up. */
-  switch (slot) {
-  case 0: objects[self_id].fields[F_Disp_load0] =
-            mk_int(objects[self_id].fields[F_Disp_load0].i + 1); break;
-  case 1: objects[self_id].fields[F_Disp_load1] =
-            mk_int(objects[self_id].fields[F_Disp_load1].i + 1); break;
-  case 2: objects[self_id].fields[F_Disp_load2] =
-            mk_int(objects[self_id].fields[F_Disp_load2].i + 1); break;
-  case 3: objects[self_id].fields[F_Disp_load3] =
-            mk_int(objects[self_id].fields[F_Disp_load3].i + 1); break;
+  if (slot < 0) {
+    wait(print_mu);
+    kprintf("[loadbal] submit_jit dropped task=%ld: all workers paused\r\n",
+            task_id);
+    signal(print_mu);
+    return;
   }
+  int worker_obj = dispatcher_worker_obj(self_id, slot);
+  dispatcher_bump_load(self_id, slot, +1);
   objects[self_id].fields[F_Disp_submitted] =
     mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
+
+  lb_task_alloc((int)task_id, 'j', (int)prog_id, worker_obj);
+
   enqueue(self_id, worker_obj, "compute_jit", 2,
           (value_t[]){ mk_int(prog_id), mk_int(task_id) });
 }
@@ -895,6 +998,8 @@ static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
   { Dispatcher_submit_jit(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "done") == 0)
   { Dispatcher_done(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "set_enabled") == 0)
+  { Dispatcher_set_enabled(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
@@ -1034,6 +1139,31 @@ void abcl_loadbal_submit_jit(int prog_id, int task_id) {
 }
 int abcl_loadbal_n_progs(void) { return N_JIT_PROGS; }
 
+void abcl_loadbal_set_enabled(int worker_idx, int on) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "set_enabled", 2,
+               (value_t[]){ mk_int((long)worker_idx), mk_int((long)on) });
+}
+
+/* Fill `buf` with one task row for /api/loadbal/task?id=N.
+ * Returns bytes written, or 0 if no such task. */
+int abcl_loadbal_task_info(int task_id, char *buf, int cap) {
+  if (cap < 200) return 0;
+  lb_task_t *t = lb_task_lookup(task_id);
+  if (NULL == t || t->task_id == 0) {
+    return sprintf(buf, "task_id=%d not_found\n", task_id);
+  }
+  long elapsed = (t->done_ms > 0) ? (t->done_ms - t->submit_ms) : -1L;
+  return sprintf(buf,
+    "task_id=%d worker_obj=%d kind=%c param=%d\n"
+    "submit_ms=%ld done_ms=%ld elapsed_ms=%ld\n"
+    "state=%s result=%ld\n",
+    t->task_id, t->worker_obj, t->kind, t->param,
+    t->submit_ms, t->done_ms, elapsed,
+    (t->done_ms > 0) ? "DONE" : "PENDING",
+    t->result);
+}
+
 /* One-shot bootstrap of the load-balancer actors.  Safe to call multiple
  * times — only the first call creates the actors.  Called from
  * webactor_autostart so the load-balancer exists even when aipl_main
@@ -1078,12 +1208,15 @@ int abcl_loadbal_stats(char *buf, int cap) {
   }
   int d = g_loadbal_disp;
   int n = (int)objects[d].fields[F_Disp_n].i;
+  long mask = objects[d].fields[F_Disp_enabled].i;
   int blen = sprintf(buf,
     "dispatcher obj=%d workers=%d submitted=%ld completed=%ld\n"
+    "enabled_mask=0x%lx (1=on per worker bit; 0xF = all four enabled)\n"
     "loads: w0=%ld w1=%ld w2=%ld w3=%ld\n",
     d, n,
     objects[d].fields[F_Disp_submitted].i,
     objects[d].fields[F_Disp_completed].i,
+    mask,
     objects[d].fields[F_Disp_load0].i,
     objects[d].fields[F_Disp_load1].i,
     objects[d].fields[F_Disp_load2].i,
