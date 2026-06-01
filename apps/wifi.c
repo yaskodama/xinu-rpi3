@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage5-b11 (scan -> AP list)"
+#define WIFI_BUILD_ID "wifi-stage5-b12b (fix Fn2 large-frame chunking)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -802,6 +802,7 @@ static int wifi_ramscan(void)
 
 extern uint8_t wifi_fw_bin[],   wifi_fw_bin_end[];
 extern uint8_t wifi_nvram_txt[], wifi_nvram_txt_end[];
+extern uint8_t wifi_clm_blob[],  wifi_clm_blob_end[];
 
 /* single-byte F1 register access (plan9 cfgr/cfgw) */
 static int  cfgr(uint32_t off) { return sdio_cmd52(1, off, 0, 0); }
@@ -963,12 +964,17 @@ static int wifi_sbenable(void)
 static uint8_t  wl_txseq;
 static uint16_t wl_reqid;
 
-/* Fn2 bulk transfer (block size 512, fixed FIFO address, no increment). */
+/* Fn2 bulk transfer to/from the fixed FIFO address (incr=0).  Split into
+ * <=512-byte byte-mode CMD53s: block-mode truncates non-block-aligned lengths
+ * and SDPCM frames are arbitrary lengths (e.g. the ~1.4 KB clmload frame). */
 static int wifi_packetrw(int write, uint8_t *buf, int len)
 {
-    /* round transfer length up to 4; the chip's frame engine pads. */
-    int n = (len + 3) & ~3;
-    return wifi_cmd53_pio(write, 2, 0 /* Enumbase&0x1FFFF */, buf, n, 0);
+    while (len > 0) {
+        int chunk = (len > 512) ? 512 : len;
+        if (wifi_cmd53_pio(write, 2, 0, buf, (chunk + 3) & ~3, 0) != 0) return -1;
+        buf += chunk; len -= chunk;
+    }
+    return 0;
 }
 
 /* Issue a firmware ioctl over the SDPCM control channel and return its reply.
@@ -978,7 +984,7 @@ static int wifi_packetrw(int write, uint8_t *buf, int len)
 static int wifi_wlcmd(int write, int op, const uint8_t *data, int dlen,
                       uint8_t *res, int rlen)
 {
-    static uint8_t pkt[768];
+    static uint8_t pkt[2048];
     int tlen = write ? (dlen + rlen) : (dlen > rlen ? dlen : rlen);
     int len = SDPCM_HDR + BCDC_HDR + tlen;
     int i, tries;
@@ -1079,12 +1085,60 @@ static int wifi_cmd_int(int op, uint32_t v)
 /* iovar SET: name\0 + value as one payload. */
 static int wifi_set_iovar(const char *name, const uint8_t *val, int vlen)
 {
-    static uint8_t b[600];
+    static uint8_t b[1600];
     int n = 0, i;
     while (name[n]) { b[n] = name[n]; n++; }
     b[n++] = '\0';
     for (i = 0; i < vlen && (n + i) < (int)sizeof(b); i++) b[n + i] = val[i];
     return wifi_wlcmd(1, WLC_SET_VAR, b, n + vlen, NULL, 0);
+}
+
+/* iovar SET with a 4-byte int value. */
+static int wifi_set_iovar_int(const char *name, uint32_t v)
+{
+    uint8_t b[4];
+    b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24;
+    return wifi_set_iovar(name, b, 4);
+}
+
+/* Upload the regulatory (CLM) blob via the "clmload" iovar.  Without valid
+ * regulatory data the firmware refuses "country" (-2) and the radio won't
+ * come up for scanning (-4).  Packet = flag[2] type[2] len[4] crc[4] data
+ * (plan9 reguload); chunked at 1400 bytes. */
+#define CLM_CHUNK   1400
+#define CLM_FLAG    0x1000          /* DL_BEGIN-ish: clm data flag */
+#define CLM_FIRST   0x0002
+#define CLM_LAST    0x0004
+static int wifi_clmload(void)
+{
+    static uint8_t buf[12 + CLM_CHUNK];
+    uint32_t total = (uint32_t)(wifi_clm_blob_end - wifi_clm_blob);
+    uint32_t off = 0;
+    int flag = CLM_FLAG | CLM_FIRST;
+
+    wifi_log("[wifi] clmload: %u bytes regulatory\r\n", total);
+    while (off < total || flag == (CLM_FLAG | CLM_FIRST)) {
+        uint32_t n = total - off;
+        int i, pad;
+        if (n > CLM_CHUNK) n = CLM_CHUNK;
+        else flag |= CLM_LAST;
+        for (i = 0; i < (int)n; i++) buf[12 + i] = wifi_clm_blob[off + i];
+        pad = 0;
+        if (flag & CLM_LAST) while ((n + pad) & 7) buf[12 + n + pad++] = 0;
+        buf[0] = flag; buf[1] = flag >> 8;        /* flag */
+        buf[2] = 2; buf[3] = 0;                   /* type = 2 */
+        buf[4] = n; buf[5] = n>>8; buf[6] = n>>16; buf[7] = n>>24;   /* len */
+        buf[8] = buf[9] = buf[10] = buf[11] = 0;  /* crc (unused) */
+        if (wifi_set_iovar("clmload", buf, 12 + n + pad) != 0) {
+            wifi_log("[wifi] clmload: chunk at %u failed\r\n", off);
+            return -1;
+        }
+        off += n;
+        flag &= ~CLM_FIRST;
+        if (off >= total) break;
+    }
+    wifi_log("[wifi] clmload: done\r\n");
+    return 0;
 }
 
 /* ================================================================== *
@@ -1111,7 +1165,9 @@ static const uint8_t escan_params[] = {
     0xff,0xff,0xff,0xff, /* passive_time */
     0xff,0xff,0xff,0xff, /* home_time */
     14,0,               /* nchannels */
-    1,0,                /* nssids */
+    0,0,                /* nssids = 0 (broadcast scan; no directed-SSID entries
+                           — avoids the per-ssid 36-byte buffer requirement
+                           that made fw 7.45.265 return BCME_BUFTOOSHORT -14) */
     0x01,0x2b,0x02,0x2b,0x03,0x2b,0x04,0x2b,0x05,0x2e,0x06,0x2e,0x07,0x2e,
     0x08,0x2b,0x09,0x2b,0x0a,0x2b,0x0b,0x2b,0x0c,0x2b,0x0d,0x2b,0x0e,0x2b,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* ssid */
@@ -1145,6 +1201,27 @@ static int wifi_scan(int *out_count)
     int nseen = 0, tries, chan, doff, i;
 
     *out_count = 0;
+    /* load regulatory (CLM) first — required before country/up on this fw */
+    if (wifi_clmload() != 0)
+        wifi_log("[wifi] scan: clmload failed (continuing)\r\n");
+    /* The radio must be UP for escan (fw returns BCME_NOTUP -4 otherwise), and
+     * it won't stay up without regulatory (country) + power management off. */
+    {
+        uint8_t cc[12];
+        for (i = 0; i < 12; i++) cc[i] = 0;
+        cc[0] = 'U'; cc[1] = 'S';                 /* country_ie  = "US" */
+        cc[4] = cc[5] = cc[6] = cc[7] = 0xFF;     /* revision = -1 */
+        cc[8] = 'U'; cc[9] = 'S';                 /* country_code = "US" */
+        if (wifi_set_iovar("country", cc, 12) != 0)
+            wifi_log("[wifi] scan: set country failed (continuing)\r\n");
+    }
+    if (wifi_set_iovar_int("mpc", 0) != 0)       /* min-power-consumption off */
+        wifi_log("[wifi] scan: set mpc=0 failed (continuing)\r\n");
+    if (wifi_cmd_int(2, 1) != 0)                  /* WLC_UP */
+        wifi_log("[wifi] scan: WLC_UP returned error (continuing)\r\n");
+    else
+        wifi_log("[wifi] scan: WLC_UP ok\r\n");
+    wifi_delay_us(150000);
     wifi_cmd_int(WLC_PASSIVE_SCAN, 0);
     if (wifi_set_iovar("escan", escan_params, sizeof(escan_params)) != 0) {
         wifi_log("[wifi] scan: escan start failed\r\n");

@@ -30,4 +30,10 @@ asm(
     ".globl wifi_nvram_txt_end\n"
     "wifi_nvram_txt_end:\n"
     ".balign 4\n"
+    ".globl wifi_clm_blob\n"
+    "wifi_clm_blob:\n"
+    "  .incbin \"/Users/kodamay/projects/xinu-raz/xinu/wifi-fw/clm_43455.blob\"\n"
+    ".globl wifi_clm_blob_end\n"
+    "wifi_clm_blob_end:\n"
+    ".balign 4\n"
 );
