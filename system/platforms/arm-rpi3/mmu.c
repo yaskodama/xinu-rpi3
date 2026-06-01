@@ -146,16 +146,23 @@ void mmu_init(void)
         "movw r1, #0x5555\n"
         "movt r1, #0x5555\n"
         "mcr p15, 0, r1, c3, c0, 0\n"
-        /* (4) Invalidate TLB (entire) */
+        /* (4) Invalidate TLB (entire) + I-cache (ICIALLU) + BP */
         "mov r1, #0\n"
-        "mcr p15, 0, r1, c8, c7, 0\n"
+        "mcr p15, 0, r1, c8, c7, 0\n"   /* TLBIALL */
+        "mcr p15, 0, r1, c7, c5, 0\n"   /* ICIALLU — invalidate I-cache */
+        "mcr p15, 0, r1, c7, c5, 6\n"   /* BPIALL — invalidate branch pred */
         /* (5) DSB + ISB so all invalidations + table writes drain */
         "dsb\n"
         "isb\n"
-        /* (6) SCTLR — read, set ONLY M (MMU), write back.  Do NOT
-         * set C/I/Z here — see big comment at top of file. */
+        /* (6) SCTLR — enable MMU (M) + I-cache (I).  D-cache (C) is LEFT
+         * OFF: enabling it would break the USB-ethernet / framebuffer DMA
+         * paths (which hand uncached bus aliases to the GPU/DMA) without
+         * cache-maintenance.  I-cache has no such DMA hazard and speeds up
+         * compute (e.g. PBKDF2).  ★ self-modifying code (cc_mvp JIT) must
+         * ICIALLU after writing instructions now that I-cache is on. */
         "mrc p15, 0, r1, c1, c0, 0\n"
-        "orr r1, r1, #(1 << 0)\n"    /* M = MMU enable */
+        "orr r1, r1, #(1 << 0)\n"     /* M = MMU enable */
+        "orr r1, r1, #(1 << 12)\n"    /* I = instruction cache enable */
         "mcr p15, 0, r1, c1, c0, 0\n"
         /* (7) ISB so the next fetch sees MMU on */
         "isb\n"

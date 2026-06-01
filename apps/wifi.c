@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b15 (assoc + observe EAPOL forwarding)"
+#define WIFI_BUILD_ID "wifi-stage6-b16 (I-cache; assoc, host keeps PMK, observe EAPOL)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1685,9 +1685,11 @@ static int wifi_do_join(const char *ssid, const char *pass)
     }
     wifi_cmd_int(2, 1);                          /* WLC_UP */
     wifi_delay_us(50000);
-    /* set the PMK while the interface is UP (WSEC_PMK -2'd when down) */
-    if (secured && wifi_set_pmk(ssid, sl, pass, pl) != 0)
-        wifi_log("[wifi] join: WSEC_PMK returned error (continuing)\r\n");
+    /* host-supplicant model: the fw has no FWSUP and rejects WSEC_PMK (-2), so
+     * we do NOT hand it the PMK.  We associate (open auth + RSN assoc); the AP
+     * then runs the 4-way handshake which the fw forwards to us as EAPOL data
+     * frames.  (PMK derivation + the handshake itself is the next step.) */
+    (void)pl;
 
     /* build the extended "join" iovar (brcmf_ext_join_params_le, 114 B):
      *   [0..35]   ssid_le (len + ssid[32])

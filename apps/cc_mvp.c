@@ -686,6 +686,17 @@ int cc_mvp_compile_and_run(const char *src, long *retval, int *codesize)
 
     *codesize = at * 4;
 
+    /* Now that the I-cache is enabled (arm-rpi3 mmu.c), freshly-written JIT
+     * instructions may be stale in the I-cache.  Invalidate it before
+     * executing (D-cache is off so the writes are already in RAM). */
+    asm volatile (
+        "dsb\n"
+        "mov r0, #0\n"
+        "mcr p15, 0, r0, c7, c5, 0\n"   /* ICIALLU */
+        "dsb\n"
+        "isb\n"
+        ::: "r0", "memory");
+
     long (*entry)(void) = (long (*)(void))code;
     *retval = entry();
     /* Execution complete — entry() returned, no live use of `code` remains.
