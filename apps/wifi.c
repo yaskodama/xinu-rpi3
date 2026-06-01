@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage1-b5 (trust firmware WIFI_CLK)"
+#define WIFI_BUILD_ID "wifi-stage1-b6 (BCM SDHCI write-delay erratum)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -188,6 +188,26 @@ const char *wifi_trace(void) { return wifi_tbuf; }
 static void wifi_udelay(volatile unsigned long n)
 {
     while (n--) { asm volatile("nop"); }
+}
+
+/* Precise microsecond delay via the BCM free-running system timer (1 MHz). */
+#define SYSTIMER_CLO (*(volatile uint32_t *)(0x3F003000UL + 0x04))
+static void wifi_delay_us(uint32_t us)
+{
+    uint32_t start = SYSTIMER_CLO;
+    while ((SYSTIMER_CLO - start) < us) { /* spin */ }
+}
+
+/* Write an EMMC/SDHCI register, then honour the BCM2835 Arasan erratum: at the
+ * <=400 kHz init clock, successive register writes within ~2 SD clocks can be
+ * LOST (clock-domain crossing).  sdhci-iproc delays ~4 SD clocks (~10us @
+ * 400kHz) after each write; bcm2835-mmc ~6us.  Without this the command/clock
+ * register writes silently vanish and CMD5 never actually issues -> the CMD5
+ * timeout we were chasing.  The DATA register is exempt (per the erratum). */
+static void ew(volatile uint32_t *reg, uint32_t val)
+{
+    *reg = val;
+    wifi_delay_us(12);   /* generous: > 4 SD clocks at 400 kHz */
 }
 
 /* ================================================================== *
@@ -363,10 +383,10 @@ static int emmc_reset_clock(uint32_t divisor)
     int t;
 
     /* full host-circuit reset */
-    EMMC_CONTROL1 |= C1_SRST_HC;
+    ew(&EMMC_CONTROL1, EMMC_CONTROL1 | C1_SRST_HC);
     for (t = 0; t < 100000; t++) {
         if (!(EMMC_CONTROL1 & C1_SRST_HC)) break;
-        wifi_udelay(100);
+        wifi_delay_us(100);
     }
     if (EMMC_CONTROL1 & C1_SRST_HC) {
         wifi_log("[wifi]   SRST_HC did not clear (controller dead?)\r\n");
@@ -377,8 +397,7 @@ static int emmc_reset_clock(uint32_t divisor)
      * CONTROL0 bits 8-11): bit8 = SD_BUS_POWER, bits9-11 = voltage select
      * (0b111 = 3.3V).  May be a no-op on the BCM EMMC (which powers the bus
      * via firmware/GPIO) but is harmless and required by spec on real SDHCI. */
-    EMMC_CONTROL0 = (EMMC_CONTROL0 & ~0xF00u) | (1u << 8) | (7u << 9);
-    wifi_udelay(2000);
+    ew(&EMMC_CONTROL0, (EMMC_CONTROL0 & ~0xF00u) | (1u << 8) | (7u << 9));
 
     /* program the SD clock: 8-bit divided-clock mode (SDHCI v3 uses the
      * low 8 bits of the divisor in [15:8] plus the upper 2 bits in [7:6]). */
@@ -387,18 +406,18 @@ static int emmc_reset_clock(uint32_t divisor)
     c1 |= C1_CLK_INTLEN | C1_TOUNIT_MAX;
     c1 |= (divisor & 0xFF) << 8;
     c1 |= ((divisor >> 8) & 0x3) << 6;
-    EMMC_CONTROL1 = c1;
+    ew(&EMMC_CONTROL1, c1);
 
     for (t = 0; t < 100000; t++) {
         if (EMMC_CONTROL1 & C1_CLK_STABLE) break;
-        wifi_udelay(100);
+        wifi_delay_us(100);
     }
     if (!(EMMC_CONTROL1 & C1_CLK_STABLE)) {
         wifi_log("[wifi]   internal clock never stabilised\r\n");
         return -1;
     }
-    EMMC_CONTROL1 |= C1_CLK_EN;            /* gate clock to the chip */
-    wifi_udelay(20000);
+    ew(&EMMC_CONTROL1, EMMC_CONTROL1 | C1_CLK_EN);   /* gate clock to the chip */
+    wifi_delay_us(2000);
     return 0;
 }
 
@@ -429,9 +448,9 @@ static int emmc_host_init(void)
         return -1;
 
     /* enable all normal-interrupt status bits (polled, not IRQ) */
-    EMMC_IRPT_EN   = 0xFFFFFFFFu;
-    EMMC_IRPT_MASK = 0xFFFFFFFFu;
-    EMMC_INTERRUPT = 0xFFFFFFFFu;          /* clear stale */
+    ew(&EMMC_IRPT_EN,   0xFFFFFFFFu);
+    ew(&EMMC_IRPT_MASK, 0xFFFFFFFFu);
+    ew(&EMMC_INTERRUPT, 0xFFFFFFFFu);      /* clear stale */
     wifi_log("[wifi] SDHCI init done: CONTROL0=0x%08x CONTROL1=0x%08x STATUS=0x%08x\r\n",
              EMMC_CONTROL0, EMMC_CONTROL1, EMMC_STATUS);
     return 0;
@@ -448,17 +467,17 @@ static int emmc_cmd(uint32_t cmd_idx, uint32_t arg, uint32_t resp_flags,
     for (t = 0; t < 1000000; t++) {
         if (!(EMMC_STATUS & SR_CMD_INHIBIT)) break;
     }
-    EMMC_INTERRUPT = 0xFFFFFFFFu;
+    ew(&EMMC_INTERRUPT, 0xFFFFFFFFu);
 
     if (read_4byte) {
-        EMMC_BLKSIZECNT = (1u << 16) | 4;   /* 1 block of 4 bytes */
+        ew(&EMMC_BLKSIZECNT, (1u << 16) | 4);   /* 1 block of 4 bytes */
     }
 
-    EMMC_ARG1  = arg;
+    ew(&EMMC_ARG1, arg);
     cmd = (cmd_idx << 24) | resp_flags;
     if (read_4byte)
         cmd |= CMD_ISDATA | TM_DAT_DIR_CH;
-    EMMC_CMDTM = cmd;
+    ew(&EMMC_CMDTM, cmd);   /* erratum-safe: spaced write so the command issues */
 
     /* wait for CMD_DONE or error */
     for (t = 0; t < 1000000; t++) {
