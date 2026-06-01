@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b27 (FWSUP; broadcast scan-all join + iovar rc log)"
+#define WIFI_BUILD_ID "wifi-stage6-b28 (FWSUP; infra/UP before scan, no DOWN after)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1728,31 +1728,29 @@ static int wifi_do_join(const char *ssid, const char *pass)
 
     wifi_radio_up();                             /* event_msgs/clm/country/pm */
 
-    /* Locate the target AP first: a plain scan finds it (the standalone scan
-     * works), capturing its BSSID + real firmware chanspec.  A broadcast +
-     * scan-all "join" only ever reached PROBREQ on this fw; a directed join to
-     * the exact BSSID/chanspec is how ether4330/brcmfmac actually associate. */
+    /* Establish infra (managed STA) mode + UP ONCE, before scanning/joining.
+     * brcmf_cfg80211_connect runs with the interface already up in infra mode
+     * and never toggles DOWN afterwards — toggling DOWN after the scan (as we
+     * did) left the fw mid-scan / cleared state so the join never associated. */
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_cmd_int(WLC_SET_INFRA, 1);
+    wifi_cmd_int(2, 1);                          /* WLC_UP */
+    wifi_delay_us(50000);
+
+    /* A prior scan populates the firmware's BSS cache (brcmfmac always connects
+     * after a cfg80211 scan).  Keep it directed by SSID for the header diag,
+     * but DON'T toggle DOWN/UP afterwards — go straight to the iovars + join. */
     {
         int n = 0, j;
         wifi_tgt_slen = sl; wifi_tgt_found = 0; wifi_tgt_set = 1;
         for (j = 0; j < sl && j < 32; j++) wifi_tgt_ssid[j] = ssid[j];
         wifi_scan(&n);
         wifi_tgt_set = 0;
-        /* Reset the trace buffer here so /api/wifi/trace shows ONLY the join
-         * phase (the bring-up + locate-scan would otherwise fill all 8000 B
-         * and the join's iovar/PMK/event lines would be lost). */
-        wifi_tn = 0;
+        wifi_tn = 0;                             /* trace shows only join phase */
         wifi_log("[wifi] === JOIN PHASE === ssid=\"%s\" tgt=%d chanspec=0x%04x\r\n",
                  ssid, wifi_tgt_found, wifi_tgt_chanspec);
     }
 
-    /* Establish infra (managed STA) mode, then bring the interface UP and keep
-     * it up — brcmf_cfg80211_connect sets all security via iovars with the
-     * interface UP and never toggles DOWN (a DOWN was clearing our settings). */
-    wifi_cmd_int(WLC_DOWN, 1);
-    wifi_cmd_int(WLC_SET_INFRA, 1);
-    wifi_cmd_int(2, 1);                          /* WLC_UP */
-    wifi_delay_us(50000);
     if (secured) {
         /* Match brcmf_cfg80211_connect exactly — every security parameter is a
          * (bsscfg, idx 0 => plain) IOVAR, not a WLC_SET_* command.  Order:
