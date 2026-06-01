@@ -1506,6 +1506,68 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wifi/scan — scan and return the AP list as JSON (for a
+             *   selection UI). */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/scan",  18) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/scan", 19))
+            {
+                extern int wifi_scan_json(char *, int);
+                static char wjson[4096];
+                static char wjhdr[120];
+                int blen = wifi_scan_json(wjson, sizeof(wjson));
+                int hlen = sprintf(wjhdr,
+                               "HTTP/1.0 200 OK\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Content-Length: %d\r\n\r\n", blen);
+                write(tcpdev, wjhdr, hlen);
+                write(tcpdev, wjson, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/wifi/join?ssid=NAME&pass=PASS — connect to an AP (WPA2-PSK
+             *   if pass given, else open).  Full [wifi] trace in the reply. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/join",  18) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/join", 19))
+            {
+                extern int wifi_join(const char *, const char *);
+                extern const char *wifi_trace(void);
+                static char ssid[40], pass[68];
+                const char *url = strchr(reqbuf, ' ');
+                const char *q = url ? strchr(url, '?') : NULL;
+                int rc, blen, hlen; const char *tr;
+                static char jhdr[160];
+                ssid[0] = pass[0] = '\0';
+                if (q) {
+                    const char *p = q + 1;
+                    while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+                        char *dst = NULL; int dcap = 0, k = 0;
+                        if (0 == strncmp(p, "ssid=", 5)) { dst = ssid; dcap = sizeof(ssid)-1; p += 5; }
+                        else if (0 == strncmp(p, "pass=", 5)) { dst = pass; dcap = sizeof(pass)-1; p += 5; }
+                        while (*p && *p != '&' && *p != ' ' && *p != '\r' && *p != '\n') {
+                            if (dst && k < dcap) {
+                                char c = *p;
+                                if (c == '+') c = ' ';   /* minimal urldecode */
+                                dst[k++] = c;
+                            }
+                            p++;
+                        }
+                        if (dst) dst[k] = '\0';
+                        if (*p == '&') p++;
+                    }
+                }
+                rc = wifi_join(ssid, pass);
+                tr = wifi_trace();
+                blen = 0; while (tr[blen] && blen < 3900) blen++;
+                hlen = sprintf(jhdr,
+                               "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                               "X-Wifi-RC: %d\r\nContent-Length: %d\r\n\r\n", rc, blen);
+                write(tcpdev, jhdr, hlen);
+                write(tcpdev, (void *)tr, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/init — spin up Dispatcher + 4 Workers if
              *   not already running.  Idempotent.  After cold boot
              *   the load-balancer actors don't exist; this creates

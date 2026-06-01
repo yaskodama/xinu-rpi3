@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage5-b12d (enable event_msgs so fw pushes results)"
+#define WIFI_BUILD_ID "wifi-stage6-b13 (scan JSON + WPA2 join)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1194,6 +1194,38 @@ static int wifi_read_frame(uint8_t *buf, int cap, int *chan, int *doff)
 
 /* Run a scan and append the discovered APs to the trace.  out_count gets the
  * number of unique APs found.  Returns 0 on success. */
+/* One-time radio bring-up needed before scan/join: enable fw events, load
+ * regulatory (CLM), set country + power management.  Idempotent. */
+static int wifi_radio_done = 0;
+static void wifi_radio_up(void)
+{
+    int i;
+    if (wifi_radio_done) return;
+    {
+        uint8_t em[16];                           /* enable all fw events */
+        for (i = 0; i < 16; i++) em[i] = 0xFF;
+        if (wifi_set_iovar("event_msgs", em, 16) != 0)
+            wifi_log("[wifi] radio: event_msgs failed (continuing)\r\n");
+        else
+            wifi_log("[wifi] radio: event_msgs enabled\r\n");
+    }
+    wifi_cmd_int(0x56, 0);                         /* WLC_SET_PM = 0 */
+    if (wifi_clmload() != 0)                       /* regulatory firmware */
+        wifi_log("[wifi] radio: clmload failed (continuing)\r\n");
+    {
+        uint8_t cc[12];
+        for (i = 0; i < 12; i++) cc[i] = 0;
+        cc[0] = 'U'; cc[1] = 'S';
+        cc[4] = cc[5] = cc[6] = cc[7] = 0xFF;      /* revision = -1 */
+        cc[8] = 'U'; cc[9] = 'S';
+        if (wifi_set_iovar("country", cc, 12) != 0)
+            wifi_log("[wifi] radio: set country failed (continuing)\r\n");
+    }
+    if (wifi_set_iovar_int("mpc", 0) != 0)
+        wifi_log("[wifi] radio: set mpc=0 failed (continuing)\r\n");
+    wifi_radio_done = 1;
+}
+
 static int wifi_scan(int *out_count)
 {
     static uint8_t fr[2048];
@@ -1201,34 +1233,7 @@ static int wifi_scan(int *out_count)
     int nseen = 0, tries, chan, doff, i;
 
     *out_count = 0;
-    /* Enable firmware event reporting — without this the fw runs the scan but
-     * never PUSHES the WLC_E_ESCAN_RESULT events, so we saw frames=0.  16-byte
-     * bitmask, all enabled (plan9 wlinit). */
-    {
-        uint8_t em[16];
-        for (i = 0; i < 16; i++) em[i] = 0xFF;
-        if (wifi_set_iovar("event_msgs", em, 16) != 0)
-            wifi_log("[wifi] scan: event_msgs failed (continuing)\r\n");
-        else
-            wifi_log("[wifi] scan: event_msgs enabled\r\n");
-    }
-    wifi_cmd_int(0x56, 0);   /* WLC_SET_PM = 0 (powersave off) */
-    /* load regulatory (CLM) first — required before country/up on this fw */
-    if (wifi_clmload() != 0)
-        wifi_log("[wifi] scan: clmload failed (continuing)\r\n");
-    /* The radio must be UP for escan (fw returns BCME_NOTUP -4 otherwise), and
-     * it won't stay up without regulatory (country) + power management off. */
-    {
-        uint8_t cc[12];
-        for (i = 0; i < 12; i++) cc[i] = 0;
-        cc[0] = 'U'; cc[1] = 'S';                 /* country_ie  = "US" */
-        cc[4] = cc[5] = cc[6] = cc[7] = 0xFF;     /* revision = -1 */
-        cc[8] = 'U'; cc[9] = 'S';                 /* country_code = "US" */
-        if (wifi_set_iovar("country", cc, 12) != 0)
-            wifi_log("[wifi] scan: set country failed (continuing)\r\n");
-    }
-    if (wifi_set_iovar_int("mpc", 0) != 0)       /* min-power-consumption off */
-        wifi_log("[wifi] scan: set mpc=0 failed (continuing)\r\n");
+    wifi_radio_up();
     if (wifi_cmd_int(2, 1) != 0)                  /* WLC_UP */
         wifi_log("[wifi] scan: WLC_UP returned error (continuing)\r\n");
     else
@@ -1303,15 +1308,17 @@ static int wifi_scan(int *out_count)
 }
 
 /* ================================================================== *
- *  Public: power on the chip and probe its SDIO identity + chip-id.  *
+ *  Bring the chip fully up (Stages 1-4): SDIO host, chip detect,     *
+ *  firmware download, SDPCM ioctl.  Idempotent per boot (wifi_ready). *
  * ================================================================== */
-int wifi_probe(void)
+static int wifi_ready = 0;
+static int wifi_bringup(void)
 {
     uint32_t ocr = 0, rca = 0, chipid = 0;
     int r, ioe;
 
-    wifi_tn = 0;                /* reset trace buffer for this run */
-    wifi_log("[wifi] === BCM43455 SDIO bring-up (Stage 1+2) ===\r\n");
+    if (wifi_ready) { wifi_log("[wifi] (chip already up)\r\n"); return 0; }
+    wifi_log("[wifi] === BCM43455 SDIO bring-up ===\r\n");
     wifi_log("[wifi] build: %s\r\n", WIFI_BUILD_ID);
 
     /* 0a. ROUTING CHECK: read the firmware's GPIO function-select for
@@ -1530,15 +1537,159 @@ int wifi_probe(void)
         wifi_log("[wifi] firmware version: %s\r\n", (char *)ver);
         wifi_log("[wifi] Stage 4 — SDPCM ioctl works (fw responds)\r\n");
     }
-
-    /* ---- Stage 5: scan for access points ---- */
-    {
-        int n = 0;
-        if (wifi_scan(&n) != 0) {
-            wifi_log("[wifi] FAILED: scan\r\n");
-            return -1;
-        }
-        wifi_log("[wifi] *** SUCCESS: Stage 5 — scan found %d access point(s) ***\r\n", n);
-    }
+    wifi_ready = 1;
     return 0;
+}
+
+/* ================================================================== *
+ *  Stage 6 — join a (WPA2-PSK) access point                          *
+ * ================================================================== */
+#define WLC_DOWN        3
+#define WLC_SET_INFRA   20
+#define WLC_SET_WSEC    134
+#define WLC_SET_WPA_AUTH 165
+#define WLC_SET_WSEC_PMK 268
+#define WLC_SET_SSID    26
+
+/* Configure WPA2-PSK security and hand the firmware the passphrase (the fw's
+ * internal supplicant derives the PMK + runs the 4-way handshake). */
+static int wifi_set_passphrase(const char *pass)
+{
+    uint8_t pmk[2 + 2 + 64];
+    int n = 0, i;
+    while (pass[n] && n < 63) n++;
+    for (i = 0; i < (int)sizeof(pmk); i++) pmk[i] = 0;
+    pmk[0] = n; pmk[1] = n >> 8;          /* key_len */
+    pmk[2] = 1; pmk[3] = 0;               /* flags = WSEC_PASSPHRASE */
+    for (i = 0; i < n; i++) pmk[4 + i] = pass[i];
+    return wifi_wlcmd(1, WLC_SET_WSEC_PMK, pmk, sizeof(pmk), NULL, 0);
+}
+
+/* Join an AP.  pass==NULL/"" => open network; otherwise WPA2-PSK. */
+static int wifi_do_join(const char *ssid, const char *pass)
+{
+    uint8_t jp[72];
+    int sl = 0, i, ev, secured = (pass && pass[0]);
+
+    while (ssid[sl] && sl < 32) sl++;
+    wifi_log("[wifi] join: ssid=\"%s\" %s\r\n", ssid, secured ? "WPA2-PSK" : "open");
+
+    wifi_radio_up();                             /* event_msgs/clm/country/pm */
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_cmd_int(WLC_SET_INFRA, 1);
+    if (secured) {
+        wifi_cmd_int(WLC_SET_WSEC, 4);          /* AES */
+        wifi_set_iovar_int("wpa_auth", 0x80);   /* WPA2-PSK */
+        wifi_cmd_int(165 /*WLC_SET_WPA_AUTH*/, 0x80);
+        wifi_set_iovar_int("sup_wpa", 1);       /* in-firmware supplicant */
+        if (wifi_set_passphrase(pass) != 0)
+            wifi_log("[wifi] join: set passphrase returned error (continuing)\r\n");
+    } else {
+        wifi_cmd_int(WLC_SET_WSEC, 0);
+        wifi_set_iovar_int("wpa_auth", 0);
+    }
+    wifi_cmd_int(2, 1);                          /* WLC_UP */
+    wifi_delay_us(50000);
+
+    /* build the "join" iovar params (ssidlen, ssid[32], scan defaults, any
+     * bssid, no channel list) */
+    for (i = 0; i < (int)sizeof(jp); i++) jp[i] = 0;
+    jp[0] = sl;                                  /* ssid len */
+    for (i = 0; i < sl; i++) jp[4 + i] = ssid[i];
+    /* offset 36: scan_type(4)=0xff, nprobes(4)=-1, active(4)=-1, passive(4)=-1,
+     * home(4)=-1, bssid(6)=ff.., pad(2), nchans(4)=0 */
+    jp[36] = 0xFF; jp[37] = 0xFF; jp[38] = 0xFF; jp[39] = 0xFF;  /* scan_type */
+    for (i = 40; i < 56; i++) jp[i] = 0xFF;      /* nprobes/active/passive */
+    for (i = 56; i < 60; i++) jp[i] = 0xFF;      /* home_time */
+    for (i = 60; i < 66; i++) jp[i] = 0xFF;      /* bssid = broadcast */
+    /* jp[66..67] pad, jp[68..71] nchans = 0 */
+    if (wifi_set_iovar("join", jp, 72 - 4) != 0) {
+        wifi_log("[wifi] join: 'join' iovar failed\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] join: request sent, waiting for link event...\r\n");
+
+    /* wait for E_SET_SSID(0)/E_LINK(16)/E_PSK_SUP success or a deauth */
+    {
+        static uint8_t fr[2048];
+        int chan, doff, tries;
+        for (tries = 0; tries < 1500; tries++) {
+            int len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (len < 0) break;
+            if (len == 0) { wifi_delay_us(10000); continue; }
+            if (chan != 1) continue;
+            if (len < doff + 4) continue;
+            {
+                int bdc = 4 + (fr[doff + 3] << 2);
+                uint8_t *evp = fr + doff + bdc;
+                long status;
+                if ((int)(evp - fr) + 24 + 16 > len) continue;
+                ev = (evp[24 + 6] << 8) | evp[24 + 7];
+                status = (evp[24+8]<<24)|(evp[24+9]<<16)|(evp[24+10]<<8)|evp[24+11];
+                if (ev == 16) {                  /* E_LINK */
+                    int up = (evp[24+2] << 8 | evp[24+3]) & 1;
+                    wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP — connected!" : "down");
+                    if (up) return 0;
+                } else if (ev == 0 || ev == 46) { /* E_SET_SSID / E_PSK_SUP */
+                    wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
+                    if (ev == 0 && status == 0) { /* SET_SSID ok */ }
+                } else if (ev == 5 || ev == 6 || ev == 12) {
+                    wifi_log("[wifi] join: deauth/disassoc event %d (auth failed?)\r\n", ev);
+                    return -1;
+                }
+            }
+        }
+    }
+    wifi_log("[wifi] join: no link-up within timeout\r\n");
+    return -1;
+}
+
+/* ================================================================== *
+ *  Public entry points (called from the HTTP routes in webactor.c)   *
+ * ================================================================== */
+int wifi_probe(void)
+{
+    int n = 0;
+    wifi_tn = 0;
+    if (wifi_bringup() != 0) return -1;
+    if (wifi_scan(&n) != 0) { wifi_log("[wifi] FAILED: scan\r\n"); return -1; }
+    wifi_log("[wifi] *** SUCCESS: scan found %d access point(s) ***\r\n", n);
+    return 0;
+}
+
+/* Scan and emit the AP list as JSON into out (for the selection UI). */
+int wifi_scan_json(char *out, int cap)
+{
+    /* run a fresh scan (bring-up is cached), then format wifi_tbuf's AP lines */
+    int n = 0, len = 0, i;
+    wifi_tn = 0;
+    if (wifi_bringup() != 0) return sprintf(out, "{\"error\":\"bringup failed\"}");
+    wifi_scan(&n);
+    /* parse the "[wifi] AP  N: \"ssid\" bssid ch=.. rssi=.." lines from the trace */
+    len += sprintf(out + len, "{\"aps\":[");
+    {
+        const char *t = wifi_tbuf;
+        int first = 1;
+        for (i = 0; t[i] && len < cap - 200; i++) {
+            if (t[i]=='A'&&t[i+1]=='P'&&t[i+2]==' ') {
+                const char *q = &t[i];
+                int j = 0; char line[160];
+                while (q[j] && q[j] != '\r' && q[j] != '\n' && j < 159) { line[j]=q[j]; j++; }
+                line[j] = '\0';
+                len += sprintf(out + len, "%s\"%s\"", first ? "" : ",", line);
+                first = 0;
+                i += j;
+            }
+        }
+    }
+    len += sprintf(out + len, "],\"count\":%d}", n);
+    return len;
+}
+
+/* Join (connect to) an access point. */
+int wifi_join(const char *ssid, const char *pass)
+{
+    wifi_tn = 0;
+    if (wifi_bringup() != 0) return -1;
+    return wifi_do_join(ssid, pass);
 }
