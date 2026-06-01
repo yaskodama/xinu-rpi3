@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage1-b6 (BCM SDHCI write-delay erratum)"
+#define WIFI_BUILD_ID "wifi-stage1-b7 (free Arasan from SD card: GPIO48-53 ALT0)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -91,6 +91,7 @@ const char *wifi_trace(void) { return wifi_tbuf; }
 #define GPPUDCLK0          (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x98))
 #define GPPUDCLK1          (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x9C)) /* GPIO32-53 */
 #define GPFSEL4            (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x10)) /* GPIO40-49 */
+#define GPFSEL5            (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x14)) /* GPIO50-59 */
 
 /* Clock manager (GPCLK2 = WIFI_CLK on GPIO43, dts gpclk2_gpio43). */
 #define WIFI_CM_BASE       0x3F101000UL
@@ -330,8 +331,28 @@ static void wifi_clk_setup(void)
  * ================================================================== */
 static void wifi_gpio_sdio(void)
 {
-    uint32_t sel = GPFSEL3;
+    uint32_t sel;
     int pin;
+
+    /* ★ Disconnect the Arasan EMMC from the SD-card pins so it is free to
+     * drive the WiFi SDIO bus.  The Arasan can mux to EITHER GPIO48-53 (SD
+     * card) or GPIO34-39 (WiFi) via ALT3.  If the firmware left GPIO48-53 at
+     * ALT3 (Arasan on the card — the Pi1/2 legacy default), the controller
+     * stays on the card and our GPIO34-39 ALT3 never reaches the chip ->
+     * CMD5 timeout.  plan9/Circle's Pi3 path sets GPIO48-53 to ALT0 (routes
+     * the card to the separate SDHOST controller) precisely for this reason.
+     * GPIO48-49 are in GPFSEL4 [24:29]; GPIO50-53 in GPFSEL5 [0:11].  ALT0=4.
+     * (We do not use the SD card at runtime, so moving it is safe.) */
+    sel = GPFSEL4;
+    sel &= ~((7u << 24) | (7u << 27));
+    sel |=  ((4u << 24) | (4u << 27));         /* GPIO48,49 -> ALT0 */
+    GPFSEL4 = sel;
+    sel = GPFSEL5;
+    sel &= ~((7u << 0) | (7u << 3) | (7u << 6) | (7u << 9));
+    sel |=  ((4u << 0) | (4u << 3) | (4u << 6) | (4u << 9)); /* GPIO50-53 -> ALT0 */
+    GPFSEL5 = sel;
+
+    sel = GPFSEL3;
     /* GPIO34-39 live in GPFSEL3; pin p uses bits [3*(p-30) .. +2].
      * ALT3 = 0b111. */
     for (pin = 34; pin <= 39; pin++) {
@@ -587,6 +608,14 @@ int wifi_probe(void)
                      (alt == 0) ? "input" : "other");
         }
         wifi_log("[wifi]   GPIO43 (WIFI_CLK) fsel=%d\r\n", (f4 >> 9) & 7);
+        /* SD-card pins 48-53: if these read ALT3(=7) the Arasan is on the
+         * card (the conflict b7 fixes by moving them to ALT0). */
+        {
+            uint32_t f5 = GPFSEL5;
+            wifi_log("[wifi]   GPIO48=%d 49=%d 50=%d 51=%d 52=%d 53=%d (card pins; 7=Arasan-on-card)\r\n",
+                     (f4 >> 24) & 7, (f4 >> 27) & 7,
+                     (f5 >> 0) & 7, (f5 >> 3) & 7, (f5 >> 6) & 7, (f5 >> 9) & 7);
+        }
     }
 
     /* 0b. start the chip's reference clock (GPCLK2/WIFI_CLK) BEFORE releasing
