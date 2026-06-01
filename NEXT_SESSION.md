@@ -20,9 +20,9 @@
 - ✅ TCP upload ~26 KB/s (IBLEN bump 後)
 
 **2026-05-27**: ethernet ping 完全動作 (LAN78xx ドライバ + DWC NAK 修正)
-**2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1+2 + GC actor を一気に積み上げ (34 commits)
+**2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1+2 + GC actor + N-Queens 分散ベンチ (LaTeX PDF レポート付) + dining 5 哲学者ベンチ WIP — 計 **39 commits**
 
-## 2026-06-01 セッション概要 (34 commits)
+## 2026-06-01 セッション概要 (39 commits)
 
 ```
 3f9fb9e  cc_mvp MVP — int main() { return CONST; }
@@ -48,7 +48,12 @@ b7e5b5e  loadbal — pause/resume + per-task tracking + enabled mask
 8d1ef4b  NEXT_SESSION refresh (30 commits 全反映)
 53d29bd  loadbal Tier 2 — sticky routing + worker restart + prefix-collision fix
 50b3366  loadbal Tier 2 rest — rate limit + task timeout + priority
-456d247  version.h refresh                                       ← 最新
+456d247  version.h refresh
+2051ec8  NEXT_SESSION refresh for Tier 2
+a0f2a93  N-Queens benchmark — Mac + Pi 3 distributed + LaTeX/PDF report
+41c3e5f  docs: N-Queens report — Japanese + embedded source-code listings
+6677955  examples: N-Queens 分散実装を AIPL で記述、レポートも AIPL ソースに切替
+626a804  dining philosophers 5 人ベンチ WIP (3/5 で止まる、次セッション対応)  ← 最新
 ```
 
 ## 重要な追加機能 (このセッション)
@@ -106,6 +111,53 @@ HTTP: `POST /compile` with C source as body。
 
 **Tier 2 prefix-collision バグ fix**: `/api/loadbal/submit` (23 chars) が `/api/loadbal/submit-sticky`
 にも match して sticky が non-sticky path に落ちていた → 次の char が `?`/` ` の guard 追加で修正。
+
+### N-Queens 分散ベンチ + PDF レポート (commits a0f2a93 / 41c3e5f / 6677955)
+
+実装ファイル一式:
+- `examples/nqueens_distributed_xinu.abcl` — Pi 3 用 AIPL ソース (type-inference-clean, send-only)
+- `examples/nqueens_distributed_mac.abcl` — Mac OCaml AIPL 用 (send / now / future 3 種類を実演)
+- `apps/abcl_program.c` — N-Queens 計算カーネル + Worker.compute_nq + Dispatcher.submit_nq (AIPL の手翻訳 C)
+- `apps/webactor.c` — `/api/loadbal/nqueens?n=N` ルート + opt-in `/api/loadbal/init` / `/api/gc-actor/init`
+- `tools/nqueens_bench.py` — 3 mode (mac / pi3 / split) × repeat ベンチ driver
+- `tools/build_report.py` — JSON → 日本語 LaTeX → lualatex → PDF
+- `docs/results.json` — 計測データ
+- `docs/nqueens-report.pdf` — **11 ページの日本語 PDF レポート** (システム構成、方法、結果表、bar chart、AIPL ソース 8 抜粋、再現手順、生 JSON)
+
+実測結果 (本セッションで取得済):
+```
+N=8 : Mac 3 ms  / Pi 3 10138 ms / Split 9969 ms
+N=9 : Mac 9 ms  / Pi 3 15221 ms / Split 10336 ms
+N=10: Mac 49 ms / Pi 3 -- (task table 64-slot 制約で測定中断) / Split --
+```
+
+Pi 3 の HTTP 1 ポーリング 770ms × 8 tasks = 圧倒的オーバヘッド。`MAX_TASKS_MAX` を 256 に bump 済 (`apps/abcl_program.c` の lb_tasks)、次セッションで N=10,11 完走再測定 可能。
+
+### Dining 5 哲学者ベンチ WIP (commit 626a804 — 未完成、引き継ぎ要)
+
+実装済 (deploy 済):
+- `examples/dining5_bench.abcl` — Fork / Philosopher / DiningBench の AIPL 仕様 (type-inference-clean)
+- `apps/abcl_program.c` で MAX_OBJECTS 16 → **32** に bump、Philosopher に `F_Philosopher_done_to` / `F_Philosopher_t_start` 追加、CLASS_DiningBench (id 6) 新設
+- HTTP: `/api/dining/init`, `/api/dining/start?mode=N&meals=M`, `/api/dining/status`
+- `tools/dining_bench.py` + `tools/build_dining_report.py`
+
+3 つの起動戦略:
+- mode 0: 全 5 並列
+- mode 1: 3+2 段階
+- mode 2: 順次 1 人ずつ
+
+**未解決の問題**: mode=0 (parallel) で **3/5 哲学者しか完食しない**。最後の 2 人が隣接フォーク (例: P2/P3 の F3 共有) で livelock。
+
+試した修正 (まだ不十分):
+- `fork_denied` 経路に staggered backoff (`sleep(10 + my_id * 8)` ms) 追加
+- 5 ms 一律 backoff → スタガー化したが 60s 中に完走しない
+
+次セッションへの推奨修正候補:
+- (a) backoff をさらに大きく + 乱数 (`sleep(50 + my_id * 30 + (clkticks & 0x1F))`)
+- (b) **Chandy-Misra hygienic philosophers** アルゴリズム移植 (clean/dirty fork、状態転送ベース)
+- (c) Fork actor に request queue を持たせて fairness 保証
+- (d) phil_done 時点で残り 2 人専用のリレースケジュールに切替
+- 副次: `abcl_dining_status` の elapsed_ms 負数 race は guard 追加済 (`if (elapsed < 0) elapsed = 0;`)
 
 ### Global Actor GC (`apps/abcl_program.c` — CLASS_Collector)
 - `CLASS_Collector` (5) — actor として実装された GC、独自 mailbox + dispatch loop
@@ -187,7 +239,18 @@ POST /api/loadbal/restart?w=N          — kill + alloc + spawn + bind (n_object
 POST /api/loadbal/rate-limit?per_sec=N&capacity=M  — token bucket configure
 GET  /api/loadbal/rate-stats           — tokens / throttled / timed_out counters
 POST /api/loadbal/timeout?ms=N         — server-side PENDING task deadline (0=disable, default 30000)
+POST /api/loadbal/init                 — opt-in: Dispatcher + 4 Workers spawn (cold boot は WebReceiver のみ)
+POST /api/loadbal/nqueens?n=N[&cols=]  — N-Queens 部分木を全 first_col に投げて task_id range を返す
 #                                        priority: ?prio=high が submit/jit で rate-limit bypass
+
+# GC actor
+POST /api/gc-actor/init                — opt-in: Collector spawn + heartbeat thread
+GET  /api/gc-actor/stats / POST /api/gc-actor/configure / enable / sweep_now
+
+# Dining 5 哲学者ベンチ (WIP)
+POST /api/dining/init                  — DiningBench spawn
+POST /api/dining/start?mode=N&meals=M  — mode 0/1/2、meals 1-100
+GET  /api/dining/status                — n_done / elapsed_ms / max_phil_ms
 
 # GC actor (periodic global actor sweep)
 GET  /api/gc-actor/stats               — period/threshold + sweep_count + counters
@@ -225,7 +288,16 @@ sync && diskutil eject /Volumes/XINU
 backup kernel:
 - `/Users/kodamay/tftpboot/kernel.img.pre-mmu-bak` (304648 B、MMU 無し、究極の fallback)
 - `/Users/kodamay/tftpboot/kernel.img.pre-kexec-bak` (305224 B、MMU only、kexec 無し)
-- `/Users/kodamay/tftpboot/kernel.img` (現行 build)
+- `/Users/kodamay/tftpboot/kernel.img.pre-tier1-bak` (310152 B、Tier 1 まで)
+- `/Users/kodamay/tftpboot/kernel.img.pre-tier2-bak` (316876 B、Tier 2 sticky+restart 前)
+- `/Users/kodamay/tftpboot/kernel.img.pre-tier2fix-bak` (316940 B、Tier 2 sticky-fix)
+- `/Users/kodamay/tftpboot/kernel.img.pre-nq-bak` (316940 B、N-Queens 前)
+- `/Users/kodamay/tftpboot/kernel.img.pre-dining-bak` (321888 B、dining 前)
+- `/Users/kodamay/tftpboot/kernel.img` (現行 build、326220 B、commit 626a804)
+
+Pi 3 SD 現在状態: 326220 B (DiningBench + LB_TASKS_MAX=256 + MAX_OBJECTS=32 + staggered backoff)
+コミット `626a804` の build。dining bench は 3/5 livelock するが、N-Queens は LB_TASKS_MAX
+拡大したため次セッションで N=10/11 完走できるはず。
 
 ## 既知の制約 / 次の候補作業
 
@@ -234,7 +306,14 @@ backup kernel:
   invalidate loop (4-way × 128 set × 64 B 一括 DCISW) を mmu.c に追加 → `SCTLR.C=1` で性能向上
 - **I-cache 有効化** — 同様に ICIALLU 後 `SCTLR.I=1`。これも性能寄与大
 
-### 中優先
+### 中優先 (= 次セッションで取り組むべき)
+- **Dining 5 哲学者の 5/5 完食化 (commit 626a804 WIP)** ★ 最優先
+  - 現状: mode=0 で 3/5 までしか完食しない (P2/P3 が F3 共有で livelock)
+  - 推奨修正: Chandy-Misra hygienic algorithm 移植、or fork に request queue
+  - 解決したら `tools/dining_bench.py` で 3 mode 比較 PDF を生成 (`tools/build_dining_report.py`)
+- **N-Queens 再ベンチ** (現 PDF: `docs/nqueens-report.pdf`)
+  - `LB_TASKS_MAX=64 → 256` bump 済 (commit 626a804) → N=10, 11 完走可能になっているはず
+  - `./tools/nqueens_bench.py --sizes 8,9,10,11 --out docs/results.json` → PDF 再生成
 - **SDHOST driver port** — BCM2837 のデフォルト SD コントローラ (EMMC でなく SDHOST @ 0x3F202000)
   → 現 `apps/sd_block.c` は EMMC 前提で動かない。永続的な network kernel write には必須
 - **JIT 拡張** — 論理 (`&&`/`||`), unary, ポインタ/配列、関数定義 (1関数→複数関数)、
@@ -242,10 +321,9 @@ backup kernel:
 - **Load-balancer Tier 2 残機能の実機テスト** (このセッションで未実施):
   - rate-limit (`/api/loadbal/rate-limit` + `/rate-stats`)、task timeout、prio=high bypass
   - Code は commit 50b3366 で実装+build success、deploy 時 USB ethernet brick で実機確認断念
-  - 次セッションで SD-direct flash 後に検証
 - **Load-balancer Tier 3 機能**:
   - true priority queues (per-prio mailbox + preemption)、auto-retry with task-id lineage、
-    dynamic worker pool resize (MAX_OBJECTS=16 cap)、speculative execution、scatter-gather、
+    dynamic worker pool resize (MAX_OBJECTS=32 cap)、speculative execution、scatter-gather、
     worker affinity / session sticky beyond hash
 
 ### 低優先 / 未着手
@@ -261,17 +339,44 @@ backup kernel:
 
 ## 重要なファイル (このセッションで追加/変更)
 
+### Pi 3 カーネル
 ```
 apps/cc_mvp.c                            — C JIT (Stage 5)
-apps/abcl_program.c                      — + Dispatcher / Worker / Collector
+apps/abcl_program.c                      — + Dispatcher / Worker / Collector / DiningBench
                                            + lb_tasks tracking + histogram + GC actor
-apps/webactor.c                          — + 多数の /api routes, /kexec, chunked reader
-                                           + 429 backpressure + /api/gc-actor/*
+                                           + N-Queens kernel + nq_count_partial
+                                           + MAX_OBJECTS 16→32, LB_TASKS_MAX 64→256
+apps/webactor.c                          — + 多数の /api routes (loadbal Tier 1+2 + GC + dining
+                                              + N-Queens + opt-in init), /kexec, chunked reader,
+                                              429 backpressure
 apps/sd_block.c                          — SD driver (動かない、SDHOST が必要)
 system/platforms/arm-rpi3/mmu.c          — MMU enable/disable
 system/platforms/arm-rpi3/Makerules      — + mmu.c
 system/platforms/arm-rpi3/platforminit.c — + mmu_init() 呼び出し
 include/tcp.h                            — TCP_IBLEN=65528 + TCP_GRACIOUSACK
+```
+
+### AIPL ソース (本セッションで追加)
+```
+examples/nqueens_distributed_xinu.abcl   — Pi 3 用 N-Queens (send-only)
+examples/nqueens_distributed_mac.abcl    — Mac AIPL 用 (send/now/future 3 種類実演)
+examples/dining5_bench.abcl              — 5 哲学者 5 フォーク + DiningBench (WIP)
+```
+
+### Mac 側 ベンチ + レポートツール
+```
+tools/nqueens_bench.py                   — N-Queens ベンチ driver (mac / pi3 / split 3 mode)
+tools/build_report.py                    — N-Queens JSON → 日本語 LaTeX/PDF
+tools/dining_bench.py                    — 5 哲学者ベンチ driver (parallel/staggered/sequential)
+tools/build_dining_report.py             — Dining JSON → 日本語 LaTeX/PDF
+```
+
+### 生成物
+```
+docs/results.json                        — N-Queens 計測データ
+docs/nqueens-report.pdf  (11 ページ)     — N-Queens 日本語 PDF レポート
+docs/nqueens-report.tex                  — LaTeX ソース (再生成可能)
+docs/bench-log.txt / dining_bench-log.txt — bench stdout 記録
 ```
 
 ## 過去セッションの記録 (2026-05-27、ethernet + telnet)
