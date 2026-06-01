@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b14b (WSEC_PMK 36-byte struct)"
+#define WIFI_BUILD_ID "wifi-stage6-b14c (WSEC_PMK after WLC_UP)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1676,17 +1676,18 @@ static int wifi_do_join(const char *ssid, const char *pass)
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_cmd_int(WLC_SET_INFRA, 1);
     if (secured) {
-        wifi_cmd_int(WLC_SET_WSEC, 4);          /* AES */
+        wifi_cmd_int(WLC_SET_WSEC, 4);          /* AES (while down) */
         wifi_set_iovar_int("wpa_auth", 0x80);   /* WPA2-PSK */
         wifi_cmd_int(165 /*WLC_SET_WPA_AUTH*/, 0x80);
-        if (wifi_set_pmk(ssid, sl, pass, pl) != 0)
-            wifi_log("[wifi] join: WSEC_PMK returned error (continuing)\r\n");
     } else {
         wifi_cmd_int(WLC_SET_WSEC, 0);
         wifi_set_iovar_int("wpa_auth", 0);
     }
     wifi_cmd_int(2, 1);                          /* WLC_UP */
     wifi_delay_us(50000);
+    /* set the PMK while the interface is UP (WSEC_PMK -2'd when down) */
+    if (secured && wifi_set_pmk(ssid, sl, pass, pl) != 0)
+        wifi_log("[wifi] join: WSEC_PMK returned error (continuing)\r\n");
 
     /* build the extended "join" iovar (brcmf_ext_join_params_le, 114 B):
      *   [0..35]   ssid_le (len + ssid[32])
