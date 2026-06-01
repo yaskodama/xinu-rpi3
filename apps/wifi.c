@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b19 (FWSUP; event-sequence in X-Wifi-EvSeq header)"
+#define WIFI_BUILD_ID "wifi-stage6-b20 (FWSUP; directed join to scanned BSSID+chanspec)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -99,6 +99,16 @@ int wifi_diag_seq(int *out, int cap)
     for (i = 0; i < n; i++) out[i] = wifi_d_seq[i];
     return n;
 }
+
+/* Directed-join target: when wifi_tgt_set, wifi_scan() records the BSSID and
+ * the real firmware chanspec of the AP whose SSID matches wifi_tgt_ssid, so
+ * the join can go straight to that BSSID/channel instead of broadcast + scan-
+ * all (which reaches PROBREQ but never associates on this firmware). */
+static char     wifi_tgt_ssid[33];
+static int      wifi_tgt_slen = 0, wifi_tgt_set = 0, wifi_tgt_found = 0;
+static uint8_t  wifi_tgt_bssid[6];
+static uint16_t wifi_tgt_chanspec = 0;
+int wifi_tgt_diag(int *found, int *chanspec) { *found = wifi_tgt_found; *chanspec = wifi_tgt_chanspec; return wifi_tgt_found; }
 
 /* ------------------------------------------------------------------ *
  *  MMIO bases (BCM2837, peripheral base 0x3F000000)                  *
@@ -1302,8 +1312,22 @@ static int wifi_scan(int *out_count)
             uint8_t *bssid = bss + 8;
             int ssidlen = bss[18]; if (ssidlen > 32) ssidlen = 32;
             short rssi = (short)(bss[78] | (bss[79] << 8));
-            int ch = (bss[72] | (bss[73] << 8)) & 0xFF;
+            uint16_t chanspec = (uint16_t)(bss[72] | (bss[73] << 8));
+            int ch = chanspec & 0xFF;
             int dup = 0;
+            /* directed-join: record this AP's BSSID + real chanspec if its SSID
+             * matches the one we're trying to join. */
+            if (wifi_tgt_set && !wifi_tgt_found && ssidlen == wifi_tgt_slen) {
+                int m = 1;
+                for (i = 0; i < ssidlen; i++)
+                    if (bss[19 + i] != (uint8_t)wifi_tgt_ssid[i]) { m = 0; break; }
+                if (m) {
+                    for (i = 0; i < 6; i++) wifi_tgt_bssid[i] = bssid[i];
+                    wifi_tgt_chanspec = chanspec; wifi_tgt_found = 1;
+                    wifi_log("[wifi] join: target found bssid=%02x:%02x:%02x:%02x:%02x:%02x chanspec=0x%04x ch=%d\r\n",
+                             bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], chanspec, ch);
+                }
+            }
             for (i = 0; i < nseen; i++)
                 if (seen[i][0]==bssid[0]&&seen[i][1]==bssid[1]&&seen[i][2]==bssid[2]&&
                     seen[i][3]==bssid[3]&&seen[i][4]==bssid[4]&&seen[i][5]==bssid[5]) { dup=1; break; }
@@ -1702,6 +1726,21 @@ static int wifi_do_join(const char *ssid, const char *pass)
     wifi_d_link = -1; wifi_d_lastev = -1; wifi_d_laststat = 0;
 
     wifi_radio_up();                             /* event_msgs/clm/country/pm */
+
+    /* Locate the target AP first: a plain scan finds it (the standalone scan
+     * works), capturing its BSSID + real firmware chanspec.  A broadcast +
+     * scan-all "join" only ever reached PROBREQ on this fw; a directed join to
+     * the exact BSSID/chanspec is how ether4330/brcmfmac actually associate. */
+    {
+        int n = 0, j;
+        wifi_tgt_slen = sl; wifi_tgt_found = 0; wifi_tgt_set = 1;
+        for (j = 0; j < sl && j < 32; j++) wifi_tgt_ssid[j] = ssid[j];
+        wifi_scan(&n);
+        wifi_tgt_set = 0;
+        wifi_log("[wifi] join: target located=%d chanspec=0x%04x\r\n",
+                 wifi_tgt_found, wifi_tgt_chanspec);
+    }
+
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_cmd_int(WLC_SET_INFRA, 1);
     if (secured) {
@@ -1747,8 +1786,18 @@ static int wifi_do_join(const char *ssid, const char *pass)
     jp[79] = 0;                                   /* scan_type = active */
     for (i = 80; i < 96; i++) jp[i] = 0xFF;      /* nprobes/active/passive/home = -1 */
     /* [96..99] channel_num = 0, [100..101] channel_list[0] = 0 */
-    for (i = 102; i < 108; i++) jp[i] = 0xFF;    /* assoc bssid = broadcast */
-    /* [108..111] chanspec_num = 0, [112..113] chanspec_list[0] = 0 */
+    if (wifi_tgt_found) {
+        /* directed assoc to the exact BSSID + real chanspec from the scan */
+        for (i = 0; i < 6; i++) jp[102 + i] = wifi_tgt_bssid[i];
+        jp[108] = 1;                              /* chanspec_num = 1 */
+        jp[112] = wifi_tgt_chanspec & 0xFF;
+        jp[113] = (wifi_tgt_chanspec >> 8) & 0xFF;
+        /* also point the join-scan at that exact channel */
+        jp[96] = 1; jp[100] = jp[112]; jp[101] = jp[113];
+    } else {
+        for (i = 102; i < 108; i++) jp[i] = 0xFF; /* assoc bssid = broadcast */
+        /* [108..111] chanspec_num = 0, [112..113] chanspec_list[0] = 0 */
+    }
     if (wifi_set_iovar("join", jp, sizeof(jp)) != 0) {
         wifi_log("[wifi] join: 'join' iovar failed\r\n");
         return -1;

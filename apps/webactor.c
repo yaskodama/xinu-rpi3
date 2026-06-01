@@ -1570,9 +1570,12 @@ thread webactor_server(void)
                      * leaves the large trace body undeliverable over TCP. */
                     extern void wifi_diag(int*,int*,int*,int*,int*,int*,int*);
                     extern int  wifi_diag_seq(int*, int);
+                    extern int  wifi_tgt_diag(int*, int*);
                     int sup, pmk, nev, eapol, link, lastev, laststat;
                     int seq[16], sn, si, sl = 0; char seqbuf[96];
+                    int tfound = 0, tchsp = 0;
                     wifi_diag(&sup,&pmk,&nev,&eapol,&link,&lastev,&laststat);
+                    wifi_tgt_diag(&tfound, &tchsp);
                     sn = wifi_diag_seq(seq, 16);
                     for (si = 0; si < sn && sl < (int)sizeof(seqbuf)-8; si++)
                         sl += sprintf(seqbuf + sl, si ? ",%d" : "%d", seq[si]);
@@ -1584,8 +1587,10 @@ thread webactor_server(void)
                                "X-Wifi-Events: %d\r\nX-Wifi-LastEvent: %d\r\n"
                                "X-Wifi-LastStatus: %d\r\nX-Wifi-Eapol: %d\r\n"
                                "X-Wifi-Link: %d\r\nX-Wifi-EvSeq: %s\r\n"
+                               "X-Wifi-Tgt: %d\r\nX-Wifi-Chanspec: 0x%04x\r\n"
                                "Content-Length: %d\r\n\r\n",
-                               rc, sup, pmk, nev, lastev, laststat, eapol, link, seqbuf, blen);
+                               rc, sup, pmk, nev, lastev, laststat, eapol, link,
+                               seqbuf, tfound, tchsp, blen);
                 }
                 write(tcpdev, jhdr, hlen);
                 write(tcpdev, (void *)tr, blen);
