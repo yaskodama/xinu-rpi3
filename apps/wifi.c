@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage1-b7 (free Arasan from SD card: GPIO48-53 ALT0)"
+#define WIFI_BUILD_ID "wifi-stage3a-b8 (CMD53 PIO + corescan + ramscan)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -580,6 +580,205 @@ static int wifi_backplane_read32(uint32_t addr, uint32_t *out)
 }
 
 /* ================================================================== *
+ *  Stage 3 — backplane bulk access + chip core/RAM enumeration       *
+ *  (port of plan9 ether4330.c sbmem/sbrw/corescan/ramscan)           *
+ * ================================================================== */
+#define SB_WSIZE        0x8000u          /* backplane window size      */
+#define SB_32BIT        0x8000u          /* 32-bit access flag in off  */
+#define SB_ENUMBASE     0x18000000u
+#define CORE_ARMCR4     0x83E
+#define CORE_ARMCM3     0x82A
+#define CORE_ARM7       0x825
+#define CORE_CHIPCOMMON 0x800
+#define CORE_SOCRAM     0x80E
+#define CORE_SDIODEV    0x829
+#define CORE_D11        0x812
+#define REG_IOCTRL      0x408
+#define REG_RESETCTRL   0x800
+#define CR4_CAP         0x04
+#define CR4_BANKIDX     0x40
+#define CR4_BANKINFO    0x44
+#define CR4_CPUHALT     0x20
+
+/* discovered chip layout (filled by wifi_corescan / wifi_ramscan) */
+static uint32_t chip_chipcommon, chip_armctl, chip_armregs, chip_armcore;
+static uint32_t chip_d11ctl, chip_socramctl, chip_socramregs, chip_sdregs;
+static uint32_t chip_rambase, chip_socramsize;
+
+/* General CMD53 (IO_RW_EXTENDED) with PIO data transfer.  `off` is the F1
+ * register offset (already including SB_32BIT when addressing the backplane).
+ * Transfers up to 511*bsize bytes (bsize=64 for Fn1).  Returns 0 on success. */
+static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
+                          int len, int incr)
+{
+    uint32_t arg, intr, t, total, w, words;
+    uint32_t bsize = (fn == 2) ? 512u : 64u;
+    int blkmode, blkcnt;
+
+    if (len <= 0) return 0;
+    if ((uint32_t)len > bsize) { blkmode = 1; blkcnt = len / bsize; total = blkcnt * bsize; }
+    else                       { blkmode = 0; blkcnt = len;         total = len; }
+
+    for (t = 0; t < 1000000; t++) if (!(EMMC_STATUS & SR_CMD_INHIBIT)) break;
+    ew(&EMMC_INTERRUPT, 0xFFFFFFFFu);
+    if (blkmode) ew(&EMMC_BLKSIZECNT, ((uint32_t)blkcnt << 16) | bsize);
+    else         ew(&EMMC_BLKSIZECNT, (1u << 16) | (uint32_t)total);
+
+    arg = ((uint32_t)(write & 1) << 31) | ((uint32_t)(fn & 7) << 28) |
+          ((uint32_t)(blkmode & 1) << 27) | ((uint32_t)(incr & 1) << 26) |
+          ((off & 0x1FFFF) << 9) |
+          ((blkmode ? (uint32_t)blkcnt : (uint32_t)total) & 0x1FF);
+    ew(&EMMC_ARG1, arg);
+    {
+        uint32_t cmd = (SD_CMD53_IO_RW_EXT << 24) | CMD_RSPNS_48 |
+                       CMD_CRCCHK_EN | CMD_IXCHK_EN | CMD_ISDATA;
+        if (!write)  cmd |= TM_DAT_DIR_CH;       /* card -> host */
+        if (blkmode) cmd |= (1u << 5) | (1u << 1); /* multiblock + blkcnt-en */
+        ew(&EMMC_CMDTM, cmd);
+    }
+    for (t = 0; t < 1000000; t++) {
+        intr = EMMC_INTERRUPT;
+        if (intr & INT_ERR)      { wifi_log("[wifi]   cmd53 err 0x%08x\r\n", intr); return -1; }
+        if (intr & INT_CMD_DONE) { ew(&EMMC_INTERRUPT, INT_CMD_DONE); break; }
+    }
+    if (t >= 1000000) { wifi_log("[wifi]   cmd53 no CMD_DONE\r\n"); return -1; }
+
+    /* PIO: the controller raises READ_RDY/WRITE_RDY before each block-sized
+     * buffer; transfer it word-by-word via the DATA register. */
+    words = (total + 3) / 4;
+    {
+        uint32_t done = 0;
+        while (done < words) {
+            uint32_t flag = write ? INT_WRITE_RDY : INT_READ_RDY;
+            uint32_t chunk = (total > bsize && (words - done) > (bsize / 4))
+                             ? (bsize / 4) : (words - done);
+            for (t = 0; t < 1000000; t++) {
+                intr = EMMC_INTERRUPT;
+                if (intr & INT_ERR)  { wifi_log("[wifi]   cmd53 data err 0x%08x\r\n", intr); return -1; }
+                if (intr & flag)     { EMMC_INTERRUPT = flag; break; }
+            }
+            if (t >= 1000000) { wifi_log("[wifi]   cmd53 no data rdy\r\n"); return -1; }
+            for (w = 0; w < chunk; w++) {
+                uint32_t idx = (done + w) * 4;
+                if (write) {
+                    uint32_t v = (uint32_t)buf[idx] | ((uint32_t)buf[idx+1] << 8) |
+                                 ((uint32_t)buf[idx+2] << 16) | ((uint32_t)buf[idx+3] << 24);
+                    EMMC_DATA = v;
+                } else {
+                    uint32_t v = EMMC_DATA;
+                    buf[idx] = v; buf[idx+1] = v >> 8; buf[idx+2] = v >> 16; buf[idx+3] = v >> 24;
+                }
+            }
+            done += chunk;
+        }
+    }
+    for (t = 0; t < 1000000; t++)
+        if (EMMC_INTERRUPT & INT_DATA_DONE) { EMMC_INTERRUPT = INT_DATA_DONE; break; }
+    return 0;
+}
+
+/* Bulk backplane read/write across 0x8000 windows (plan9 sbmem+sbrw). */
+static int wifi_sbmem(int write, uint8_t *buf, int len, uint32_t addr)
+{
+    uint32_t n = SB_WSIZE - (addr & (SB_WSIZE - 1));
+    while (len > 0) {
+        uint32_t woff;
+        int chunk = ((int)n < len) ? (int)n : len;
+        if (sdio_set_window(addr) != 0) return -1;
+        woff = (addr & (SB_WSIZE - 1)) | SB_32BIT;
+        /* transfer chunk (round down to 4 for the bulk part; tail < 4 ignored
+         * — firmware/EROM lengths here are 4-aligned). */
+        if (wifi_cmd53_pio(write, 1, woff, buf, chunk & ~3, 1) != 0) return -1;
+        addr += chunk; buf += chunk; len -= chunk;
+        n = SB_WSIZE;
+    }
+    return 0;
+}
+
+/* 32-bit backplane write at absolute address. */
+static int wifi_backplane_write32(uint32_t addr, uint32_t val)
+{
+    uint8_t b[4];
+    b[0] = val; b[1] = val >> 8; b[2] = val >> 16; b[3] = val >> 24;
+    return wifi_sbmem(1, b, 4, addr);
+}
+
+/* Scan the SonicsSiliconBackplane EROM to locate the chip's cores. */
+static int wifi_corescan(void)
+{
+    static uint8_t erom[512];
+    uint32_t eromptr, i;
+    int coreid = 0;
+
+    /* EROM pointer lives at chipcommon enum base + 63*4 */
+    if (wifi_backplane_read32(SB_ENUMBASE + 63 * 4, &eromptr) != 0) return -1;
+    chip_chipcommon = chip_armctl = chip_armregs = chip_armcore = 0;
+    chip_d11ctl = chip_socramctl = chip_socramregs = chip_sdregs = 0;
+    if (wifi_sbmem(0, erom, sizeof(erom), eromptr) != 0) return -1;
+
+    for (i = 0; i < sizeof(erom); i += 4) {
+        uint32_t addr;
+        switch (erom[i] & 0xF) {
+        case 0xF:                                  /* end */
+            return 0;
+        case 0x1:                                  /* core info */
+            if ((erom[i + 4] & 0xF) != 0x1) break;
+            coreid = (erom[i + 1] | (erom[i + 2] << 8)) & 0xFFF;
+            i += 4;
+            break;
+        case 0x5:                                  /* address descriptor */
+            addr = (erom[i + 1] << 8) | (erom[i + 2] << 16) | (erom[i + 3] << 24);
+            addr &= ~0xFFFu;
+            switch (coreid) {
+            case CORE_CHIPCOMMON:
+                if ((erom[i] & 0xC0) == 0) chip_chipcommon = addr;
+                break;
+            case CORE_ARMCM3: case CORE_ARM7: case CORE_ARMCR4:
+                chip_armcore = coreid;
+                if (erom[i] & 0xC0) { if (!chip_armctl) chip_armctl = addr; }
+                else                { if (!chip_armregs) chip_armregs = addr; }
+                break;
+            case CORE_SOCRAM:
+                if (erom[i] & 0xC0) chip_socramctl = addr;
+                else if (!chip_socramregs) chip_socramregs = addr;
+                break;
+            case CORE_SDIODEV:
+                if ((erom[i] & 0xC0) == 0) chip_sdregs = addr;
+                break;
+            case CORE_D11:
+                if (erom[i] & 0xC0) chip_d11ctl = addr;
+                break;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Determine on-chip RAM size (CR4 path for the BCM43455). */
+static int wifi_ramscan(void)
+{
+    uint32_t r, n, size = 0;
+    int banks, i;
+
+    if (chip_armcore != CORE_ARMCR4) {
+        wifi_log("[wifi]   ramscan: non-CR4 core 0x%x not handled here\r\n", chip_armcore);
+        return -1;
+    }
+    r = chip_armregs;
+    if (wifi_backplane_read32(r + CR4_CAP, &n) != 0) return -1;
+    banks = ((n >> 4) & 0xF) + (n & 0xF);
+    for (i = 0; i < banks; i++) {
+        if (wifi_backplane_write32(r + CR4_BANKIDX, i) != 0) return -1;
+        if (wifi_backplane_read32(r + CR4_BANKINFO, &n) != 0) return -1;
+        size += 8192 * ((n & 0x3F) + 1);
+    }
+    chip_socramsize = size;
+    chip_rambase = 0x198000;       /* BCM43455 TCM base */
+    return 0;
+}
+
+/* ================================================================== *
  *  Public: power on the chip and probe its SDIO identity + chip-id.  *
  * ================================================================== */
 int wifi_probe(void)
@@ -719,11 +918,35 @@ int wifi_probe(void)
     wifi_log("[wifi] chipcommon[0]=0x%08x  chip-id=0x%04x  rev=%d\r\n",
             chipid, chipid & CID_ID_MASK, (chipid >> 16) & 0xF);
 
-    if ((chipid & CID_ID_MASK) == BCM43455_CHIP_ID) {
-        wifi_log("[wifi] *** SUCCESS: BCM43455 (0x4345) detected over SDIO ***\r\n");
-        return 0;
+    if ((chipid & CID_ID_MASK) != BCM43455_CHIP_ID) {
+        wifi_log("[wifi] chip-id 0x%04x is not the expected 0x4345 "
+                "(check window/access path)\r\n", chipid & CID_ID_MASK);
+        return -1;
     }
-    wifi_log("[wifi] chip-id 0x%04x is not the expected 0x4345 "
-            "(check window/access path)\r\n", chipid & CID_ID_MASK);
-    return -1;
+    wifi_log("[wifi] BCM43455 (0x4345) detected over SDIO\r\n");
+
+    /* ---- Stage 3a: enumerate the chip's cores + on-chip RAM ----
+     * Validates the bulk backplane path (CMD53 PIO + sbmem) by reading the
+     * 512-byte EROM and the CR4 RAM banks.  This is the foundation for the
+     * firmware download (Stage 3b). */
+    if (wifi_corescan() != 0) {
+        wifi_log("[wifi] FAILED: corescan (EROM bulk read)\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] cores: chipcommon=0x%x armcore=0x%x armctl=0x%x armregs=0x%x\r\n",
+             chip_chipcommon, chip_armcore, chip_armctl, chip_armregs);
+    wifi_log("[wifi]        d11ctl=0x%x socramctl=0x%x sdregs=0x%x\r\n",
+             chip_d11ctl, chip_socramctl, chip_sdregs);
+    if (chip_armctl == 0 || chip_d11ctl == 0) {
+        wifi_log("[wifi] FAILED: corescan missing essential cores\r\n");
+        return -1;
+    }
+    if (wifi_ramscan() != 0) {
+        wifi_log("[wifi] FAILED: ramscan\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] RAM: base=0x%x size=%u bytes (%u KB)\r\n",
+             chip_rambase, chip_socramsize, chip_socramsize / 1024);
+    wifi_log("[wifi] *** SUCCESS: Stage 3a — chip cores + RAM enumerated ***\r\n");
+    return 0;
 }
