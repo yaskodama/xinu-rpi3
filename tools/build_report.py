@@ -17,14 +17,28 @@ import sys
 PROJECT_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".."))
 
-# レポートに埋め込むソースコード抜粋の (相対パス, 開始行, 終了行, ラベル)
+# レポートに埋め込むソースコード抜粋
+#   (相対パス, 開始行, 終了行, ラベル)
+# プログラム本体は AIPL ソース。Pi 3 上では aipl2c で C に翻訳された
+# 等価な実装が abcl_program.c 内で走っているが、canonical な仕様は
+# 以下の .abcl ファイル。
 SOURCE_EXCERPTS = [
-    ("apps/abcl_program.c", 1505, 1531, "N-Queens 計算カーネル (C, Pi 3 側)"),
-    ("apps/abcl_program.c", 1400, 1432, "Worker.compute\\_nq アクターメソッド"),
-    ("apps/abcl_program.c", 1118, 1147, "Dispatcher.submit\\_nq (Round-robin 振分け)"),
-    ("apps/webactor.c",     1422, 1517, "/api/loadbal/nqueens HTTP ルート"),
-    ("tools/nqueens_bench.py",  37,  61, "Mac 側 N-Queens 参照実装 (Python)"),
-    ("tools/nqueens_bench.py", 153, 184, "Mac 側 Pi 3 ポーリング (並列)"),
+    ("examples/nqueens_distributed_xinu.abcl",   23,  83,
+     "Worker クラス (N-Queens 部分木計算、AIPL)"),
+    ("examples/nqueens_distributed_xinu.abcl",   85, 179,
+     "Dispatcher クラス (Round-robin 振分け + pause/done 集約、AIPL)"),
+    ("examples/nqueens_distributed_xinu.abcl",  181, 216,
+     "Collector クラス (周期 GC、AIPL)"),
+    ("examples/nqueens_distributed_xinu.abcl",  218, 254,
+     "Orchestrator + global (アクター起動と配線、AIPL)"),
+    ("examples/nqueens_distributed_mac.abcl",    15,  49,
+     "Mac AIPL: Worker (now で同期戻値を返すスタイル)"),
+    ("examples/nqueens_distributed_mac.abcl",    51, 108,
+     "Mac AIPL: Orchestrator (send / now / future の 3 種類を実演)"),
+    ("tools/nqueens_bench.py",                   37,  61,
+     "Mac 側 N-Queens 参照実装 (Python、AIPL ランタイム非依存の baseline)"),
+    ("tools/nqueens_bench.py",                  153, 184,
+     "Mac 側 Pi 3 並列ポーリング (Python、計測駆動)"),
 ]
 
 TEX_TEMPLATE = r"""\documentclass[a4paper,11pt]{ltjsarticle}
@@ -52,6 +66,16 @@ TEX_TEMPLATE = r"""\documentclass[a4paper,11pt]{ltjsarticle}
   keywordstyle=\color{blue!70!black}\bfseries,
   commentstyle=\color{green!40!black}\itshape,
   stringstyle=\color{red!60!black}
+}
+
+% AIPL — listings does not know it; define minimal keyword set.
+\lstdefinelanguage{AIPL}{
+  morekeywords={class,method,function,var,new,send,now,future,
+                if,else,while,do,return,suicide,await},
+  morekeywords=[2]{int,any,float,string,bool},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
 }
 
 \title{N-Queens 分散ベンチマーク \\
@@ -205,9 +229,10 @@ def cell_lookup(results, mode, n):
 
 
 def lang_for(path):
-    if path.endswith(".c"):  return "C"
-    if path.endswith(".py"): return "Python"
-    if path.endswith(".sh"): return "bash"
+    if path.endswith(".c"):    return "C"
+    if path.endswith(".py"):   return "Python"
+    if path.endswith(".sh"):   return "bash"
+    if path.endswith(".abcl"): return "AIPL"
     return ""
 
 

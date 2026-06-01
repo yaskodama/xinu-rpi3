@@ -1,0 +1,108 @@
+// nqueens_distributed_mac.abcl — Mac OCaml AIPL 用 N-Queens 分散版
+//
+// xinu 版との違い:
+//   * Mac OCaml AIPL は `now`/`future` をサポート → 同期 + future が使える
+//   * 型推論で省略可能だが、本ファイルは型注釈を明示 (型推論フリー規約)
+//   * actor pool 上限が無いので Worker を必要な数だけ生む
+//   * GC は Mac 側に actor table の上限が無いので不要
+//
+// メッセージ送信を 3 種類全部使用してデモする:
+//   - send  actor.method(...)      — 非同期 fire-and-forget
+//   - now   actor.method(...)      — 同期呼出 (戻り値を直接受取る)
+//   - future actor.method(...)     — 非同期だが handle が返る、
+//                                     後で await して値を回収
+
+class Worker {
+  function safe(cols: any, row: int, c: int) -> int {
+    var i : int = 0;
+    while (i < row) do {
+      var p : int = array_get(cols, i);
+      if (p == c)            { return 0; }
+      if (p - c == row - i)  { return 0; }
+      if (c - p == row - i)  { return 0; }
+      i = i + 1;
+    }
+    return 1;
+  }
+
+  function try_col(cols: any, n: int, row: int, c: int) -> int {
+    if (c >= n) { return 0; }
+    var here : int = 0;
+    if (safe(cols, row, c)) {
+      var cols2 : any = array_set(cols, row, c);
+      here = nq_count(cols2, n, row + 1);
+    }
+    return here + try_col(cols, n, row, c + 1);
+  }
+
+  function nq_count(cols: any, n: int, row: int) -> int {
+    if (row == n) { return 1; }
+    return try_col(cols, n, row, 0);
+  }
+
+  /* now の戻値として直接 int を返す */
+  method solve(n: int, first_col: int) -> int {
+    var cols[12];
+    var cols2 : any = array_set(cols, 0, first_col);
+    return nq_count(cols2, n, 1);
+  }
+}
+
+class Orchestrator {
+  /* 同期 now で分散 (シンプル、戻値直結) */
+  function run_now(n: int) -> int {
+    var sum : int = 0;
+    var c   : int = 0;
+    while (c < n) do {
+      var w   : any = new Worker();
+      var sub : int = now w.solve(n, c);
+      sum = sum + sub;
+      c   = c + 1;
+    }
+    return sum;
+  }
+
+  /* future で全 first_col を並行発射 → 後でまとめて await
+     (Mac OCaml AIPL ランタイムが提供する future handle 型は any) */
+  function run_future(n: int) -> int {
+    var sum : int = 0;
+    var c   : int = 0;
+    var fs  : any = array_new(n);
+    /* 発射 */
+    while (c < n) do {
+      var w : any = new Worker();
+      fs = array_set(fs, c, future w.solve(n, c));
+      c  = c + 1;
+    }
+    /* 回収 */
+    c = 0;
+    while (c < n) do {
+      sum = sum + await(array_get(fs, c));
+      c   = c + 1;
+    }
+    return sum;
+  }
+
+  /* fire-and-forget (集計したくない場合のみ意味がある — ここではログ用) */
+  method warmup(n: int) {
+    var w : any = new Worker();
+    send w.solve(n, 0);   /* 戻値破棄、副作用 (キャッシュ温め) のみ */
+  }
+
+  method init(tag: any) {
+    print("[mac] === " + tag + " ===");
+
+    var t0  : int = now_ms();
+    var s8a : int = run_now(8);
+    print("[mac] now    N=8 sol=" + s8a + " elapsed_ms=" + (now_ms() - t0));
+
+    var t1  : int = now_ms();
+    var s8b : int = run_future(8);
+    print("[mac] future N=8 sol=" + s8b + " elapsed_ms=" + (now_ms() - t1));
+
+    send self.warmup(4);   /* send デモ (return 値なし) */
+    print("[mac] === done ===");
+  }
+}
+
+var orch = new Orchestrator("nqueens distributed");

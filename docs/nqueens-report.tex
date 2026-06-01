@@ -25,6 +25,16 @@
   stringstyle=\color{red!60!black}
 }
 
+% AIPL — listings does not know it; define minimal keyword set.
+\lstdefinelanguage{AIPL}{
+  morekeywords={class,method,function,var,new,send,now,future,
+                if,else,while,do,return,suicide,await},
+  morekeywords=[2]{int,any,float,string,bool},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
+}
+
 \title{N-Queens 分散ベンチマーク \\
   \large Mac + Raspberry Pi 3 (Embedded Xinu, AIPL アクター負荷分散器)}
 \author{自動生成: \texttt{tools/build\_report.py}}
@@ -150,27 +160,35 @@ $N$ & 解の数 & Mac (ms) & Pi 3 (ms) & 分散 (ms) & 高速化率 (Mac/分散)
 GitHub リポジトリ \url{https://github.com/yaskodama/xinu-rpi3} の
 ブランチ \texttt{arm-rpi3-port} 参照。
 
-\paragraph{N-Queens 計算カーネル (C, Pi 3 側)} \hfill
-\texttt{apps/abcl\_program.c:1505-1531}
-\lstinputlisting[firstline=1505,lastline=1531, firstnumber=1505, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/abcl_program.c}
+\paragraph{Worker クラス (N-Queens 部分木計算、AIPL)} \hfill
+\texttt{examples/nqueens\_distributed\_xinu.abcl:23-83}
+\lstinputlisting[firstline=23,lastline=83, firstnumber=23, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_xinu.abcl}
 
-\paragraph{Worker.compute\_nq アクターメソッド} \hfill
-\texttt{apps/abcl\_program.c:1400-1432}
-\lstinputlisting[firstline=1400,lastline=1432, firstnumber=1400, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/abcl_program.c}
+\paragraph{Dispatcher クラス (Round-robin 振分け + pause/done 集約、AIPL)} \hfill
+\texttt{examples/nqueens\_distributed\_xinu.abcl:85-179}
+\lstinputlisting[firstline=85,lastline=179, firstnumber=85, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_xinu.abcl}
 
-\paragraph{Dispatcher.submit\_nq (Round-robin 振分け)} \hfill
-\texttt{apps/abcl\_program.c:1118-1147}
-\lstinputlisting[firstline=1118,lastline=1147, firstnumber=1118, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/abcl_program.c}
+\paragraph{Collector クラス (周期 GC、AIPL)} \hfill
+\texttt{examples/nqueens\_distributed\_xinu.abcl:181-216}
+\lstinputlisting[firstline=181,lastline=216, firstnumber=181, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_xinu.abcl}
 
-\paragraph{/api/loadbal/nqueens HTTP ルート} \hfill
-\texttt{apps/webactor.c:1422-1517}
-\lstinputlisting[firstline=1422,lastline=1517, firstnumber=1422, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/webactor.c}
+\paragraph{Orchestrator + global (アクター起動と配線、AIPL)} \hfill
+\texttt{examples/nqueens\_distributed\_xinu.abcl:218-254}
+\lstinputlisting[firstline=218,lastline=254, firstnumber=218, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_xinu.abcl}
 
-\paragraph{Mac 側 N-Queens 参照実装 (Python)} \hfill
+\paragraph{Mac AIPL: Worker (now で同期戻値を返すスタイル)} \hfill
+\texttt{examples/nqueens\_distributed\_mac.abcl:15-49}
+\lstinputlisting[firstline=15,lastline=49, firstnumber=15, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_mac.abcl}
+
+\paragraph{Mac AIPL: Orchestrator (send / now / future の 3 種類を実演)} \hfill
+\texttt{examples/nqueens\_distributed\_mac.abcl:51-108}
+\lstinputlisting[firstline=51,lastline=108, firstnumber=51, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/nqueens_distributed_mac.abcl}
+
+\paragraph{Mac 側 N-Queens 参照実装 (Python、AIPL ランタイム非依存の baseline)} \hfill
 \texttt{tools/nqueens\_bench.py:37-61}
 \lstinputlisting[firstline=37,lastline=61, firstnumber=37, language=Python]{/Users/kodamay/projects/xinu-raz/xinu/tools/nqueens_bench.py}
 
-\paragraph{Mac 側 Pi 3 ポーリング (並列)} \hfill
+\paragraph{Mac 側 Pi 3 並列ポーリング (Python、計測駆動)} \hfill
 \texttt{tools/nqueens\_bench.py:153-184}
 \lstinputlisting[firstline=153,lastline=184, firstnumber=153, language=Python]{/Users/kodamay/projects/xinu-raz/xinu/tools/nqueens_bench.py}
 
