@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b14c (WSEC_PMK after WLC_UP)"
+#define WIFI_BUILD_ID "wifi-stage6-b15 (assoc + observe EAPOL forwarding)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1713,38 +1713,49 @@ static int wifi_do_join(const char *ssid, const char *pass)
     }
     wifi_log("[wifi] join: request sent, waiting for link event...\r\n");
 
-    /* wait for E_SET_SSID(0)/E_LINK(16)/E_PSK_SUP success or a deauth */
+    /* Observe association events (channel 1) and whether the AP's EAPOL 4-way
+     * handshake frames (channel 2 data, ethertype 0x888E) are forwarded to the
+     * host — the viability test for a host-side supplicant. */
     {
         static uint8_t fr[2048];
-        int chan, doff, tries;
+        int chan, doff, tries, nev = 0, ndata = 0, eapol = 0;
         for (tries = 0; tries < 1500; tries++) {
             int len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
             if (len < 0) break;
             if (len == 0) { wifi_delay_us(10000); continue; }
-            if (chan != 1) continue;
             if (len < doff + 4) continue;
             {
                 int bdc = 4 + (fr[doff + 3] << 2);
-                uint8_t *evp = fr + doff + bdc;
-                long status;
-                if ((int)(evp - fr) + 24 + 16 > len) continue;
-                ev = (evp[24 + 6] << 8) | evp[24 + 7];
-                status = (evp[24+8]<<24)|(evp[24+9]<<16)|(evp[24+10]<<8)|evp[24+11];
-                if (ev == 16) {                  /* E_LINK */
-                    int up = (evp[24+2] << 8 | evp[24+3]) & 1;
-                    wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP — connected!" : "down");
-                    if (up) return 0;
-                } else if (ev == 0 || ev == 46) { /* E_SET_SSID / E_PSK_SUP */
-                    wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
-                    if (ev == 0 && status == 0) { /* SET_SSID ok */ }
-                } else if (ev == 5 || ev == 6 || ev == 12) {
-                    wifi_log("[wifi] join: deauth/disassoc event %d (auth failed?)\r\n", ev);
-                    return -1;
+                uint8_t *p = fr + doff + bdc;     /* 802.3 frame */
+                if ((int)(p - fr) + 16 > len) continue;
+                if (chan == 1) {                  /* event */
+                    long status = (p[24+8]<<24)|(p[24+9]<<16)|(p[24+10]<<8)|p[24+11];
+                    ev = (p[24 + 6] << 8) | p[24 + 7];
+                    if (nev++ < 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
+                    if (ev == 16) {
+                        int up = (p[24+2] << 8 | p[24+3]) & 1;
+                        wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP" : "down");
+                        if (up) { wifi_log("[wifi] *** associated (link up) ***\r\n"); return 0; }
+                    } else if (ev == 5 || ev == 6 || ev == 12 || ev == 24) {
+                        wifi_log("[wifi] join: deauth/disassoc event %d\r\n", ev);
+                    }
+                } else if (chan == 2) {           /* data frame */
+                    int et = (p[12] << 8) | p[13];
+                    ndata++;
+                    if (et == 0x888E) {           /* EAPOL — the 4-way handshake */
+                        eapol++;
+                        wifi_log("[wifi] join: EAPOL frame #%d (len=%d) — AP started 4-way!\r\n",
+                                 eapol, len);
+                        if (eapol == 1)
+                            wifi_log("[wifi] *** host-supplicant VIABLE: fw forwards EAPOL ***\r\n");
+                    } else if (ndata <= 6) {
+                        wifi_log("[wifi] join: data frame ethertype=0x%04x len=%d\r\n", et, len);
+                    }
                 }
             }
         }
+        wifi_log("[wifi] join: timeout (events=%d data=%d eapol=%d)\r\n", nev, ndata, eapol);
     }
-    wifi_log("[wifi] join: no link-up within timeout\r\n");
     return -1;
 }
 
