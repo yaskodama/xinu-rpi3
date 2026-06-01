@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage1-b4 (routing-probe + control0)"
+#define WIFI_BUILD_ID "wifi-stage1-b5 (trust firmware WIFI_CLK)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -287,28 +287,22 @@ static uint32_t wifi_fw_get_clock_rate(uint32_t clk_id)
  * ================================================================== */
 static void wifi_clk_setup(void)
 {
-    uint32_t sel, divi, divf;
-    int t;
+    uint32_t sel = GPFSEL4;
+    int alt43 = (sel >> 9) & 7;
 
-    /* GPIO43 -> ALT0 (GPCLK2).  GPIO43 is in GPFSEL4, bits [9:11]; ALT0=4. */
-    sel = GPFSEL4;
-    sel &= ~(7u << 9);
-    sel |=  (4u << 9);
-    GPFSEL4 = sel;
-
-    /* stop GPCLK2 before reprogramming */
-    CM_GP2CTL = CM_PASSWD | (CM_GP2CTL & ~CM_CTL_ENAB);
-    for (t = 0; t < 100000 && (CM_GP2CTL & CM_CTL_BUSY); t++) wifi_udelay(10);
-
-    /* 19.2 MHz / 32.768 kHz = 585.9375 -> DIVI=585, DIVF=0.9375*4096=3840 */
-    divi = 585; divf = 3840;
-    CM_GP2DIV = CM_PASSWD | (divi << 12) | (divf & 0xFFF);
-    /* source = oscillator, enable, MASH-1 for the fractional divider */
-    CM_GP2CTL = CM_PASSWD | (1u << 9) /* MASH=1 */ | CM_SRC_OSC;
-    CM_GP2CTL = CM_PASSWD | (1u << 9) | CM_CTL_ENAB | CM_SRC_OSC;
-    for (t = 0; t < 100000 && !(CM_GP2CTL & CM_CTL_BUSY); t++) wifi_udelay(10);
-    wifi_log("[wifi] WIFI_CLK GPCLK2 on GPIO43 ~32.768kHz (CTL=0x%08x)\r\n",
-             CM_GP2CTL);
+    /* The firmware already routes GPIO43 -> ALT0 (GPCLK2) AND runs WIFI_CLK at
+     * whatever frequency the chip expects (observed: GPIO43 fsel=4, GP2CTL
+     * BUSY).  Reprogramming GPCLK2 ourselves risks feeding the chip the wrong
+     * reference clock, so b5 TRUSTS the firmware: ensure GPIO43 is ALT0 and
+     * leave the clock manager untouched. */
+    if (alt43 != 4) {
+        sel &= ~(7u << 9);
+        sel |=  (4u << 9);
+        GPFSEL4 = sel;
+        wifi_log("[wifi] WIFI_CLK: set GPIO43 -> ALT0 (was fsel=%d)\r\n", alt43);
+    }
+    wifi_log("[wifi] WIFI_CLK: trusting firmware GPCLK2 (GP2CTL=0x%08x, GP2DIV=0x%08x)\r\n",
+             CM_GP2CTL, CM_GP2DIV);
 }
 
 /* ================================================================== *
