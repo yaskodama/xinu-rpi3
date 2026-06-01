@@ -779,10 +779,13 @@ enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
  * buffer of the most recent LB_TASKS_MAX submissions plus their
  * outcomes (submit-time, done-time, worker, result).
  *
- * Lookup is a linear scan; with N=64 that's trivially fast at the
- * scale we run.  Bigger N would want a hash, but the actor mailbox
- * is already 64-deep so 64 in-flight is a reasonable working set. */
-#define LB_TASKS_MAX 64
+ * Lookup is a linear scan.  256 entries × ~32 B = ~8 KB .bss; the
+ * walk fits comfortably in L1 and the cost is well under the
+ * HTTP-side round-trip noise.  Bumped from 64 to 256 so the
+ * N-Queens benchmark's REPEAT * sizes * N submission count doesn't
+ * scroll completed results out of the buffer before Mac collects
+ * them via /api/loadbal/task?id=N. */
+#define LB_TASKS_MAX 256
 
 /* Per-task state for cancellation tracking.
  *   P = pending / running (worker should run it)
