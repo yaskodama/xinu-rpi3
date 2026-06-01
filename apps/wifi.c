@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage1-b3 (gpclk2 + http-trace)"
+#define WIFI_BUILD_ID "wifi-stage1-b4 (routing-probe + control0)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -379,6 +379,13 @@ static int emmc_reset_clock(uint32_t divisor)
         return -1;
     }
 
+    /* SD bus power + voltage (standard SDHCI Power Control, byte at 0x29 =
+     * CONTROL0 bits 8-11): bit8 = SD_BUS_POWER, bits9-11 = voltage select
+     * (0b111 = 3.3V).  May be a no-op on the BCM EMMC (which powers the bus
+     * via firmware/GPIO) but is harmless and required by spec on real SDHCI. */
+    EMMC_CONTROL0 = (EMMC_CONTROL0 & ~0xF00u) | (1u << 8) | (7u << 9);
+    wifi_udelay(2000);
+
     /* program the SD clock: 8-bit divided-clock mode (SDHCI v3 uses the
      * low 8 bits of the divisor in [15:8] plus the upper 2 bits in [7:6]). */
     c1 = EMMC_CONTROL1;
@@ -431,7 +438,8 @@ static int emmc_host_init(void)
     EMMC_IRPT_EN   = 0xFFFFFFFFu;
     EMMC_IRPT_MASK = 0xFFFFFFFFu;
     EMMC_INTERRUPT = 0xFFFFFFFFu;          /* clear stale */
-    wifi_log("[wifi] SDHCI host initialised (clock on)\r\n");
+    wifi_log("[wifi] SDHCI init done: CONTROL0=0x%08x CONTROL1=0x%08x STATUS=0x%08x\r\n",
+             EMMC_CONTROL0, EMMC_CONTROL1, EMMC_STATUS);
     return 0;
 }
 
@@ -549,7 +557,26 @@ int wifi_probe(void)
     wifi_log("[wifi] === BCM43455 SDIO bring-up (Stage 1+2) ===\r\n");
     wifi_log("[wifi] build: %s\r\n", WIFI_BUILD_ID);
 
-    /* 0. start the chip's reference clock (GPCLK2/WIFI_CLK) BEFORE releasing
+    /* 0a. ROUTING CHECK: read the firmware's GPIO function-select for
+     *     GPIO34-39 BEFORE we touch them.  If the firmware already has them
+     *     as ALT3 (=7), the Arasan EMMC (0x3F300000) is wired to the WiFi
+     *     SDIO bus and our controller choice is correct.  If they read as
+     *     input(0)/something-else, the WiFi SDIO may instead be on the SDHOST
+     *     controller (0x3F202000) and we are driving the wrong block. */
+    {
+        uint32_t f3 = GPFSEL3, f4 = GPFSEL4;
+        int p;
+        wifi_log("[wifi] firmware GPFSEL3=0x%08x GPFSEL4=0x%08x\r\n", f3, f4);
+        for (p = 34; p <= 39; p++) {
+            int alt = (f3 >> (3 * (p - 30))) & 7;
+            wifi_log("[wifi]   GPIO%d fsel=%d (%s)\r\n", p, alt,
+                     (alt == 7) ? "ALT3=SD1/Arasan" :
+                     (alt == 0) ? "input" : "other");
+        }
+        wifi_log("[wifi]   GPIO43 (WIFI_CLK) fsel=%d\r\n", (f4 >> 9) & 7);
+    }
+
+    /* 0b. start the chip's reference clock (GPCLK2/WIFI_CLK) BEFORE releasing
      *    reset, so the chip has a clock as it boots. */
     wifi_clk_setup();
 
