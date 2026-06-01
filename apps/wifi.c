@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b21 (FWSUP; FIXED 65-B ext_join struct, join_scan_params)"
+#define WIFI_BUILD_ID "wifi-stage6-b22 (FWSUP; GET_BSSID assoc poll, ground-truth link)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1689,6 +1689,7 @@ static void pbkdf2_sha1(const uint8_t *pass, int plen, const uint8_t *salt, int 
 #define WLC_SET_WPA_AUTH 165
 #define WLC_SET_WSEC_PMK 268
 #define WLC_SET_SSID    26
+#define WLC_GET_BSSID   23
 
 /* Derive the WPA2 PMK (PBKDF2-SHA1 of passphrase+ssid) and hand it to the
  * firmware's in-dongle supplicant via WLC_SET_WSEC_PMK.
@@ -1824,7 +1825,23 @@ static int wifi_do_join(const char *ssid, const char *pass)
         static uint8_t fr[2048];
         int chan, doff, tries, nev = 0, ndata = 0, eapol = 0;
         for (tries = 0; tries < 1500; tries++) {
-            int len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            int len;
+            /* Ground-truth association check, independent of catching events:
+             * ask the fw which BSSID we're associated to.  A directed join can
+             * complete + raise/clear E_LINK faster than we poll the FIFO, so
+             * GET_BSSID is the reliable "are we on?" signal. */
+            if ((tries % 80) == 40) {
+                uint8_t bss[6]; int k, nz = 0;
+                if (wifi_wlcmd(0, WLC_GET_BSSID, NULL, 0, bss, 6) == 0)
+                    for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
+                if (nz) {
+                    wifi_d_link = 1;
+                    wifi_log("[wifi] join: GET_BSSID %02x:%02x:%02x:%02x:%02x:%02x -> *** associated ***\r\n",
+                             bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]);
+                    return 0;
+                }
+            }
+            len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
             if (len < 0) break;
             if (len == 0) { wifi_delay_us(10000); continue; }
             if (len < doff + 4) continue;
