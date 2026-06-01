@@ -6,8 +6,16 @@
  *
  * The blobs are NOT in git (nonfree license; .gitignore'd under wifi-fw/).
  * They were fetched from RPi-Distro/firmware-nonfree and staged at:
- *     wifi-fw/fw_43455.bin    = cypress/cyfmac43455-sdio-standard.bin (~609 KB)
+ *     wifi-fw/fw_43455.bin    = cypress/cyfmac43455-sdio-MINIMAL.bin  (~548 KB)
  *     wifi-fw/nvram_43455.txt = brcm/brcmfmac43455-sdio.txt           (~2 KB)
+ *
+ * ★ We use the *minimal* (7.45.241) variant, NOT standard (7.45.265): the
+ *   minimal build advertises `idsup-idauth` in its capability string = it has
+ *   the in-dongle WPA supplicant (FWSUP).  brcmfmac probes this via the
+ *   `sup_wpa` iovar (feature.c:349); standard fw returns -23 UNSUPPORTED there
+ *   (it offloads SAE to the host instead: `extsae-dpp-sr-okc`).  We want the
+ *   firmware to run the WPA2-PSK 4-way handshake itself, so minimal is correct.
+ *   The clm_blob is byte-identical between the two; nvram is board-specific.
  * They are linked directly into the kernel image via .incbin so wifi.c can
  * stream them into the chip's RAM over SDIO without a separate upload step.
  *

@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b16 (I-cache; assoc, host keeps PMK, observe EAPOL)"
+#define WIFI_BUILD_ID "wifi-stage6-b17 (minimal fw 7.45.241 FWSUP; sup_wpa+PMK 4-way in fw)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1644,20 +1644,25 @@ static void pbkdf2_sha1(const uint8_t *pass, int plen, const uint8_t *salt, int 
 #define WLC_SET_WSEC_PMK 268
 #define WLC_SET_SSID    26
 
-/* Derive the WPA2 PMK (PBKDF2-SHA1 of passphrase+ssid) and give it to the
- * firmware via WLC_SET_WSEC_PMK.  This fw rejected the passphrase-flag form
- * (-2), so we send the real 32-byte PMK (flags=0). */
+/* Derive the WPA2 PMK (PBKDF2-SHA1 of passphrase+ssid) and hand it to the
+ * firmware's in-dongle supplicant via WLC_SET_WSEC_PMK.
+ *
+ * ★ The struct is brcmf_wsec_pmk_le { __le16 key_len; __le16 flags; u8 key[128] }
+ *   = a FIXED 132 bytes (key[] is BRCMF_WSEC_MAX_SAE_PASSWORD_LEN=128), sent in
+ *   full regardless of key_len.  Our earlier attempt sent only 36 bytes
+ *   (key[32]) which the firmware rejected (-2 BADARG) — the FWSUP firmware
+ *   wants the whole 132-byte struct.  key_len=32, flags=0 for a raw PMK. */
 static int wifi_set_pmk(const char *ssid, int slen, const char *pass, int plen)
 {
     uint8_t pmk32[32];
-    uint8_t msg[2 + 2 + 32];              /* brcmf_wsec_pmk_le: key[32] => 36 B */
+    uint8_t msg[2 + 2 + 128];             /* brcmf_wsec_pmk_le: 132 B fixed */
     int i;
     pbkdf2_sha1((const uint8_t *)pass, plen, (const uint8_t *)ssid, slen, 4096, pmk32, 32);
     wifi_log("[wifi] join: PMK %02x%02x%02x%02x...%02x%02x derived\r\n",
              pmk32[0], pmk32[1], pmk32[2], pmk32[3], pmk32[30], pmk32[31]);
     for (i = 0; i < (int)sizeof(msg); i++) msg[i] = 0;
     msg[0] = 32; msg[1] = 0;              /* key_len = 32 (raw PMK) */
-    msg[2] = 0;  msg[3] = 0;              /* flags = 0 */
+    msg[2] = 0;  msg[3] = 0;              /* flags = 0 (key material, not passphrase) */
     for (i = 0; i < 32; i++) msg[4 + i] = pmk32[i];
     return wifi_wlcmd(1, WLC_SET_WSEC_PMK, msg, sizeof(msg), NULL, 0);
 }
@@ -1676,20 +1681,29 @@ static int wifi_do_join(const char *ssid, const char *pass)
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_cmd_int(WLC_SET_INFRA, 1);
     if (secured) {
-        wifi_cmd_int(WLC_SET_WSEC, 4);          /* AES (while down) */
+        /* FWSUP WPA2-PSK path (matches brcmfmac brcmf_cfg80211_connect, minimal
+         * fw with idsup).  Order: wsec/wpa_auth/auth while down, UP, then
+         * sup_wpa=1 + the 32-byte PMK, then the join iovar.  The firmware runs
+         * the 4-way handshake internally and raises E_LINK up on success. */
+        int rc;
+        wifi_cmd_int(WLC_SET_WSEC, 4);          /* wsec = AES/CCMP */
         wifi_set_iovar_int("wpa_auth", 0x80);   /* WPA2-PSK */
-        wifi_cmd_int(165 /*WLC_SET_WPA_AUTH*/, 0x80);
+        wifi_cmd_int(WLC_SET_WPA_AUTH, 0x80);
+        wifi_cmd_int(22 /*WLC_SET_AUTH*/, 0);   /* open auth (WPA2 uses open) */
+        wifi_cmd_int(2, 1);                      /* WLC_UP */
+        wifi_delay_us(50000);
+        rc = wifi_set_iovar_int("sup_wpa", 1);   /* enable in-dongle supplicant */
+        wifi_log("[wifi] join: sup_wpa=1 rc=%d %s\r\n", rc,
+                 rc ? "(FWSUP NOT available — wrong fw variant?)" : "(FWSUP on)");
+        rc = wifi_set_pmk(ssid, sl, pass, pl);   /* 132-B WSEC_PMK with PMK */
+        wifi_log("[wifi] join: WSEC_PMK rc=%d %s\r\n", rc,
+                 rc ? "(fw rejected PMK)" : "(PMK accepted)");
     } else {
         wifi_cmd_int(WLC_SET_WSEC, 0);
         wifi_set_iovar_int("wpa_auth", 0);
+        wifi_cmd_int(2, 1);                      /* WLC_UP */
+        wifi_delay_us(50000);
     }
-    wifi_cmd_int(2, 1);                          /* WLC_UP */
-    wifi_delay_us(50000);
-    /* host-supplicant model: the fw has no FWSUP and rejects WSEC_PMK (-2), so
-     * we do NOT hand it the PMK.  We associate (open auth + RSN assoc); the AP
-     * then runs the 4-way handshake which the fw forwards to us as EAPOL data
-     * frames.  (PMK derivation + the handshake itself is the next step.) */
-    (void)pl;
 
     /* build the extended "join" iovar (brcmf_ext_join_params_le, 114 B):
      *   [0..35]   ssid_le (len + ssid[32])
@@ -1715,9 +1729,11 @@ static int wifi_do_join(const char *ssid, const char *pass)
     }
     wifi_log("[wifi] join: request sent, waiting for link event...\r\n");
 
-    /* Observe association events (channel 1) and whether the AP's EAPOL 4-way
-     * handshake frames (channel 2 data, ethertype 0x888E) are forwarded to the
-     * host — the viability test for a host-side supplicant. */
+    /* Wait for the firmware supplicant to finish.  Success path: E_SET_SSID
+     * (0) status 0 -> the fw runs the 4-way -> E_PSK_SUP (46) status 6
+     * (WLC_SUP_KEYED) -> E_LINK (16) flags&1 = link up.  We return 0 on link
+     * up.  Channel-2 EAPOL frames should NOT appear now (the fw consumes them
+     * internally); if they do, FWSUP didn't engage. */
     {
         static uint8_t fr[2048];
         int chan, doff, tries, nev = 0, ndata = 0, eapol = 0;
