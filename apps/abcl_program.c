@@ -529,6 +529,8 @@ static int _abcl_cap = 0;
 #define CLASS_Worker 4        /* load-balancer worker (compute target) */
 #define CLASS_Collector 5     /* periodic actor GC */
 #define CLASS_DiningBench 6   /* 5 philosophers + 5 forks benchmark orchestrator */
+#define CLASS_ForkCM 7        /* Chandy-Misra hygienic fork (clean/dirty) */
+#define CLASS_PhilCM 8        /* Chandy-Misra philosopher (request/release) */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
@@ -538,6 +540,8 @@ static int _abcl_cap = 0;
 #define ABCL_PRIO_Worker 22       /* one above philosophers so submit() lands */
 #define ABCL_PRIO_Collector 26    /* GC runs above dispatcher so sweeps land */
 #define ABCL_PRIO_DiningBench 24  /* between Dispatcher (25) and Worker (22) */
+#define ABCL_PRIO_ForkCM 20       /* same tier as old Fork */
+#define ABCL_PRIO_PhilCM 20       /* same tier as old Philosopher */
 static int abcl_class_prio(int class_id) {
   switch (class_id) {
   case CLASS_Fork: return ABCL_PRIO_Fork;
@@ -547,6 +551,8 @@ static int abcl_class_prio(int class_id) {
   case CLASS_Worker:     return ABCL_PRIO_Worker;
   case CLASS_Collector:  return ABCL_PRIO_Collector;
   case CLASS_DiningBench: return ABCL_PRIO_DiningBench;
+  case CLASS_ForkCM:     return ABCL_PRIO_ForkCM;
+  case CLASS_PhilCM:     return ABCL_PRIO_PhilCM;
   default: return INITPRIO;
   }
 }
@@ -559,6 +565,8 @@ const char* abcl_class_name(int class_id) {
   case CLASS_Worker:     return "Worker";
   case CLASS_Collector:  return "Collector";
   case CLASS_DiningBench: return "DiningBench";
+  case CLASS_ForkCM:     return "ForkCM";
+  case CLASS_PhilCM:     return "PhilCM";
   default: return "?";
   }
 }
@@ -569,6 +577,8 @@ static void dispatch_Dispatcher(int, int, const char*, value_t*, int);
 static void dispatch_Worker(int, int, const char*, value_t*, int);
 static void dispatch_Collector(int, int, const char*, value_t*, int);
 static void dispatch_DiningBench(int, int, const char*, value_t*, int);
+static void dispatch_ForkCM(int, int, const char*, value_t*, int);
+static void dispatch_PhilCM(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -2079,6 +2089,243 @@ static void init_fields_DiningBench(int self_id) {
   for (i = 0; i < 5; i++) { g_dining_forks[i] = -1; g_dining_phils[i] = -1; }
 }
 
+/* ============================================================
+ * Chandy-Misra hygienic philosophers
+ *
+ *   Each Fork holds: holder (philosopher obj_id), dirty flag,
+ *   single pending-request slot (only one neighbor competes per fork).
+ *
+ *   Rules:
+ *   - request from non-holder: dirty -> transfer immediately and clean
+ *                              clean -> queue (will transfer when dirtied)
+ *                              holder == requester -> reconfirm via fork_arrived
+ *   - release(p) by current holder p: mark dirty; if pending, transfer.
+ *
+ *   Each Philosopher tracks has_lo / has_hi (mirroring holder state) and
+ *   req_lo / req_hi (have I already asked).  On both forks present, eat,
+ *   then release; fork_lost messages re-sync the mirror if transferred.
+ *   Initial fork distribution per CM precedence: lower philosopher id
+ *   holds the fork between any pair (P0 starts with F0+F1, P1 with F2,
+ *   P2 with F3, P3 with F4, P4 with none).  All forks initially dirty
+ *   so the first request transfers.
+ * ============================================================ */
+
+/* ---- ForkCM ---- */
+enum { F_ForkCM_holder, F_ForkCM_dirty, F_ForkCM_request_id, F_ForkCM__N };
+
+static void init_fields_ForkCM(int self_id) {
+  objects[self_id].fields[F_ForkCM_holder]     = mk_int(-1L);
+  objects[self_id].fields[F_ForkCM_dirty]      = mk_int(1L);
+  objects[self_id].fields[F_ForkCM_request_id] = mk_int(-1L);
+}
+
+static void ForkCM_set_holder(int self_id, int sender_id,
+                              value_t* args, int n_args) {
+  (void)sender_id;
+  long h = (n_args > 0) ? args[0].i : -1L;
+  objects[self_id].fields[F_ForkCM_holder]     = mk_int(h);
+  objects[self_id].fields[F_ForkCM_dirty]      = mk_int(1L);
+  objects[self_id].fields[F_ForkCM_request_id] = mk_int(-1L);
+}
+
+static void ForkCM_request(int self_id, int sender_id,
+                           value_t* args, int n_args) {
+  (void)sender_id;
+  long requester = (n_args > 0) ? args[0].i : -1L;
+  long holder = objects[self_id].fields[F_ForkCM_holder].i;
+  long dirty  = objects[self_id].fields[F_ForkCM_dirty].i;
+  if (requester < 0) return;
+  if (holder == requester) {
+    /* Already owns it — re-confirm (covers post-release self-request). */
+    abcl_enqueue(self_id, (int)requester, "fork_arrived", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    return;
+  }
+  if (holder < 0) {
+    /* In transit — queue (rare). */
+    objects[self_id].fields[F_ForkCM_request_id] = mk_int(requester);
+    return;
+  }
+  if (dirty) {
+    /* Transfer now; mark clean for new holder. */
+    objects[self_id].fields[F_ForkCM_holder]     = mk_int(requester);
+    objects[self_id].fields[F_ForkCM_dirty]      = mk_int(0L);
+    objects[self_id].fields[F_ForkCM_request_id] = mk_int(-1L);
+    abcl_enqueue(self_id, (int)holder, "fork_lost", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    abcl_enqueue(self_id, (int)requester, "fork_arrived", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+  } else {
+    /* Clean — queue request; transferred on next release. */
+    objects[self_id].fields[F_ForkCM_request_id] = mk_int(requester);
+  }
+}
+
+static void ForkCM_release(int self_id, int sender_id,
+                           value_t* args, int n_args) {
+  (void)sender_id;
+  long p_id = (n_args > 0) ? args[0].i : -1L;
+  long holder = objects[self_id].fields[F_ForkCM_holder].i;
+  if (holder != p_id) return;             /* stale / spurious release */
+  objects[self_id].fields[F_ForkCM_dirty] = mk_int(1L);
+  long pending = objects[self_id].fields[F_ForkCM_request_id].i;
+  if (pending >= 0L) {
+    objects[self_id].fields[F_ForkCM_holder]     = mk_int(pending);
+    objects[self_id].fields[F_ForkCM_dirty]      = mk_int(0L);
+    objects[self_id].fields[F_ForkCM_request_id] = mk_int(-1L);
+    abcl_enqueue(self_id, (int)holder, "fork_lost", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    abcl_enqueue(self_id, (int)pending, "fork_arrived", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+  }
+}
+
+static void dispatch_ForkCM(int self_id, int sender_id, const char* method,
+                            value_t* args, int n_args) {
+  if (strcmp(method, "init") == 0) return;
+  if (strcmp(method, "set_holder") == 0)
+  { ForkCM_set_holder(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "request") == 0)
+  { ForkCM_request(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "release") == 0)
+  { ForkCM_release(self_id, sender_id, args, n_args); return; }
+}
+
+/* ---- PhilCM ---- */
+enum { F_PhilCM_my_id, F_PhilCM_f_lo, F_PhilCM_f_hi,
+       F_PhilCM_has_lo, F_PhilCM_has_hi,
+       F_PhilCM_meals, F_PhilCM_meal_idx,
+       F_PhilCM_done_to, F_PhilCM_t_start,
+       F_PhilCM_req_lo, F_PhilCM_req_hi,
+       F_PhilCM__N };
+
+static void init_fields_PhilCM(int self_id) {
+  int i;
+  for (i = 0; i < F_PhilCM__N; i++)
+    objects[self_id].fields[i] = mk_int(0L);
+}
+
+static void PhilCM_init_phil(int self_id, int sender_id,
+                             value_t* args, int n_args) {
+  (void)sender_id; (void)n_args;
+  /* args: (id, f_lo, f_hi, has_lo, has_hi, meals, done_to) */
+  long id      = args[0].i;
+  int  f_lo    = args[1].obj_id;
+  int  f_hi    = args[2].obj_id;
+  long has_lo  = args[3].i;
+  long has_hi  = args[4].i;
+  long meals   = args[5].i;
+  int  done_to = args[6].obj_id;
+  objects[self_id].fields[F_PhilCM_my_id]    = mk_int(id);
+  objects[self_id].fields[F_PhilCM_f_lo]     = mk_obj(f_lo);
+  objects[self_id].fields[F_PhilCM_f_hi]     = mk_obj(f_hi);
+  objects[self_id].fields[F_PhilCM_has_lo]   = mk_int(has_lo);
+  objects[self_id].fields[F_PhilCM_has_hi]   = mk_int(has_hi);
+  objects[self_id].fields[F_PhilCM_meals]    = mk_int(meals);
+  objects[self_id].fields[F_PhilCM_meal_idx] = mk_int(0L);
+  objects[self_id].fields[F_PhilCM_done_to]  = mk_obj(done_to);
+  objects[self_id].fields[F_PhilCM_t_start]  = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_PhilCM_req_lo]   = mk_int(0L);
+  objects[self_id].fields[F_PhilCM_req_hi]   = mk_int(0L);
+  abcl_enqueue(self_id, self_id, "try_eat", 0, NULL);
+}
+
+static void PhilCM_try_eat(int self_id, int sender_id,
+                           value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  long meals  = objects[self_id].fields[F_PhilCM_meals].i;
+  long has_lo = objects[self_id].fields[F_PhilCM_has_lo].i;
+  long has_hi = objects[self_id].fields[F_PhilCM_has_hi].i;
+  if (meals <= 0L) {
+    int orch     = objects[self_id].fields[F_PhilCM_done_to].obj_id;
+    long t_start = objects[self_id].fields[F_PhilCM_t_start].i;
+    long elapsed = (long)(clkticks * 10) - t_start;
+    long my_id   = objects[self_id].fields[F_PhilCM_my_id].i;
+    if (elapsed < 0) elapsed = 0;
+    if (orch > 0) {
+      abcl_enqueue(self_id, orch, "phil_done", 2,
+                   (value_t[]){ mk_int(my_id), mk_int(elapsed) });
+    }
+    abcl_actor_suicide(self_id);
+    return;
+  }
+  if (has_lo && has_hi) {
+    /* EAT */
+    objects[self_id].fields[F_PhilCM_meals]    = mk_int(meals - 1L);
+    objects[self_id].fields[F_PhilCM_meal_idx] = mk_int(
+        objects[self_id].fields[F_PhilCM_meal_idx].i + 1L);
+    /* Optimistically zero has_lo/has_hi: a pending request may transfer
+     * either fork during release.  Real ownership is reconfirmed by
+     * fork_arrived (post-release self-request) or fork_lost (transfer). */
+    objects[self_id].fields[F_PhilCM_has_lo] = mk_int(0L);
+    objects[self_id].fields[F_PhilCM_has_hi] = mk_int(0L);
+    objects[self_id].fields[F_PhilCM_req_lo] = mk_int(0L);
+    objects[self_id].fields[F_PhilCM_req_hi] = mk_int(0L);
+    int f_lo = objects[self_id].fields[F_PhilCM_f_lo].obj_id;
+    int f_hi = objects[self_id].fields[F_PhilCM_f_hi].obj_id;
+    abcl_enqueue(self_id, f_lo, "release", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    abcl_enqueue(self_id, f_hi, "release", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    abcl_enqueue(self_id, self_id, "try_eat", 0, NULL);
+    return;
+  }
+  /* Need at least one fork — request missing (idempotent via req_lo/hi). */
+  long req_lo = objects[self_id].fields[F_PhilCM_req_lo].i;
+  long req_hi = objects[self_id].fields[F_PhilCM_req_hi].i;
+  if (!has_lo && !req_lo) {
+    int f_lo = objects[self_id].fields[F_PhilCM_f_lo].obj_id;
+    abcl_enqueue(self_id, f_lo, "request", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    objects[self_id].fields[F_PhilCM_req_lo] = mk_int(1L);
+  }
+  if (!has_hi && !req_hi) {
+    int f_hi = objects[self_id].fields[F_PhilCM_f_hi].obj_id;
+    abcl_enqueue(self_id, f_hi, "request", 1,
+                 (value_t[]){ mk_int((long)self_id) });
+    objects[self_id].fields[F_PhilCM_req_hi] = mk_int(1L);
+  }
+}
+
+static void PhilCM_fork_arrived(int self_id, int sender_id,
+                                value_t* args, int n_args) {
+  (void)sender_id;
+  int fork = (n_args > 0) ? (int)args[0].i : -1;
+  int f_lo = objects[self_id].fields[F_PhilCM_f_lo].obj_id;
+  int f_hi = objects[self_id].fields[F_PhilCM_f_hi].obj_id;
+  if (fork == f_lo) {
+    objects[self_id].fields[F_PhilCM_has_lo] = mk_int(1L);
+    objects[self_id].fields[F_PhilCM_req_lo] = mk_int(0L);
+  } else if (fork == f_hi) {
+    objects[self_id].fields[F_PhilCM_has_hi] = mk_int(1L);
+    objects[self_id].fields[F_PhilCM_req_hi] = mk_int(0L);
+  }
+  abcl_enqueue(self_id, self_id, "try_eat", 0, NULL);
+}
+
+static void PhilCM_fork_lost(int self_id, int sender_id,
+                             value_t* args, int n_args) {
+  (void)sender_id;
+  int fork = (n_args > 0) ? (int)args[0].i : -1;
+  int f_lo = objects[self_id].fields[F_PhilCM_f_lo].obj_id;
+  int f_hi = objects[self_id].fields[F_PhilCM_f_hi].obj_id;
+  if (fork == f_lo) objects[self_id].fields[F_PhilCM_has_lo] = mk_int(0L);
+  else if (fork == f_hi) objects[self_id].fields[F_PhilCM_has_hi] = mk_int(0L);
+}
+
+static void dispatch_PhilCM(int self_id, int sender_id, const char* method,
+                            value_t* args, int n_args) {
+  if (strcmp(method, "init") == 0) return;
+  if (strcmp(method, "init_phil") == 0)
+  { PhilCM_init_phil(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "try_eat") == 0)
+  { PhilCM_try_eat(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "fork_arrived") == 0)
+  { PhilCM_fork_arrived(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "fork_lost") == 0)
+  { PhilCM_fork_lost(self_id, sender_id, args, n_args); return; }
+}
+
 static void dining_start_phil(int self_id, int i) {
   long meals = objects[self_id].fields[F_DB_meals].i;
   int pid = g_dining_phils[i];
@@ -2103,15 +2350,19 @@ static void DiningBench_run(int self_id, int sender_id,
   long meals = (n_args > 1) ? args[1].i : 50L;
   int i;
   /* Allocate 5 Forks + 5 Philosophers fresh per run.
-   * Caller is responsible for not invoking run twice without giving
-   * the previous batch time to terminate (or for accepting the slot
-   * accumulation; cleaned up by the GC actor's sweep). */
+   * mode 0..2: legacy Fork + Philosopher (acquire/release with staggered
+   *            backoff — has the 3/5 livelock we're working around).
+   * mode 3:    ForkCM + PhilCM (Chandy-Misra hygiene — deadlock-free, fair).
+   * Caller must space repeated run_bench calls; old slots get reaped by
+   * the GC actor. */
+  int fork_class = (mode == 3L) ? CLASS_ForkCM : CLASS_Fork;
+  int phil_class = (mode == 3L) ? CLASS_PhilCM : CLASS_Philosopher;
   for (i = 0; i < 5; i++) {
-    g_dining_forks[i] = alloc_obj(CLASS_Fork, 0, NULL);
+    g_dining_forks[i] = alloc_obj(fork_class, 0, NULL);
     spawn_actor(g_dining_forks[i]);
   }
   for (i = 0; i < 5; i++) {
-    g_dining_phils[i] = alloc_obj(CLASS_Philosopher, 0, NULL);
+    g_dining_phils[i] = alloc_obj(phil_class, 0, NULL);
     spawn_actor(g_dining_phils[i]);
   }
   objects[self_id].fields[F_DB_mode]     = mk_int(mode);
@@ -2136,6 +2387,41 @@ static void DiningBench_run(int self_id, int sender_id,
     /* 3 + 2 staggered: launch P0..P2 now; the rest on phil_done */
     objects[self_id].fields[F_DB_cursor] = mk_int(3L);
     for (i = 0; i < 3; i++) dining_start_phil(self_id, i);
+  } else if (mode == 3L) {
+    /* CM mode — initial fork distribution per Chandy-Misra precedence.
+     * Pairs: F0(P0,P4) F1(P0,P1) F2(P1,P2) F3(P2,P3) F4(P3,P4)
+     * Lower-id philosopher holds each fork initially (and dirty so the
+     * first request transfers):
+     *   F0 -> P0, F1 -> P0, F2 -> P1, F3 -> P2, F4 -> P3
+     *   P0 holds {F0,F1};  P1 holds {F2};  P2 holds {F3};  P3 holds {F4};  P4 nothing.
+     */
+    int holders[5];
+    holders[0] = g_dining_phils[0];
+    holders[1] = g_dining_phils[0];
+    holders[2] = g_dining_phils[1];
+    holders[3] = g_dining_phils[2];
+    holders[4] = g_dining_phils[3];
+    for (i = 0; i < 5; i++) {
+      abcl_enqueue(self_id, g_dining_forks[i], "set_holder", 1,
+                   (value_t[]){ mk_int((long)holders[i]) });
+    }
+    for (i = 0; i < 5; i++) {
+      int lo_idx, hi_idx;
+      if (i == 4) { lo_idx = 0; hi_idx = 4; }
+      else        { lo_idx = i; hi_idx = i + 1; }
+      int pid = g_dining_phils[i];
+      int has_lo = (holders[lo_idx] == pid) ? 1 : 0;
+      int has_hi = (holders[hi_idx] == pid) ? 1 : 0;
+      abcl_enqueue(self_id, pid, "init_phil", 7,
+                   (value_t[]){ mk_int((long)i),
+                                mk_obj(g_dining_forks[lo_idx]),
+                                mk_obj(g_dining_forks[hi_idx]),
+                                mk_int((long)has_lo),
+                                mk_int((long)has_hi),
+                                mk_int(meals),
+                                mk_obj(self_id) });
+    }
+    objects[self_id].fields[F_DB_cursor] = mk_int(5L);
   } else {
     /* sequential: launch P0; subsequent on phil_done */
     objects[self_id].fields[F_DB_cursor] = mk_int(1L);
@@ -2240,6 +2526,8 @@ static void dispatch(int self_id, int sender_id, const char* method, value_t* ar
   case CLASS_Worker:     dispatch_Worker(self_id, sender_id, method, args, n_args); break;
   case CLASS_Collector:  dispatch_Collector(self_id, sender_id, method, args, n_args); break;
   case CLASS_DiningBench: dispatch_DiningBench(self_id, sender_id, method, args, n_args); break;
+  case CLASS_ForkCM:     dispatch_ForkCM(self_id, sender_id, method, args, n_args); break;
+  case CLASS_PhilCM:     dispatch_PhilCM(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -2253,6 +2541,8 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_Worker:     init_fields_Worker(self_id);     break;
   case CLASS_Collector:  init_fields_Collector(self_id);  break;
   case CLASS_DiningBench: init_fields_DiningBench(self_id); break;
+  case CLASS_ForkCM:     init_fields_ForkCM(self_id);     break;
+  case CLASS_PhilCM:     init_fields_PhilCM(self_id);     break;
   default: break;
   }
 }

@@ -38,8 +38,15 @@
 static char           upload_slot_name[64];
 /* 512 KB — bumped from 64 KB so a full xinu.boot (~305 KB) can be
  * uploaded for the /kexec network-update path.  Lives in .bss so it
- * doesn't inflate the on-disk binary, just runtime footprint. */
-static unsigned char  upload_slot_data[524288];
+ * doesn't inflate the on-disk binary, just runtime footprint.
+ *
+ * MUST be word-aligned: the kexec stub uses LDR r3, [r0], #4 to copy
+ * the buffer to 0x8000 with the MMU disabled (treats memory as
+ * Strongly Ordered, so any misalignment data-aborts regardless of
+ * SCTLR.A).  Without this attribute the linker may park the array at
+ * an odd offset and only some kernel sizes survive — silent boot
+ * failure with `!EXC A` at PC=0x7fec. */
+static unsigned char  upload_slot_data[524288] __attribute__((aligned(16)));
 static int            upload_slot_size = 0;
 
 void _upload_set(const char *name, const unsigned char *data, int size)
@@ -1437,7 +1444,7 @@ thread webactor_server(void)
                     }
                 }
                 if (mode < 0)  mode = 0;
-                if (mode > 2)  mode = 2;
+                if (mode > 3)  mode = 3;     /* 0=par 1=stag 2=seq 3=CM */
                 if (meals < 1) meals = 1;
                 if (meals > 100) meals = 100;
                 abcl_dining_start(mode, meals);
