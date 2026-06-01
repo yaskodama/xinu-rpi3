@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage5-b12b (fix Fn2 large-frame chunking)"
+#define WIFI_BUILD_ID "wifi-stage5-b12d (enable event_msgs so fw pushes results)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1201,6 +1201,18 @@ static int wifi_scan(int *out_count)
     int nseen = 0, tries, chan, doff, i;
 
     *out_count = 0;
+    /* Enable firmware event reporting — without this the fw runs the scan but
+     * never PUSHES the WLC_E_ESCAN_RESULT events, so we saw frames=0.  16-byte
+     * bitmask, all enabled (plan9 wlinit). */
+    {
+        uint8_t em[16];
+        for (i = 0; i < 16; i++) em[i] = 0xFF;
+        if (wifi_set_iovar("event_msgs", em, 16) != 0)
+            wifi_log("[wifi] scan: event_msgs failed (continuing)\r\n");
+        else
+            wifi_log("[wifi] scan: event_msgs enabled\r\n");
+    }
+    wifi_cmd_int(0x56, 0);   /* WLC_SET_PM = 0 (powersave off) */
     /* load regulatory (CLM) first — required before country/up on this fw */
     if (wifi_clmload() != 0)
         wifi_log("[wifi] scan: clmload failed (continuing)\r\n");
@@ -1229,19 +1241,28 @@ static int wifi_scan(int *out_count)
     }
     wifi_log("[wifi] scan: escan started, collecting results...\r\n");
 
-    for (tries = 0; tries < 1200; tries++) {     /* ~up to several seconds */
+    {
+    int nframes = 0, nchan1 = 0, nev = 0;
+    for (tries = 0; tries < 2000; tries++) {     /* ~up to several seconds */
         uint8_t *evp, *escan, *bss;
         int len, event, nbss, bdc;
 
         len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
         if (len < 0) break;
         if (len == 0) { wifi_delay_us(5000); continue; }
-        if (chan != 1) continue;                 /* only event frames carry results */
+        nframes++;
+        if (chan != 1) {
+            if (nframes <= 12) wifi_log("[wifi] scan rx: chan=%d len=%d (skip)\r\n", chan, len);
+            continue;
+        }
+        nchan1++;
         if (len < doff + 4) continue;
         bdc = 4 + (fr[doff + 3] << 2);
         evp = fr + doff + bdc;                    /* 802.3 event frame */
         if ((int)(evp - fr) + 24 + 64 > len) continue;
         event = (evp[24 + 6] << 8) | evp[24 + 7]; /* big-endian event number */
+        if (nev < 12) { wifi_log("[wifi] scan rx: chan1 len=%d doff=%d bdc=%d event=%d\r\n",
+                                 len, doff, bdc, event); nev++; }
         if (event == WLC_E_SCAN_COMPLETE) { wifi_log("[wifi] scan: complete event\r\n"); break; }
         if (event != WLC_E_ESCAN_RESULT) continue;
         escan = evp + 24 + 48;
@@ -1273,6 +1294,9 @@ static int wifi_scan(int *out_count)
                          bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], ch, rssi);
             }
         }
+    }
+    wifi_log("[wifi] scan: frames=%d chan1=%d (collected %d AP)\r\n",
+             nframes, nchan1, nseen);
     }
     *out_count = nseen;
     return 0;
