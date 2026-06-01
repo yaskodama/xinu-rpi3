@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage3a-b8b (set F1/F2 block size for block-mode CMD53)"
+#define WIFI_BUILD_ID "wifi-stage3b-b9 (firmware download + CR4 start)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -166,6 +166,7 @@ const char *wifi_trace(void) { return wifi_tbuf; }
 /* CCCR (function 0) registers */
 #define SDIO_CCCR_IOEx          0x02   /* I/O function enable               */
 #define SDIO_CCCR_IORx          0x03   /* I/O function ready                */
+#define SDIO_CCCR_INT_ENABLE    0x04   /* interrupt enable                  */
 #define SDIO_CCCR_BUS_IF        0x07   /* bus width                         */
 
 /* Broadcom F1 backplane window registers (brcmfmac sdio.h) */
@@ -677,20 +678,22 @@ static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
     return 0;
 }
 
-/* Bulk backplane read/write across 0x8000 windows (plan9 sbmem+sbrw). */
+/* Bulk backplane read/write across 0x8000 windows (plan9 sbmem+sbrw).
+ * Each CMD53 is capped at SB_XFER (2048) so it stays well under the 511-block
+ * limit (32 blocks of 64) and within a single 0x8000 window. */
+#define SB_XFER 2048
 static int wifi_sbmem(int write, uint8_t *buf, int len, uint32_t addr)
 {
-    uint32_t n = SB_WSIZE - (addr & (SB_WSIZE - 1));
     while (len > 0) {
         uint32_t woff;
-        int chunk = ((int)n < len) ? (int)n : len;
+        int wrem = (int)(SB_WSIZE - (addr & (SB_WSIZE - 1)));   /* to window end */
+        int chunk = len;
+        if (chunk > SB_XFER) chunk = SB_XFER;
+        if (chunk > wrem)    chunk = wrem;
         if (sdio_set_window(addr) != 0) return -1;
         woff = (addr & (SB_WSIZE - 1)) | SB_32BIT;
-        /* transfer chunk (round down to 4 for the bulk part; tail < 4 ignored
-         * — firmware/EROM lengths here are 4-aligned). */
-        if (wifi_cmd53_pio(write, 1, woff, buf, chunk & ~3, 1) != 0) return -1;
+        if (wifi_cmd53_pio(write, 1, woff, buf, (chunk + 3) & ~3, 1) != 0) return -1;
         addr += chunk; buf += chunk; len -= chunk;
-        n = SB_WSIZE;
     }
     return 0;
 }
@@ -775,6 +778,172 @@ static int wifi_ramscan(void)
     }
     chip_socramsize = size;
     chip_rambase = 0x198000;       /* BCM43455 TCM base */
+    return 0;
+}
+
+/* ================================================================== *
+ *  Stage 3b — firmware download + ARM core start                     *
+ *  (port of plan9 ether4330.c sbinit/fwload/sbenable)                *
+ * ================================================================== */
+/* Clkcsr (F1 byte register 0x1000e) bits */
+#define REG_CLKCSR   0x1000E
+#define CLK_FORCEALP 0x01
+#define CLK_FORCEHT  0x02
+#define CLK_REQALP   0x08
+#define CLK_REQHT    0x10
+#define CLK_NOHWREQ  0x20
+#define CLK_ALPAVAIL 0x40
+#define CLK_HTAVAIL  0x80
+#define REG_PULLUPS  0x1000F
+/* sdio core (0x829) registers */
+#define SDR_INTSTATUS 0x20
+#define SDR_INTMASK   0x24
+#define SDR_MBOXDATA  0x48
+
+extern uint8_t wifi_fw_bin[],   wifi_fw_bin_end[];
+extern uint8_t wifi_nvram_txt[], wifi_nvram_txt_end[];
+
+/* single-byte F1 register access (plan9 cfgr/cfgw) */
+static int  cfgr(uint32_t off) { return sdio_cmd52(1, off, 0, 0); }
+static void cfgw(uint32_t off, int v) { sdio_cmd52(1, off, 1, v); }
+
+/* core enable/reset via the SonicsSiliconBackplane wrapper (Ioctrl/Resetctrl) */
+static void sb_disable(uint32_t regs, int pre, int ioctl)
+{
+    uint32_t v;
+    if (wifi_backplane_read32(regs + REG_RESETCTRL, &v) == 0 && (v & 1)) {
+        wifi_backplane_write32(regs + REG_IOCTRL, 3 | ioctl);
+        wifi_backplane_read32(regs + REG_IOCTRL, &v);
+        return;
+    }
+    wifi_backplane_write32(regs + REG_IOCTRL, 3 | pre);
+    wifi_backplane_read32(regs + REG_IOCTRL, &v);
+    wifi_backplane_write32(regs + REG_RESETCTRL, 1);
+    wifi_delay_us(10);
+    do { wifi_backplane_read32(regs + REG_RESETCTRL, &v); } while (!(v & 1));
+    wifi_backplane_write32(regs + REG_IOCTRL, 3 | ioctl);
+    wifi_backplane_read32(regs + REG_IOCTRL, &v);
+}
+
+static void sb_reset(uint32_t regs, int pre, int ioctl)
+{
+    uint32_t v;
+    sb_disable(regs, pre, ioctl);
+    do {
+        wifi_backplane_read32(regs + REG_RESETCTRL, &v);
+        if (v & 1) { wifi_backplane_write32(regs + REG_RESETCTRL, 0); wifi_delay_us(40); }
+    } while (v & 1);
+    wifi_backplane_write32(regs + REG_IOCTRL, 1 | ioctl);
+    wifi_backplane_read32(regs + REG_IOCTRL, &v);
+}
+
+/* condense nvram text to a 'var=value\0...\0' list (plan9 condense). */
+static int wifi_condense(uint8_t *buf, int n)
+{
+    uint8_t *p, *ep = buf + n, *op = buf, *lp = buf;
+    int c, skipping = 0;
+    for (p = buf; p < ep; p++) {
+        c = *p;
+        if (c == '#') skipping = 1;
+        else if (c == '\0' || c == '\n') {
+            skipping = 0;
+            if (op != lp) { *op++ = '\0'; lp = op; }
+        } else if (c == '\r') { /* drop */ }
+        else if (!skipping) *op++ = (uint8_t)c;
+    }
+    if (!skipping && op != lp) *op++ = '\0';
+    *op++ = '\0';
+    for (n = op - buf; n & 3; n++) *op++ = '\0';
+    return n;
+}
+
+/* Download firmware + NVRAM into chip RAM and start the ARM CR4 core. */
+static int wifi_fwload(void)
+{
+    static uint8_t nvbuf[3072];
+    uint8_t trailer[4];
+    uint32_t resetvec, t, fwlen, nvlen, off;
+    int i;
+
+    fwlen = (uint32_t)(wifi_fw_bin_end - wifi_fw_bin);
+    nvlen = (uint32_t)(wifi_nvram_txt_end - wifi_nvram_txt);
+    wifi_log("[wifi] fwload: fw=%u B nvram=%u B -> rambase 0x%x (ramsize %u)\r\n",
+             fwlen, nvlen, chip_rambase, chip_socramsize);
+
+    /* request ALP clock */
+    cfgw(REG_CLKCSR, CLK_REQALP);
+    for (i = 0; i < 2000 && !(cfgr(REG_CLKCSR) & CLK_ALPAVAIL); i++) wifi_delay_us(100);
+
+    /* clear the nvram trailer word */
+    trailer[0] = trailer[1] = trailer[2] = trailer[3] = 0;
+    if (wifi_sbmem(1, trailer, 4, chip_rambase + chip_socramsize - 4) != 0) return -1;
+
+    /* write the firmware to RAM base; first 4 bytes are the reset vector */
+    resetvec = (uint32_t)wifi_fw_bin[0] | ((uint32_t)wifi_fw_bin[1] << 8) |
+               ((uint32_t)wifi_fw_bin[2] << 16) | ((uint32_t)wifi_fw_bin[3] << 24);
+    if (wifi_sbmem(1, wifi_fw_bin, (int)fwlen, chip_rambase) != 0) {
+        wifi_log("[wifi] fwload: firmware write failed\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] fwload: firmware written\r\n");
+
+    /* condense nvram, write near the top of RAM, then the length token */
+    if (nvlen > sizeof(nvbuf)) nvlen = sizeof(nvbuf);
+    for (i = 0; i < (int)nvlen; i++) nvbuf[i] = wifi_nvram_txt[i];
+    nvlen = wifi_condense(nvbuf, (int)nvlen);
+    off = chip_socramsize - nvlen - 4;
+    if (wifi_sbmem(1, nvbuf, (int)nvlen, chip_rambase + off) != 0) return -1;
+    t = nvlen / 4;
+    t = (t & 0xFFFF) | (~t << 16);
+    trailer[0] = t; trailer[1] = t >> 8; trailer[2] = t >> 16; trailer[3] = t >> 24;
+    if (wifi_sbmem(1, trailer, 4, chip_rambase + chip_socramsize - 4) != 0) return -1;
+    wifi_log("[wifi] fwload: nvram %u B + trailer 0x%x written\r\n", nvlen, t);
+
+    /* start the CR4: clear sdio intstatus, plant reset vector at 0, run */
+    wifi_backplane_write32(chip_sdregs + SDR_INTSTATUS, 0xFFFFFFFFu);
+    if (resetvec != 0) {
+        trailer[0] = resetvec; trailer[1] = resetvec >> 8;
+        trailer[2] = resetvec >> 16; trailer[3] = resetvec >> 24;
+        wifi_sbmem(1, trailer, 4, 0);
+    }
+    sb_reset(chip_armctl, CR4_CPUHALT, 0);
+    wifi_log("[wifi] fwload: CR4 released (resetvec=0x%x) — firmware running\r\n", resetvec);
+    return 0;
+}
+
+/* After fw is running: bring up the HT clock and enable WLAN data (Fn2). */
+static int wifi_sbenable(void)
+{
+    int i, fn2;
+    cfgw(REG_CLKCSR, 0);
+    wifi_delay_us(1000);
+    cfgw(REG_CLKCSR, CLK_REQHT);
+    for (i = 0; i < 500 && !(cfgr(REG_CLKCSR) & CLK_HTAVAIL); i++) wifi_delay_us(2000);
+    if (!(cfgr(REG_CLKCSR) & CLK_HTAVAIL)) {
+        wifi_log("[wifi] sbenable: HT clock never came up (csr=0x%02x)\r\n", cfgr(REG_CLKCSR));
+        return -1;
+    }
+    cfgw(REG_CLKCSR, cfgr(REG_CLKCSR) | CLK_FORCEHT);
+    wifi_delay_us(10000);
+    wifi_log("[wifi] sbenable: HT clock up (csr=0x%02x)\r\n", cfgr(REG_CLKCSR));
+
+    /* sdio core: protocol version + interrupt mask */
+    wifi_backplane_write32(chip_sdregs + SDR_MBOXDATA, 4 << 16);
+    wifi_backplane_write32(chip_sdregs + SDR_INTMASK, (1u<<7)|(1u<<6)|(1u<<5));
+
+    /* enable WLAN data function 2 */
+    sdio_cmd52(0, SDIO_CCCR_IOEx, 1, (1 << 1) | (1 << 2));   /* enable F1+F2 */
+    for (i = 0, fn2 = 0; i < 50; i++) {
+        fn2 = sdio_cmd52(0, SDIO_CCCR_IORx, 0, 0);
+        if (fn2 >= 0 && (fn2 & (1 << 2))) break;
+        wifi_delay_us(2000);
+    }
+    if (!(fn2 & (1 << 2))) {
+        wifi_log("[wifi] sbenable: Fn2 not ready (IOR=0x%02x)\r\n", fn2);
+        return -1;
+    }
+    sdio_cmd52(0, SDIO_CCCR_INT_ENABLE, 1, (1<<1)|(1<<2)|1);
+    wifi_log("[wifi] sbenable: WLAN function 2 enabled+ready\r\n");
     return 0;
 }
 
@@ -959,6 +1128,33 @@ int wifi_probe(void)
     }
     wifi_log("[wifi] RAM: base=0x%x size=%u bytes (%u KB)\r\n",
              chip_rambase, chip_socramsize, chip_socramsize / 1024);
-    wifi_log("[wifi] *** SUCCESS: Stage 3a — chip cores + RAM enumerated ***\r\n");
+
+    /* ---- Stage 3b: download firmware + start the ARM CR4 ----
+     * sbinit-equivalent: halt the ARM core, reset the d11 (MAC) core, then
+     * force the ALP clock; then fwload writes fw+nvram and releases the CR4;
+     * sbenable brings up the HT clock and enables WLAN function 2. */
+    sb_reset(chip_armctl, CR4_CPUHALT, CR4_CPUHALT);   /* halt CR4 */
+    sb_reset(chip_d11ctl, 8 | 4, 4);                   /* reset d11 MAC */
+    cfgw(REG_CLKCSR, 0);
+    wifi_delay_us(10);
+    cfgw(REG_CLKCSR, CLK_NOHWREQ | CLK_REQALP);
+    for (r = 0; r < 2000 && !(cfgr(REG_CLKCSR) & (CLK_HTAVAIL | CLK_ALPAVAIL)); r++)
+        wifi_delay_us(10);
+    cfgw(REG_CLKCSR, CLK_NOHWREQ | CLK_FORCEALP);
+    wifi_delay_us(65);
+    cfgw(REG_PULLUPS, 0);
+    wifi_backplane_write32(chip_chipcommon + 0x58, 0);   /* gpio pullup   */
+    wifi_backplane_write32(chip_chipcommon + 0x5c, 0);   /* gpio pulldown */
+    wifi_log("[wifi] chip halted + ALP clock forced (csr=0x%02x)\r\n", cfgr(REG_CLKCSR));
+
+    if (wifi_fwload() != 0) {
+        wifi_log("[wifi] FAILED: firmware download\r\n");
+        return -1;
+    }
+    if (wifi_sbenable() != 0) {
+        wifi_log("[wifi] FAILED: sbenable (HT clock / Fn2)\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] *** SUCCESS: Stage 3 — firmware loaded, chip running ***\r\n");
     return 0;
 }
