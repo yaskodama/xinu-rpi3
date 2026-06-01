@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b22 (FWSUP; GET_BSSID assoc poll, ground-truth link)"
+#define WIFI_BUILD_ID "wifi-stage6-b23 (FWSUP; wsec/auth/wpa_auth via IOVARS like brcmfmac)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1742,20 +1742,29 @@ static int wifi_do_join(const char *ssid, const char *pass)
                  wifi_tgt_found, wifi_tgt_chanspec);
     }
 
+    /* Establish infra (managed STA) mode, then bring the interface UP and keep
+     * it up — brcmf_cfg80211_connect sets all security via iovars with the
+     * interface UP and never toggles DOWN (a DOWN was clearing our settings). */
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_cmd_int(WLC_SET_INFRA, 1);
+    wifi_cmd_int(2, 1);                          /* WLC_UP */
+    wifi_delay_us(50000);
     if (secured) {
-        /* FWSUP WPA2-PSK path (matches brcmfmac brcmf_cfg80211_connect, minimal
-         * fw with idsup).  Order: wsec/wpa_auth/auth while down, UP, then
-         * sup_wpa=1 + the 32-byte PMK, then the join iovar.  The firmware runs
-         * the 4-way handshake internally and raises E_LINK up on success. */
+        /* Match brcmf_cfg80211_connect exactly — every security parameter is a
+         * (bsscfg, idx 0 => plain) IOVAR, not a WLC_SET_* command.  Order:
+         *   set_wpa_version : wpa_auth = WPA2_AUTH_PSK|WPA2_AUTH_UNSPECIFIED
+         *   set_auth_type   : auth     = 0 (open)
+         *   set_wsec_mode   : wsec     = AES_ENABLED (4)
+         *   set_key_mgmt    : wpa_auth = WPA2_AUTH_PSK (refine)
+         *   FWSUP           : sup_wpa  = 1
+         *   set_pmk         : WLC_SET_WSEC_PMK (the only command)
+         * Setting wsec/auth via commands (134/165/22) earlier left the bsscfg
+         * iovars the join/FWSUP path reads at 0 -> probed but never associated. */
         int rc;
-        wifi_cmd_int(WLC_SET_WSEC, 4);          /* wsec = AES/CCMP */
-        wifi_set_iovar_int("wpa_auth", 0x80);   /* WPA2-PSK */
-        wifi_cmd_int(WLC_SET_WPA_AUTH, 0x80);
-        wifi_cmd_int(22 /*WLC_SET_AUTH*/, 0);   /* open auth (WPA2 uses open) */
-        wifi_cmd_int(2, 1);                      /* WLC_UP */
-        wifi_delay_us(50000);
+        wifi_set_iovar_int("wpa_auth", 0xc0);    /* WPA2_AUTH_PSK | UNSPECIFIED */
+        wifi_set_iovar_int("auth", 0);           /* open auth */
+        wifi_set_iovar_int("wsec", 4);           /* AES_ENABLED (CCMP) */
+        wifi_set_iovar_int("wpa_auth", 0x80);    /* WPA2_AUTH_PSK */
         rc = wifi_set_iovar_int("sup_wpa", 1);   /* enable in-dongle supplicant */
         wifi_d_sup = rc;
         wifi_log("[wifi] join: sup_wpa=1 rc=%d %s\r\n", rc,
@@ -1765,10 +1774,9 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_log("[wifi] join: WSEC_PMK rc=%d %s\r\n", rc,
                  rc ? "(fw rejected PMK)" : "(PMK accepted)");
     } else {
-        wifi_cmd_int(WLC_SET_WSEC, 0);
-        wifi_set_iovar_int("wpa_auth", 0);
-        wifi_cmd_int(2, 1);                      /* WLC_UP */
-        wifi_delay_us(50000);
+        wifi_set_iovar_int("wsec", 0);
+        wifi_set_iovar_int("wpa_auth", 0);       /* WPA_AUTH_DISABLED */
+        wifi_set_iovar_int("auth", 0);
     }
 
     /* Build the "join" iovar = struct brcmf_ext_join_params_le.  ★ The scan
