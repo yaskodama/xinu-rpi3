@@ -10,7 +10,11 @@
 /* P3: bumped from 16 to 64 so the lock-free MPSC ring can sustain
    higher producer fan-in without back-pressure dropping messages. */
 #define MAX_MAILBOX 64
-#define MAX_OBJECTS 16
+/* MAX_OBJECTS bumped 16 -> 32 to fit dining5 bench: opt-in init creates
+ * 1 (WebReceiver) + 5 (Dispatcher + 4 Workers) + 1 (Collector) + 1
+ * (DiningBench) + 5 (Forks) + 5 (Philosophers) = 18 actors.  Memory cost
+ * is ~80 KB more .bss for the extra mailboxes + field tables. */
+#define MAX_OBJECTS 32
 #define MAX_FIELDS  16
 #define MAX_ARGS    8
 
@@ -524,6 +528,7 @@ static int _abcl_cap = 0;
 #define CLASS_Dispatcher 3    /* load-balancer router */
 #define CLASS_Worker 4        /* load-balancer worker (compute target) */
 #define CLASS_Collector 5     /* periodic actor GC */
+#define CLASS_DiningBench 6   /* 5 philosophers + 5 forks benchmark orchestrator */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
@@ -532,6 +537,7 @@ static int _abcl_cap = 0;
 #define ABCL_PRIO_Dispatcher 25   /* routing is fast — keep ahead of workers */
 #define ABCL_PRIO_Worker 22       /* one above philosophers so submit() lands */
 #define ABCL_PRIO_Collector 26    /* GC runs above dispatcher so sweeps land */
+#define ABCL_PRIO_DiningBench 24  /* between Dispatcher (25) and Worker (22) */
 static int abcl_class_prio(int class_id) {
   switch (class_id) {
   case CLASS_Fork: return ABCL_PRIO_Fork;
@@ -540,6 +546,7 @@ static int abcl_class_prio(int class_id) {
   case CLASS_Dispatcher: return ABCL_PRIO_Dispatcher;
   case CLASS_Worker:     return ABCL_PRIO_Worker;
   case CLASS_Collector:  return ABCL_PRIO_Collector;
+  case CLASS_DiningBench: return ABCL_PRIO_DiningBench;
   default: return INITPRIO;
   }
 }
@@ -551,6 +558,7 @@ const char* abcl_class_name(int class_id) {
   case CLASS_Dispatcher: return "Dispatcher";
   case CLASS_Worker:     return "Worker";
   case CLASS_Collector:  return "Collector";
+  case CLASS_DiningBench: return "DiningBench";
   default: return "?";
   }
 }
@@ -560,6 +568,7 @@ static void dispatch_Philosopher(int, int, const char*, value_t*, int);
 static void dispatch_Dispatcher(int, int, const char*, value_t*, int);
 static void dispatch_Worker(int, int, const char*, value_t*, int);
 static void dispatch_Collector(int, int, const char*, value_t*, int);
+static void dispatch_DiningBench(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -636,7 +645,11 @@ static void dispatch_Fork(int self_id, int sender_id, const char* method, value_
   fprintf(stderr, "unknown method %s on Fork\n", method);
 }
 
-enum { F_Philosopher_my_id, F_Philosopher_f_low, F_Philosopher_f_high, F_Philosopher_meals, F_Philosopher_meal_idx, F_Philosopher_state, F_Philosopher__N };
+enum { F_Philosopher_my_id, F_Philosopher_f_low, F_Philosopher_f_high,
+       F_Philosopher_meals, F_Philosopher_meal_idx, F_Philosopher_state,
+       F_Philosopher_done_to,    /* DiningBench orch obj_id (0 = no-op) */
+       F_Philosopher_t_start,    /* ms when init_phil was processed */
+       F_Philosopher__N };
 
 static void init_fields_Philosopher(int self_id) {
   (void)self_id;
@@ -648,6 +661,9 @@ static void init_fields_Philosopher(int self_id) {
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
 }
 
+/* dining5 bench 用に拡張: init_phil(id, low, high, meals, done_to) を新規
+ * メソッドとして dispatch_Philosopher で受ける.  既存の `init` は 3-arg の
+ * ままで dining 哲学者本来の startup シーケンスとして残る。 */
 static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_args) {
   (void)args; (void)n_args; (void)sender_id;
   long p_id_arg = (n_args > 0) ? ((args[0]).tag == V_INT ? (args[0]).i : (long)((args[0]).f)) : (long)(0L);
@@ -659,18 +675,54 @@ static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_ar
   objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(50L));
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
+  objects[self_id].fields[F_Philosopher_done_to] = mk_obj(0);
+  objects[self_id].fields[F_Philosopher_t_start] = mk_int((long)(clkticks * 10));
+  enqueue(self_id, self_id, "try_eat", 0, NULL);
+}
+
+/* 5-arg 版: (id, low, high, meals, done_to_orch).  meals と done_to を上書きする
+ * 以外は init() と同じ。dining5 bench はこれを使う。 */
+static void Philosopher_init_phil(int self_id, int sender_id,
+                                  value_t* args, int n_args) {
+  (void)sender_id;
+  long p_id     = (n_args > 0) ? args[0].i      : 0L;
+  int  p_lo     = (n_args > 1) ? args[1].obj_id : -1;
+  int  p_hi     = (n_args > 2) ? args[2].obj_id : -1;
+  long meals    = (n_args > 3) ? args[3].i      : 50L;
+  int  done_to  = (n_args > 4) ? args[4].obj_id : 0;
+  objects[self_id].fields[F_Philosopher_my_id]    = mk_int(p_id);
+  objects[self_id].fields[F_Philosopher_f_low]    = mk_obj(p_lo);
+  objects[self_id].fields[F_Philosopher_f_high]   = mk_obj(p_hi);
+  objects[self_id].fields[F_Philosopher_meals]    = mk_int(meals);
+  objects[self_id].fields[F_Philosopher_meal_idx] = mk_int(0L);
+  objects[self_id].fields[F_Philosopher_state]    = mk_int(0L);
+  objects[self_id].fields[F_Philosopher_done_to]  = mk_obj(done_to);
+  objects[self_id].fields[F_Philosopher_t_start]  = mk_int((long)(clkticks * 10));
   enqueue(self_id, self_id, "try_eat", 0, NULL);
 }
 
 static void Philosopher_try_eat(int self_id, int sender_id, value_t* args, int n_args) {
   (void)args; (void)n_args; (void)sender_id;
   int _pid = (int)((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f));
-  if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_meals]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meals]).i : (long)((objects[self_id].fields[F_Philosopher_meals]).f))) == (0L))))))) {
-    abcl_phil_say(_pid, "finished — terminating (suicide)");
+  long meals_left = (objects[self_id].fields[F_Philosopher_meals]).i;
+  if (meals_left == 0L) {
+    int orch = objects[self_id].fields[F_Philosopher_done_to].obj_id;
+    if (orch > 0) {
+      long t_start = objects[self_id].fields[F_Philosopher_t_start].i;
+      long elapsed = (long)(clkticks * 10) - t_start;
+      enqueue(self_id, orch, "phil_done", 2,
+              (value_t[]){ mk_int((long)_pid), mk_int(elapsed) });
+    } else {
+      abcl_phil_say(_pid, "finished — terminating (suicide)");
+    }
     abcl_actor_suicide(self_id);
   } else {
-    abcl_phil_say(_pid, "thinking");
-    sleep(450);   /* pace so the narration is readable on the console */
+    /* dining5 bench 用に narrative + 450ms sleep を抑制
+     * (orch 設定時 = bench 中はサイレント+高速)。 */
+    if (objects[self_id].fields[F_Philosopher_done_to].obj_id == 0) {
+      abcl_phil_say(_pid, "thinking");
+      sleep(450);
+    }
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_low].obj_id, "acquire", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
   }
 }
@@ -679,21 +731,24 @@ static void Philosopher_fork_granted(int self_id, int sender_id, value_t* args, 
   (void)args; (void)n_args; (void)sender_id;
   value_t p_pid = (n_args > 0) ? args[0] : mk_int(0L);
   int _pid = (int)((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f));
+  int bench_mode = (objects[self_id].fields[F_Philosopher_done_to].obj_id != 0);
   if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_state]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_state]).i : (long)((objects[self_id].fields[F_Philosopher_state]).f))) == (0L))))))) {
     /* got the first (low) fork — go for the second (high) one. */
     objects[self_id].fields[F_Philosopher_state] = mk_int((long)(1L));
-    abcl_phil_say(_pid, "took a fork");
+    if (!bench_mode) abcl_phil_say(_pid, "took a fork");
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_high].obj_id, "acquire", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
   } else {
     /* got the second fork — both held, so eat, then put them down. */
-    abcl_phil_say(_pid, "took a fork");
-    abcl_phil_say(_pid, "eating");
-    sleep(450);   /* eating (holds both forks) */
+    if (!bench_mode) {
+      abcl_phil_say(_pid, "took a fork");
+      abcl_phil_say(_pid, "eating");
+      sleep(450);   /* eating (holds both forks) — narration pace only */
+    }
     objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(((((objects[self_id].fields[F_Philosopher_meal_idx]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meal_idx]).i : (long)((objects[self_id].fields[F_Philosopher_meal_idx]).f))) + (1L))));
     objects[self_id].fields[F_Philosopher_meals] = mk_int((long)(((((objects[self_id].fields[F_Philosopher_meals]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_meals]).i : (long)((objects[self_id].fields[F_Philosopher_meals]).f))) - (1L))));
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_high].obj_id, "release", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_low].obj_id, "release", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
-    abcl_phil_say(_pid, "put down forks");
+    if (!bench_mode) abcl_phil_say(_pid, "put down forks");
     objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
     enqueue(self_id, self_id, "try_eat", 0, NULL);
   }
@@ -702,16 +757,27 @@ static void Philosopher_fork_granted(int self_id, int sender_id, value_t* args, 
 static void Philosopher_fork_denied(int self_id, int sender_id, value_t* args, int n_args) {
   (void)args; (void)n_args; (void)sender_id;
   value_t p_pid = (n_args > 0) ? args[0] : mk_int(0L);
+  int bench_mode = (objects[self_id].fields[F_Philosopher_done_to].obj_id != 0);
   if (truthy(mk_int((long)(((long)((((objects[self_id].fields[F_Philosopher_state]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_state]).i : (long)((objects[self_id].fields[F_Philosopher_state]).f))) == (1L))))))) {
     enqueue(self_id, objects[self_id].fields[F_Philosopher_f_low].obj_id, "release", 1, (value_t[]){mk_int((long)(((objects[self_id].fields[F_Philosopher_my_id]).tag == V_INT ? (objects[self_id].fields[F_Philosopher_my_id]).i : (long)((objects[self_id].fields[F_Philosopher_my_id]).f))))});
     objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
   } else {
+  }
+  /* Backoff so we don't livelock with the philosopher who has our fork.
+   * Stagger by my_id so adjacent philosophers don't lock-step retry —
+   * P_i sleeps 10 + i*8 ms (= 10, 18, 26, 34, 42).  Empirically a
+   * uniform 5 ms backoff still livelocks the P2/P3 pair on the shared
+   * F3 fork; staggering breaks the symmetry. */
+  if (bench_mode) {
+    int my_id_int = (int)objects[self_id].fields[F_Philosopher_my_id].i;
+    sleep(10 + my_id_int * 8);
   }
   enqueue(self_id, self_id, "try_eat", 0, NULL);
 }
 
 static void dispatch_Philosopher(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   if (strcmp(method, "init") == 0) { Philosopher_init(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "init_phil") == 0) { Philosopher_init_phil(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "try_eat") == 0) { Philosopher_try_eat(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "fork_granted") == 0) { Philosopher_fork_granted(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "fork_denied") == 0) { Philosopher_fork_denied(self_id, sender_id, args, n_args); return; }
@@ -1959,6 +2025,212 @@ void abcl_gc_actor_init(void) {
   signal(print_mu);
 }
 
+/* ============================================================
+ * DiningBench — 5 哲学者問題 (5 forks + 5 philosophers) のベンチ
+ * Orchestrator として 3 つの分散戦略を比較.
+ *
+ * mode 0 : 全 5 並列 (古典)
+ * mode 1 : 3+2 段階    (P0-P2 完了後に P3,P4 起動)
+ * mode 2 : 順次 1 人ずつ
+ *
+ * HTTP:
+ *   POST /api/dining/init        — DiningBench actor を spawn (idempotent)
+ *   POST /api/dining/start?mode=N&meals=M
+ *   GET  /api/dining/status      — n_done / elapsed_ms / max_phil_ms
+ * ============================================================ */
+enum { F_Dining_mode, F_Dining_meals,
+       F_Dining_t_start, F_Dining_t_end,
+       F_Dining_n_done, F_Dining_max_phil,
+       F_Dining_cursor,
+       F_Dining_f0, F_Dining_f1, F_Dining_f2, F_Dining_f3, F_Dining_f4,
+       F_Dining_p0, F_Dining_p1, F_Dining_p2, F_Dining_p3, F_Dining_p4,
+       F_Dining__N };
+/* F_Dining__N = 17 — EXCEEDS MAX_FIELDS=16 !
+ * Fix: keep philosophers in a small file-static array indexed by
+ * DiningBench obj_id.  Workable because we only ever have 1
+ * DiningBench actor live at a time. */
+static int  g_dining_obj   = -1;        /* the DiningBench's obj_id */
+static int  g_dining_forks[5] = { -1, -1, -1, -1, -1 };
+static int  g_dining_phils[5] = { -1, -1, -1, -1, -1 };
+
+/* Re-defined enum without the per-actor f/p slot fields (now in globals). */
+#undef F_Dining_f0
+#undef F_Dining_f1
+#undef F_Dining_f2
+#undef F_Dining_f3
+#undef F_Dining_f4
+#undef F_Dining_p0
+#undef F_Dining_p1
+#undef F_Dining_p2
+#undef F_Dining_p3
+#undef F_Dining_p4
+#undef F_Dining__N
+enum { F_DB_mode, F_DB_meals,
+       F_DB_t_start, F_DB_t_end,
+       F_DB_n_done, F_DB_max_phil,
+       F_DB_cursor,
+       F_DB__N };
+
+static void init_fields_DiningBench(int self_id) {
+  int i;
+  for (i = 0; i < F_DB__N; i++)
+    objects[self_id].fields[i] = mk_int(0L);
+  g_dining_obj = self_id;
+  for (i = 0; i < 5; i++) { g_dining_forks[i] = -1; g_dining_phils[i] = -1; }
+}
+
+static void dining_start_phil(int self_id, int i) {
+  long meals = objects[self_id].fields[F_DB_meals].i;
+  int pid = g_dining_phils[i];
+  /* fork pairs: P_i uses F_i and F_(i+1)%5.  Pick (low, high) by id so
+   * deadlock-free (canonical asymmetric).  P4 uses F0 (low) and F4 (high). */
+  int lo_idx, hi_idx;
+  if (i == 4) { lo_idx = 0; hi_idx = 4; }
+  else        { lo_idx = i; hi_idx = i + 1; }
+  int lo = g_dining_forks[lo_idx];
+  int hi = g_dining_forks[hi_idx];
+  abcl_enqueue(self_id, pid, "init_phil", 5,
+               (value_t[]){ mk_int((long)i),
+                            mk_obj(lo), mk_obj(hi),
+                            mk_int(meals),
+                            mk_obj(self_id) });
+}
+
+static void DiningBench_run(int self_id, int sender_id,
+                            value_t* args, int n_args) {
+  (void)sender_id;
+  long mode  = (n_args > 0) ? args[0].i : 0L;
+  long meals = (n_args > 1) ? args[1].i : 50L;
+  int i;
+  /* Allocate 5 Forks + 5 Philosophers fresh per run.
+   * Caller is responsible for not invoking run twice without giving
+   * the previous batch time to terminate (or for accepting the slot
+   * accumulation; cleaned up by the GC actor's sweep). */
+  for (i = 0; i < 5; i++) {
+    g_dining_forks[i] = alloc_obj(CLASS_Fork, 0, NULL);
+    spawn_actor(g_dining_forks[i]);
+  }
+  for (i = 0; i < 5; i++) {
+    g_dining_phils[i] = alloc_obj(CLASS_Philosopher, 0, NULL);
+    spawn_actor(g_dining_phils[i]);
+  }
+  objects[self_id].fields[F_DB_mode]     = mk_int(mode);
+  objects[self_id].fields[F_DB_meals]    = mk_int(meals);
+  objects[self_id].fields[F_DB_n_done]   = mk_int(0L);
+  objects[self_id].fields[F_DB_max_phil] = mk_int(0L);
+  objects[self_id].fields[F_DB_t_start]  = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_DB_t_end]    = mk_int(0L);
+
+  wait(print_mu);
+  kprintf("[dining] start mode=%ld meals=%ld phils=%d..%d forks=%d..%d\r\n",
+          mode, meals,
+          g_dining_phils[0], g_dining_phils[4],
+          g_dining_forks[0], g_dining_forks[4]);
+  signal(print_mu);
+
+  if (mode == 0L) {
+    /* All 5 in parallel */
+    objects[self_id].fields[F_DB_cursor] = mk_int(5L);
+    for (i = 0; i < 5; i++) dining_start_phil(self_id, i);
+  } else if (mode == 1L) {
+    /* 3 + 2 staggered: launch P0..P2 now; the rest on phil_done */
+    objects[self_id].fields[F_DB_cursor] = mk_int(3L);
+    for (i = 0; i < 3; i++) dining_start_phil(self_id, i);
+  } else {
+    /* sequential: launch P0; subsequent on phil_done */
+    objects[self_id].fields[F_DB_cursor] = mk_int(1L);
+    dining_start_phil(self_id, 0);
+  }
+}
+
+static void DiningBench_phil_done(int self_id, int sender_id,
+                                  value_t* args, int n_args) {
+  (void)sender_id;
+  long phil_id    = (n_args > 0) ? args[0].i : -1L;
+  long elapsed_ms = (n_args > 1) ? args[1].i : 0L;
+  long n_done = objects[self_id].fields[F_DB_n_done].i + 1;
+  objects[self_id].fields[F_DB_n_done] = mk_int(n_done);
+  if (elapsed_ms > objects[self_id].fields[F_DB_max_phil].i) {
+    objects[self_id].fields[F_DB_max_phil] = mk_int(elapsed_ms);
+  }
+  long mode = objects[self_id].fields[F_DB_mode].i;
+  long cur  = objects[self_id].fields[F_DB_cursor].i;
+  if (mode == 1L && n_done == 3L) {
+    /* 3+2 staggered: launch P3 + P4 */
+    objects[self_id].fields[F_DB_cursor] = mk_int(5L);
+    dining_start_phil(self_id, 3);
+    dining_start_phil(self_id, 4);
+  } else if (mode == 2L && cur < 5L) {
+    /* sequential: launch next */
+    objects[self_id].fields[F_DB_cursor] = mk_int(cur + 1L);
+    dining_start_phil(self_id, (int)cur);
+  }
+  if (n_done == 5L) {
+    long t_end = (long)(clkticks * 10);
+    objects[self_id].fields[F_DB_t_end] = mk_int(t_end);
+    wait(print_mu);
+    kprintf("[dining] mode=%ld all done in %ld ms (max_phil=%ld)\r\n",
+            mode, t_end - objects[self_id].fields[F_DB_t_start].i,
+            objects[self_id].fields[F_DB_max_phil].i);
+    signal(print_mu);
+  } else {
+    wait(print_mu);
+    kprintf("[dining] phil=%ld done elapsed=%ld (n_done=%ld/5)\r\n",
+            phil_id, elapsed_ms, n_done);
+    signal(print_mu);
+  }
+}
+
+static void dispatch_DiningBench(int self_id, int sender_id, const char* method,
+                                 value_t* args, int n_args) {
+  if (strcmp(method, "run_bench") == 0)
+  { DiningBench_run(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "phil_done") == 0)
+  { DiningBench_phil_done(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "init") == 0) return;
+}
+
+/* HTTP-facing helpers */
+int abcl_dining_actor_id(void) { return g_dining_obj; }
+
+void abcl_dining_init(void) {
+  if (g_dining_obj >= 0) return;
+  int id = alloc_obj(CLASS_DiningBench, 0, NULL);
+  abcl_object_protect(id, 1);
+  spawn_actor(id);
+  /* g_dining_obj is set inside init_fields_DiningBench */
+}
+
+void abcl_dining_start(int mode, int meals) {
+  if (g_dining_obj < 0) return;
+  abcl_enqueue(-1, g_dining_obj, "run_bench", 2,
+               (value_t[]){ mk_int((long)mode), mk_int((long)meals) });
+}
+
+int abcl_dining_status(char *buf, int cap) {
+  if (cap < 256) return 0;
+  if (g_dining_obj < 0) return sprintf(buf, "dining not initialized\n");
+  int d = g_dining_obj;
+  long t_start  = objects[d].fields[F_DB_t_start].i;
+  long t_end    = objects[d].fields[F_DB_t_end].i;
+  long elapsed  = (t_end > 0) ? (t_end - t_start)
+                               : ((long)(clkticks * 10) - t_start);
+  /* Race guard: a concurrent run_bench could update t_start AFTER we
+   * read clkticks; clamp to 0 instead of confusing the Mac poller
+   * with negative numbers. */
+  if (elapsed < 0) elapsed = 0;
+  return sprintf(buf,
+    "obj=%d mode=%ld meals=%ld n_done=%ld/5\n"
+    "elapsed_ms=%ld (final=%s) max_phil_ms=%ld\n",
+    d,
+    objects[d].fields[F_DB_mode].i,
+    objects[d].fields[F_DB_meals].i,
+    objects[d].fields[F_DB_n_done].i,
+    elapsed,
+    (objects[d].fields[F_DB_n_done].i == 5L) ? "yes" : "no",
+    objects[d].fields[F_DB_max_phil].i);
+}
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
@@ -1967,6 +2239,7 @@ static void dispatch(int self_id, int sender_id, const char* method, value_t* ar
   case CLASS_Dispatcher: dispatch_Dispatcher(self_id, sender_id, method, args, n_args); break;
   case CLASS_Worker:     dispatch_Worker(self_id, sender_id, method, args, n_args); break;
   case CLASS_Collector:  dispatch_Collector(self_id, sender_id, method, args, n_args); break;
+  case CLASS_DiningBench: dispatch_DiningBench(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -1979,6 +2252,7 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_Dispatcher: init_fields_Dispatcher(self_id); break;
   case CLASS_Worker:     init_fields_Worker(self_id);     break;
   case CLASS_Collector:  init_fields_Collector(self_id);  break;
+  case CLASS_DiningBench: init_fields_DiningBench(self_id); break;
   default: break;
   }
 }

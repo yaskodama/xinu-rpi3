@@ -1368,6 +1368,111 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/dining/init — spin up DiningBench orchestrator actor.
+             *   POST /api/dining/start?mode=N&meals=M
+             *   GET  /api/dining/status — n_done / elapsed_ms / max_phil_ms
+             *
+             *   mode 0: 5 philosophers in parallel (classical)
+             *   mode 1: 3+2 staggered  (P0..P2 first, then P3+P4)
+             *   mode 2: sequential     (one philosopher at a time)
+             *
+             * Each mode spawns 5 Forks + 5 Philosophers, so the
+             * DiningBench needs the GC actor to reap the previous run's
+             * residue (or accept the n_objects accumulation up to
+             * MAX_OBJECTS=32). */
+            if (0 == strncmp(reqbuf, "GET /api/dining/init",  20) ||
+                0 == strncmp(reqbuf, "POST /api/dining/init", 21))
+            {
+                extern void abcl_dining_init(void);
+                extern int  abcl_dining_actor_id(void);
+                abcl_dining_init();
+                static char diresp[200];
+                int blen = sprintf(diresp + 100,
+                    "dining initialized (obj=%d)\r\n",
+                    abcl_dining_actor_id());
+                int hlen = sprintf(diresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(diresp + hlen, diresp + 100, blen);
+                write(tcpdev, diresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/dining/start",  21) ||
+                0 == strncmp(reqbuf, "POST /api/dining/start", 22))
+            {
+                extern void abcl_dining_start(int, int);
+                int mode = 0, meals = 50;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url) {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q) {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int kl = eq - p;
+                            if (kl == 4 && 0 == strncmp(p, "mode", 4)
+                                && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                mode = v;
+                            } else if (kl == 5 && 0 == strncmp(p, "meals", 5)
+                                       && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                meals = v;
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                if (mode < 0)  mode = 0;
+                if (mode > 2)  mode = 2;
+                if (meals < 1) meals = 1;
+                if (meals > 100) meals = 100;
+                abcl_dining_start(mode, meals);
+                static char dsresp[200];
+                int blen = sprintf(dsresp + 100,
+                    "dining start mode=%d meals=%d (poll /api/dining/status)\r\n",
+                    mode, meals);
+                int hlen = sprintf(dsresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(dsresp + hlen, dsresp + 100, blen);
+                write(tcpdev, dsresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/dining/status",  22) ||
+                0 == strncmp(reqbuf, "POST /api/dining/status", 23))
+            {
+                extern int abcl_dining_status(char *, int);
+                static char dst[400];
+                int blen = abcl_dining_status(dst + 100, 300);
+                int hlen = sprintf(dst,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(dst + hlen, dst + 100, blen);
+                write(tcpdev, dst, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/init — spin up Dispatcher + 4 Workers if
              *   not already running.  Idempotent.  After cold boot
              *   the load-balancer actors don't exist; this creates
