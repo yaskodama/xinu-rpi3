@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b20 (FWSUP; directed join to scanned BSSID+chanspec)"
+#define WIFI_BUILD_ID "wifi-stage6-b21 (FWSUP; FIXED 65-B ext_join struct, join_scan_params)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1716,8 +1716,8 @@ static int wifi_set_pmk(const char *ssid, int slen, const char *pass, int plen)
 /* Join an AP.  pass==NULL/"" => open network; otherwise WPA2-PSK. */
 static int wifi_do_join(const char *ssid, const char *pass)
 {
-    uint8_t jp[114];
-    int sl = 0, i, ev, secured = (pass && pass[0]), pl = 0;
+    uint8_t jp[65];
+    int sl = 0, i, ev, secured = (pass && pass[0]), pl = 0, jsz;
 
     while (ssid[sl] && sl < 32) sl++;
     if (pass) while (pass[pl] && pl < 63) pl++;
@@ -1770,35 +1770,46 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_delay_us(50000);
     }
 
-    /* build the extended "join" iovar (brcmf_ext_join_params_le, 114 B):
-     *   [0..35]   ssid_le (len + ssid[32])
-     *   [36..101] scan_params (ssid + bssid + bss_type + scan_type + nprobes
-     *             + active/passive/home + channel_num + channel_list[1])
-     *   [102..113] assoc_params (bssid + chanspec_num + chanspec_list[1]) */
+    /* Build the "join" iovar = struct brcmf_ext_join_params_le.  ★ The scan
+     * sub-struct is brcmf_JOIN_scan_params_le (scan_type+4 timers = 17 B), NOT
+     * the larger brcmf_scan_params_le — an earlier 114-B layout (with a nested
+     * ssid_le + bssid + bss_type) put the BSSID/chanspec at the wrong offsets,
+     * so the fw scanned but never associated.  Correct packed layout (65 B):
+     *   [0..3]   SSID_len (le32)
+     *   [4..35]  SSID[32]
+     *   --- brcmf_join_scan_params_le (17 B) ---
+     *   [36]     scan_type (u8)
+     *   [37..40] nprobes (le32)
+     *   [41..44] active_time (le32)
+     *   [45..48] passive_time (le32)
+     *   [49..52] home_time (le32)
+     *   --- brcmf_assoc_params_le (12 B) ---
+     *   [53..58] bssid[6]
+     *   [59..62] chanspec_num (le32)
+     *   [63..64] chanspec_list[0] (le16) */
     for (i = 0; i < (int)sizeof(jp); i++) jp[i] = 0;
-    jp[0] = sl;
+    jp[0] = sl;                                   /* SSID_len */
     for (i = 0; i < sl; i++) jp[4 + i] = ssid[i];
-    /* scan_params.ssid (directed) */
-    jp[36] = sl;
-    for (i = 0; i < sl; i++) jp[40 + i] = ssid[i];
-    for (i = 72; i < 78; i++) jp[i] = 0xFF;      /* scan bssid = broadcast */
-    jp[78] = 2;                                   /* bss_type = any */
-    jp[79] = 0;                                   /* scan_type = active */
-    for (i = 80; i < 96; i++) jp[i] = 0xFF;      /* nprobes/active/passive/home = -1 */
-    /* [96..99] channel_num = 0, [100..101] channel_list[0] = 0 */
+    jp[36] = 0;                                   /* scan_type = use default */
     if (wifi_tgt_found) {
-        /* directed assoc to the exact BSSID + real chanspec from the scan */
-        for (i = 0; i < 6; i++) jp[102 + i] = wifi_tgt_bssid[i];
-        jp[108] = 1;                              /* chanspec_num = 1 */
-        jp[112] = wifi_tgt_chanspec & 0xFF;
-        jp[113] = (wifi_tgt_chanspec >> 8) & 0xFF;
-        /* also point the join-scan at that exact channel */
-        jp[96] = 1; jp[100] = jp[112]; jp[101] = jp[113];
+        /* directed: known channel -> finite probes/dwell (matches ether4330) */
+        jp[37] = 2;                               /* nprobes = 2 */
+        jp[41] = 120;                             /* active_time = 120 ms */
+        jp[45] = 0x86; jp[46] = 0x01;             /* passive_time = 390 ms */
+        jp[49] = 0xFF; jp[50]=0xFF; jp[51]=0xFF; jp[52]=0xFF;  /* home = -1 */
+        for (i = 0; i < 6; i++) jp[53 + i] = wifi_tgt_bssid[i];  /* assoc bssid */
+        jp[59] = 1;                               /* chanspec_num = 1 */
+        jp[63] = wifi_tgt_chanspec & 0xFF;
+        jp[64] = (wifi_tgt_chanspec >> 8) & 0xFF;
+        jsz = 65;
     } else {
-        for (i = 102; i < 108; i++) jp[i] = 0xFF; /* assoc bssid = broadcast */
-        /* [108..111] chanspec_num = 0, [112..113] chanspec_list[0] = 0 */
+        /* broadcast scan-all fallback: all timers = -1, bcast bssid, 0 chans */
+        for (i = 37; i < 53; i++) jp[i] = 0xFF;   /* nprobes/active/passive/home = -1 */
+        for (i = 53; i < 59; i++) jp[i] = 0xFF;   /* assoc bssid = broadcast */
+        /* chanspec_num = 0; omit chanspec_list */
+        jsz = 63;
     }
-    if (wifi_set_iovar("join", jp, sizeof(jp)) != 0) {
+    if (wifi_set_iovar("join", jp, jsz) != 0) {
         wifi_log("[wifi] join: 'join' iovar failed\r\n");
         return -1;
     }
