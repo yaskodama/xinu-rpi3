@@ -1073,6 +1073,35 @@ static void Dispatcher_submit_sticky(int self_id, int sender_id,
           (value_t[]){ mk_int(work_ms), mk_int(task_id) });
 }
 
+/* N-Queens dispatch — round-robin first_col across workers.  Same
+ * routing as submit_jit (uses F_Disp_rr cursor).  Each task receives
+ * (n, first_col, task_id), worker calls abcl_nq_count_partial. */
+static void Dispatcher_submit_nq(int self_id, int sender_id,
+                                 value_t* args, int n_args) {
+  (void)sender_id;
+  long n         = (n_args > 0) ? args[0].i : 8L;
+  long first_col = (n_args > 1) ? args[1].i : 0L;
+  long task_id   = (n_args > 2) ? args[2].i : 0L;
+  int n_workers = (int)objects[self_id].fields[F_Disp_n].i;
+  if (n_workers <= 0) return;
+  long mask = objects[self_id].fields[F_Disp_enabled].i;
+  int slot = -1, tries;
+  for (tries = 0; tries < n_workers; tries++) {
+    int s = (int)(objects[self_id].fields[F_Disp_rr].i % n_workers);
+    objects[self_id].fields[F_Disp_rr] =
+      mk_int(objects[self_id].fields[F_Disp_rr].i + 1);
+    if ((mask >> s) & 1L) { slot = s; break; }
+  }
+  if (slot < 0) return;
+  int worker_obj = dispatcher_worker_obj(self_id, slot);
+  dispatcher_bump_load(self_id, slot, +1);
+  objects[self_id].fields[F_Disp_submitted] =
+    mk_int(objects[self_id].fields[F_Disp_submitted].i + 1);
+  lb_task_alloc((int)task_id, 'n', (int)first_col, worker_obj);
+  enqueue(self_id, worker_obj, "compute_nq", 3,
+          (value_t[]){ mk_int(n), mk_int(first_col), mk_int(task_id) });
+}
+
 /* Worker restart — kill old thread, allocate fresh actor, swap into
  * the dispatcher's worker slot.  Uses a NEW obj_id (n_objects bumps),
  * which is permanent — restarting all 4 workers consumes 4 of the 9
@@ -1083,6 +1112,10 @@ static void Dispatcher_submit_sticky(int self_id, int sender_id,
  * as submitted-not-completed forever).  Done-callbacks from the old
  * worker after kill are also lost.  The load counter is reset to 0
  * for the slot to reflect the fresh start. */
+static void Dispatcher_submit_nq(int self_id, int sender_id,
+                                 value_t* args, int n_args);
+int abcl_nq_count_partial(int n, int first_col);
+
 static void Dispatcher_restart_worker(int self_id, int sender_id,
                                       value_t* args, int n_args) {
   (void)sender_id;
@@ -1190,6 +1223,8 @@ static void dispatch_Dispatcher(int self_id, int sender_id, const char* method,
   { Dispatcher_cancel_task(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "restart_worker") == 0)
   { Dispatcher_restart_worker(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "submit_nq") == 0)
+  { Dispatcher_submit_nq(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
@@ -1356,6 +1391,38 @@ static void Worker_compute_jit(int self_id, int sender_id,
           (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(result) });
 }
 
+/* N-Queens partial work — computes nqueens_count_partial(n, first_col)
+ * on this worker thread, reports the solution count as `result` via
+ * done.  Used by the /api/loadbal/nqueens demo / benchmark. */
+static void Worker_compute_nq(int self_id, int sender_id,
+                              value_t* args, int n_args) {
+  (void)sender_id;
+  long n         = (n_args > 0) ? args[0].i : 8L;
+  long first_col = (n_args > 1) ? args[1].i : 0L;
+  long task_id   = (n_args > 2) ? args[2].i : 0L;
+  long idx       = objects[self_id].fields[F_Worker_my_idx].i;
+  int  disp      = objects[self_id].fields[F_Worker_dispatcher].obj_id;
+
+  long t0 = (long)(clkticks * 10);
+  long result = (long)abcl_nq_count_partial((int)n, (int)first_col);
+  long elapsed = (long)(clkticks * 10) - t0;
+
+  objects[self_id].fields[F_Worker_last_n]      = mk_int(n);
+  objects[self_id].fields[F_Worker_last_result] = mk_int(result);
+  objects[self_id].fields[F_Worker_done] =
+    mk_int(objects[self_id].fields[F_Worker_done].i + 1);
+  objects[self_id].fields[F_Worker_busy_ms] =
+    mk_int(objects[self_id].fields[F_Worker_busy_ms].i + elapsed);
+
+  wait(print_mu);
+  kprintf("[loadbal/nq] worker idx=%ld task=%ld nq(%ld,%ld)=%ld in %ldms\r\n",
+          idx, task_id, n, first_col, result, elapsed);
+  signal(print_mu);
+
+  enqueue(self_id, disp, "done", 3,
+          (value_t[]){ mk_int(idx), mk_int(task_id), mk_int(result) });
+}
+
 static void dispatch_Worker(int self_id, int sender_id, const char* method,
                             value_t* args, int n_args) {
   if (strcmp(method, "bind") == 0)
@@ -1364,6 +1431,8 @@ static void dispatch_Worker(int self_id, int sender_id, const char* method,
   { Worker_compute(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "compute_jit") == 0)
   { Worker_compute_jit(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "compute_nq") == 0)
+  { Worker_compute_nq(self_id, sender_id, args, n_args); return; }
   if (strcmp(method, "init") == 0) return;
 }
 
@@ -1411,6 +1480,50 @@ void abcl_loadbal_restart_worker(int slot) {
   if (g_loadbal_disp < 0) return;
   abcl_enqueue(-1, g_loadbal_disp, "restart_worker", 1,
                (value_t[]){ mk_int((long)slot) });
+}
+
+void abcl_loadbal_submit_nq(int n, int first_col, int task_id) {
+  if (g_loadbal_disp < 0) return;
+  abcl_enqueue(-1, g_loadbal_disp, "submit_nq", 3,
+               (value_t[]){ mk_int((long)n), mk_int((long)first_col),
+                            mk_int((long)task_id) });
+}
+
+/* N-Queens partial counter — counts solutions where the FIRST row's
+ * queen is placed at column `first_col`.  Caller sums over
+ * first_col=0..n-1 to get the total count.  Embarrassingly parallel:
+ * each first_col job is independent and they're roughly equal in
+ * cost (modulo board symmetry), making it a clean load-balance demo.
+ *
+ * O(n!) worst case, but the branching prune cuts it sharply.  For
+ * n=8 the total is 92 solutions and the work fits in < 100 ms even
+ * on a single Pi 3 worker.  For n=11 it's 2680 solutions and starts
+ * to be visible (~seconds). */
+static int nq_recurse(int n, int row, int *cols) {
+  if (row == n) return 1;
+  int count = 0, c;
+  for (c = 0; c < n; c++) {
+    int ok = 1;
+    int r;
+    for (r = 0; r < row; r++) {
+      int dc = cols[r] - c;
+      if (dc < 0) dc = -dc;
+      if (cols[r] == c || dc == row - r) { ok = 0; break; }
+    }
+    if (ok) {
+      cols[row] = c;
+      count += nq_recurse(n, row + 1, cols);
+    }
+  }
+  return count;
+}
+
+int abcl_nq_count_partial(int n, int first_col) {
+  int cols[16];
+  if (n < 1 || n > 16) return 0;
+  if (first_col < 0 || first_col >= n) return 0;
+  cols[0] = first_col;
+  return nq_recurse(n, 1, cols);
 }
 
 /* djb2 — small portable string hash for sticky routing keys.

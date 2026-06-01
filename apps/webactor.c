@@ -1368,6 +1368,149 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/loadbal/init — spin up Dispatcher + 4 Workers if
+             *   not already running.  Idempotent.  After cold boot
+             *   the load-balancer actors don't exist; this creates
+             *   them on first use. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/init",  21) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/init", 22))
+            {
+                extern void abcl_loadbal_init(void);
+                extern int  abcl_loadbal_dispatcher_id(void);
+                abcl_loadbal_init();
+                static char iresp[200];
+                int blen = sprintf(iresp + 100,
+                    "loadbal initialized (dispatcher_obj=%d, 4 workers)\r\n",
+                    abcl_loadbal_dispatcher_id());
+                int hlen = sprintf(iresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(iresp + hlen, iresp + 100, blen);
+                write(tcpdev, iresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/gc-actor/init — spin up Collector actor + heartbeat
+             *   thread.  Idempotent.  After cold boot the GC actor
+             *   doesn't exist; this creates it.  Should be called
+             *   AFTER /api/loadbal/init if both are used, so the
+             *   Collector can protect the load-balancer actors. */
+            if (0 == strncmp(reqbuf, "GET /api/gc-actor/init",  22) ||
+                0 == strncmp(reqbuf, "POST /api/gc-actor/init", 23))
+            {
+                extern void abcl_gc_actor_init(void);
+                extern int  abcl_gc_actor_id(void);
+                abcl_gc_actor_init();
+                static char giresp[200];
+                int blen = sprintf(giresp + 100,
+                    "gc-actor initialized (obj=%d, heartbeat thread spawned)\r\n",
+                    abcl_gc_actor_id());
+                int hlen = sprintf(giresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(giresp + hlen, giresp + 100, blen);
+                write(tcpdev, giresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/loadbal/nqueens?n=N[&cols=COMMA_LIST]
+             *   N-Queens benchmark route.  Submits one compute_nq
+             *   task per first-column in `cols` (default: 0..N-1).
+             *   Returns starting task_id; Mac polls /api/loadbal/task
+             *   for each to collect partial counts, sums them.
+             *   Used by tools/nqueens-bench.py for the Mac+Pi 3
+             *   distributed benchmark. */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/nqueens",  24) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/nqueens", 25))
+            {
+                extern void abcl_loadbal_submit_nq(int, int, int);
+                int n = 8;
+                /* Default cols = 0..n-1 (whole problem).  If ?cols=
+                 * given, parse comma-separated list. */
+                char cols_str[256];
+                cols_str[0] = '\0';
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url) {
+                    const char *q = strchr(url, '?');
+                    if (NULL != q) {
+                        const char *p = q + 1;
+                        while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+                            const char *eq = p;
+                            while (*eq && *eq != '=' && *eq != '&' &&
+                                   *eq != ' ' && *eq != '\r' && *eq != '\n') eq++;
+                            const char *amp = (*eq == '=') ? eq + 1 : eq;
+                            while (*amp && *amp != '&' && *amp != ' ' &&
+                                   *amp != '\r' && *amp != '\n') amp++;
+                            int kl = eq - p;
+                            if (kl == 1 && *p == 'n' && *eq == '=') {
+                                int v = 0; const char *d = eq + 1;
+                                while (d < amp && *d >= '0' && *d <= '9')
+                                { v = v*10 + (*d - '0'); d++; }
+                                n = v;
+                            } else if (kl == 4 && 0 == strncmp(p, "cols", 4)
+                                       && *eq == '=') {
+                                int cl = amp - (eq + 1);
+                                if (cl > 255) cl = 255;
+                                memcpy(cols_str, eq + 1, cl);
+                                cols_str[cl] = '\0';
+                            }
+                            p = (*amp == '&') ? amp + 1 : amp;
+                        }
+                    }
+                }
+                if (n < 1) n = 1;
+                if (n > 12) n = 12;     /* cap — n=12 = 14200 solutions */
+                /* Static task-id allocator persists across requests so
+                 * subsequent /nqueens calls don't reuse the same id
+                 * range — task lookup table holds 64 entries. */
+                static int g_nq_next_id = 1;
+                int first_id = g_nq_next_id;
+                int n_submitted = 0;
+                if (cols_str[0] == '\0') {
+                    /* Default: all columns 0..n-1 */
+                    int c;
+                    for (c = 0; c < n; c++) {
+                        abcl_loadbal_submit_nq(n, c, g_nq_next_id++);
+                        n_submitted++;
+                    }
+                } else {
+                    /* Parse comma-separated */
+                    const char *p = cols_str;
+                    while (*p) {
+                        int v = 0;
+                        while (*p >= '0' && *p <= '9') {
+                            v = v*10 + (*p - '0'); p++;
+                        }
+                        if (v >= 0 && v < n) {
+                            abcl_loadbal_submit_nq(n, v, g_nq_next_id++);
+                            n_submitted++;
+                        }
+                        while (*p && *p != ',') p++;
+                        if (*p == ',') p++;
+                    }
+                }
+                static char nqresp[300];
+                int blen = sprintf(nqresp + 100,
+                    "nqueens n=%d submitted=%d task_id_range=%d..%d\r\n"
+                    "poll /api/loadbal/task?id=K for each, sum result fields\r\n",
+                    n, n_submitted, first_id, g_nq_next_id - 1);
+                int hlen = sprintf(nqresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(nqresp + hlen, nqresp + 100, blen);
+                write(tcpdev, nqresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/restart?w=N — kill + respawn worker N.
              *   Uses a new obj_id (n_objects bumps).  MAX_OBJECTS=16 cap
              *   means ~9 restarts before the table fills.  Pending tasks
@@ -1929,20 +2072,13 @@ thread webactor_autostart(void)
                     WEBACTOR_PORT);
         }
     }
-    /* Spin up the load-balancer (1 Dispatcher + 4 Workers) so the
-     * /api/loadbal/* routes work without needing aipl_main. */
-    {
-        extern void abcl_loadbal_init(void);
-        abcl_loadbal_init();
-    }
-    /* Spin up the global actor GC actor.  Order matters — must come
-     * AFTER loadbal init so it can mark the Dispatcher/Workers as
-     * protected (otherwise its first sweep at the default 30 s
-     * threshold could reap them while they sat idle in the boot's
-     * first quiet minute). */
-    {
-        extern void abcl_gc_actor_init(void);
-        abcl_gc_actor_init();
-    }
+    /* Load-balancer (Dispatcher + 4 Workers) and Collector (actor GC)
+     * are NOT auto-started anymore — they cost 6 idle actors plus a
+     * heartbeat thread that most callers don't need.  Spin them up
+     * explicitly via:
+     *   POST /api/loadbal/init   — start Dispatcher + 4 Workers
+     *   POST /api/gc-actor/init  — start Collector + heartbeat
+     * Both inits are idempotent; subsequent calls just return.  Cold
+     * boot shows only WebReceiver in /api/actors. */
     return OK;
 }
