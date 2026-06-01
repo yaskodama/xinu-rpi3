@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage3b-b9 (firmware download + CR4 start)"
+#define WIFI_BUILD_ID "wifi-stage4-b10b (SDPCM: poll Fn2 FIFO for response)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -948,6 +948,127 @@ static int wifi_sbenable(void)
 }
 
 /* ================================================================== *
+ *  Stage 4 — SDPCM control channel (ioctl / iovar over Fn2)          *
+ *  (synchronous, polled port of plan9 ether4330.c wlcmd/packetrw)    *
+ * ================================================================== */
+#define SDPCM_HDR   12          /* len[2] lenck[2] seq chan nextlen doff fc win ver pad */
+#define BCDC_HDR    16          /* cmd[4] len[4] flags[2] id[2] status[4] */
+#define SD_INT_FRAME  (1u << 6)
+#define SD_INT_MBOX   (1u << 7)
+#define SDR_SBMBOX    0x40
+#define SDR_HOSTMBOX  0x4c
+#define WLC_GET_VAR   262
+#define WLC_SET_VAR   263
+
+static uint8_t  wl_txseq;
+static uint16_t wl_reqid;
+
+/* Fn2 bulk transfer (block size 512, fixed FIFO address, no increment). */
+static int wifi_packetrw(int write, uint8_t *buf, int len)
+{
+    /* round transfer length up to 4; the chip's frame engine pads. */
+    int n = (len + 3) & ~3;
+    return wifi_cmd53_pio(write, 2, 0 /* Enumbase&0x1FFFF */, buf, n, 0);
+}
+
+/* Issue a firmware ioctl over the SDPCM control channel and return its reply.
+ * write!=0 sends `data` (dlen) as the ioctl payload; otherwise `data` is the
+ * request (e.g. an iovar name) and the reply is copied into res/rlen.
+ * Returns 0 on success. */
+static int wifi_wlcmd(int write, int op, const uint8_t *data, int dlen,
+                      uint8_t *res, int rlen)
+{
+    static uint8_t pkt[768];
+    int tlen = write ? (dlen + rlen) : (dlen > rlen ? dlen : rlen);
+    int len = SDPCM_HDR + BCDC_HDR + tlen;
+    int i, tries;
+
+    if (len > (int)sizeof(pkt)) { wifi_log("[wifi] wlcmd: pkt too big %d\r\n", len); return -1; }
+    for (i = 0; i < len; i++) pkt[i] = 0;
+
+    /* SDPCM header (control channel = 0) */
+    pkt[0] = len & 0xFF; pkt[1] = (len >> 8) & 0xFF;
+    pkt[2] = ~len & 0xFF; pkt[3] = (~len >> 8) & 0xFF;
+    pkt[4] = wl_txseq;          /* seq */
+    pkt[5] = 0;                 /* chanflg: channel 0 = control */
+    pkt[7] = SDPCM_HDR;         /* doffset */
+
+    /* BCDC command header */
+    {
+        uint8_t *q = pkt + SDPCM_HDR;
+        q[0] = op; q[1] = op >> 8; q[2] = op >> 16; q[3] = op >> 24;
+        q[4] = tlen; q[5] = tlen >> 8; q[6] = tlen >> 16; q[7] = tlen >> 24;
+        q[8] = write ? 2 : 0;   /* flags */
+        wl_reqid++;
+        q[10] = wl_reqid; q[11] = wl_reqid >> 8;
+    }
+    if (dlen > 0) for (i = 0; i < dlen; i++) pkt[SDPCM_HDR + BCDC_HDR + i] = data[i];
+
+    if (wifi_packetrw(1, pkt, len) != 0) { wifi_log("[wifi] wlcmd: tx failed\r\n"); return -1; }
+    wl_txseq++;
+
+    /* wait for the control-channel response by polling the Fn2 FIFO directly:
+     * a read of the 12-byte SDPCM header returns len==0 when no frame is
+     * queued (plan9 wlreadpkt), so we don't depend on the interrupt status. */
+    for (tries = 0; tries < 400; tries++) {
+        uint32_t ints;
+        int plen, lenck, chan, doff;
+
+        /* best-effort: ack any sdio-core interrupt + firmware mailbox */
+        if (wifi_backplane_read32(chip_sdregs + SDR_INTSTATUS, &ints) == 0 && ints) {
+            wifi_backplane_write32(chip_sdregs + SDR_INTSTATUS, ints);
+            if (ints & SD_INT_MBOX) {
+                uint32_t mb;
+                wifi_backplane_read32(chip_sdregs + SDR_HOSTMBOX, &mb);
+                wifi_backplane_write32(chip_sdregs + SDR_SBMBOX, 2);   /* ack */
+            }
+        }
+
+        /* read the SDPCM header from the FIFO; len==0 => nothing queued yet */
+        if (wifi_packetrw(0, pkt, SDPCM_HDR) != 0) { wifi_delay_us(2000); continue; }
+        plen = pkt[0] | (pkt[1] << 8);
+        lenck = pkt[2] | (pkt[3] << 8);
+        if (tries < 3)
+            wifi_log("[wifi] wlcmd rx try%d: len=0x%x lenck=0x%x ints=0x%x\r\n",
+                     tries, plen, lenck, ints);
+        if (plen == 0) { wifi_delay_us(2000); continue; }
+        if (lenck != ((plen ^ 0xFFFF) & 0xFFFF) || plen < SDPCM_HDR || plen > (int)sizeof(pkt)) {
+            wifi_log("[wifi] wlcmd: bad frame len=0x%x lenck=0x%x\r\n", plen, lenck);
+            wifi_delay_us(2000);
+            continue;
+        }
+        chan = pkt[5] & 0xF;
+        doff = pkt[7];
+        if (plen > SDPCM_HDR)
+            if (wifi_packetrw(0, pkt + SDPCM_HDR, plen - SDPCM_HDR) != 0) return -1;
+        if (chan != 0) { wifi_log("[wifi] wlcmd: drained chan %d frame\r\n", chan); continue; }
+
+        /* BCDC reply at doff */
+        {
+            uint8_t *q = pkt + doff;
+            uint32_t st = q[12] | (q[13] << 8) | (q[14] << 16) | (q[15] << 24);
+            if (st != 0) { wifi_log("[wifi] wlcmd: op %d status %u\r\n", op, st); return -1; }
+            if (!write && rlen > 0) {
+                uint8_t *d = q + BCDC_HDR;
+                for (i = 0; i < rlen; i++) res[i] = d[i];
+            }
+            return 0;
+        }
+    }
+    wifi_log("[wifi] wlcmd: op %d timed out (no control response)\r\n", op);
+    return -1;
+}
+
+/* iovar GET (e.g. "ver"). */
+static int wifi_get_iovar(const char *name, uint8_t *val, int len)
+{
+    int n = 0;
+    while (name[n]) n++;
+    n++;                         /* include NUL */
+    return wifi_wlcmd(0, WLC_GET_VAR, (const uint8_t *)name, n, val, len);
+}
+
+/* ================================================================== *
  *  Public: power on the chip and probe its SDIO identity + chip-id.  *
  * ================================================================== */
 int wifi_probe(void)
@@ -1155,6 +1276,25 @@ int wifi_probe(void)
         wifi_log("[wifi] FAILED: sbenable (HT clock / Fn2)\r\n");
         return -1;
     }
-    wifi_log("[wifi] *** SUCCESS: Stage 3 — firmware loaded, chip running ***\r\n");
+    wifi_log("[wifi] Stage 3 — firmware loaded, chip running\r\n");
+
+    /* ---- Stage 4: SDPCM control channel — ask the firmware its version ----
+     * A successful "ver" iovar GET proves the host<->firmware ioctl path
+     * (SDPCM framing + BCDC control header over Fn2) works end to end. */
+    {
+        static uint8_t ver[128];
+        int i;
+        for (i = 0; i < (int)sizeof(ver); i++) ver[i] = 0;
+        wifi_delay_us(50000);       /* let the firmware settle after boot */
+        if (wifi_get_iovar("ver", ver, sizeof(ver) - 1) != 0) {
+            wifi_log("[wifi] FAILED: SDPCM ioctl (get 'ver')\r\n");
+            return -1;
+        }
+        /* trim the version string to its first line for the trace */
+        for (i = 0; i < (int)sizeof(ver) - 1; i++)
+            if (ver[i] == '\r' || ver[i] == '\n') { ver[i] = '\0'; break; }
+        wifi_log("[wifi] firmware version: %s\r\n", (char *)ver);
+        wifi_log("[wifi] *** SUCCESS: Stage 4 — SDPCM ioctl works (fw responds) ***\r\n");
+    }
     return 0;
 }
