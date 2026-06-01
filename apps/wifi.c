@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b24 (FWSUP; /api/wifi/trace endpoint for full log)"
+#define WIFI_BUILD_ID "wifi-stage6-b25 (FWSUP; trace reset at join phase, 8KB buf)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -53,7 +53,7 @@ extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
  *  Trace buffer — every [wifi] line is captured here AND echoed to    *
  *  the serial console, so the HTTP reply can carry the whole trace.   *
  * ------------------------------------------------------------------ */
-static char wifi_tbuf[4000];
+static char wifi_tbuf[8000];
 static int  wifi_tn;
 
 static int wifi_tputc(int c, int arg)
@@ -1738,8 +1738,12 @@ static int wifi_do_join(const char *ssid, const char *pass)
         for (j = 0; j < sl && j < 32; j++) wifi_tgt_ssid[j] = ssid[j];
         wifi_scan(&n);
         wifi_tgt_set = 0;
-        wifi_log("[wifi] join: target located=%d chanspec=0x%04x\r\n",
-                 wifi_tgt_found, wifi_tgt_chanspec);
+        /* Reset the trace buffer here so /api/wifi/trace shows ONLY the join
+         * phase (the bring-up + locate-scan would otherwise fill all 8000 B
+         * and the join's iovar/PMK/event lines would be lost). */
+        wifi_tn = 0;
+        wifi_log("[wifi] === JOIN PHASE === ssid=\"%s\" tgt=%d chanspec=0x%04x\r\n",
+                 ssid, wifi_tgt_found, wifi_tgt_chanspec);
     }
 
     /* Establish infra (managed STA) mode, then bring the interface UP and keep
