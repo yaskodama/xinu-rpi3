@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b13 (scan JSON + WPA2 join)"
+#define WIFI_BUILD_ID "wifi-stage6-b14b (WSEC_PMK 36-byte struct)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1542,6 +1542,99 @@ static int wifi_bringup(void)
 }
 
 /* ================================================================== *
+ *  SHA1 / HMAC-SHA1 / PBKDF2 — to derive the WPA2 PMK from the        *
+ *  passphrase (PMK = PBKDF2-SHA1(passphrase, ssid, 4096, 32)).        *
+ * ================================================================== */
+struct sha1 { uint32_t h[5]; uint64_t len; uint8_t buf[64]; int n; };
+
+static uint32_t sha1_rol(uint32_t v, int s) { return (v << s) | (v >> (32 - s)); }
+
+static void sha1_block(struct sha1 *c, const uint8_t *p)
+{
+    uint32_t w[80], a, b, d, e, f, k, t; int i;
+    for (i = 0; i < 16; i++)
+        w[i] = (p[i*4]<<24)|(p[i*4+1]<<16)|(p[i*4+2]<<8)|p[i*4+3];
+    for (i = 16; i < 80; i++) w[i] = sha1_rol(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+    a=c->h[0]; b=c->h[1]; d=c->h[2]; e=c->h[3]; f=c->h[4];
+    for (i = 0; i < 80; i++) {
+        uint32_t fn;
+        if (i < 20)      { fn = (b & d) | (~b & e); k = 0x5A827999; }
+        else if (i < 40) { fn = b ^ d ^ e;          k = 0x6ED9EBA1; }
+        else if (i < 60) { fn = (b&d)|(b&e)|(d&e);  k = 0x8F1BBCDC; }
+        else             { fn = b ^ d ^ e;          k = 0xCA62C1D6; }
+        t = sha1_rol(a,5) + fn + f + k + w[i];
+        f = e; e = d; d = sha1_rol(b,30); b = a; a = t;
+    }
+    c->h[0]+=a; c->h[1]+=b; c->h[2]+=d; c->h[3]+=e; c->h[4]+=f;
+}
+
+static void sha1_init(struct sha1 *c)
+{
+    c->h[0]=0x67452301; c->h[1]=0xEFCDAB89; c->h[2]=0x98BADCFE;
+    c->h[3]=0x10325476; c->h[4]=0xC3D2E1F0; c->len=0; c->n=0;
+}
+
+static void sha1_update(struct sha1 *c, const uint8_t *p, int len)
+{
+    int i;
+    for (i = 0; i < len; i++) {
+        c->buf[c->n++] = p[i];
+        if (c->n == 64) { sha1_block(c, c->buf); c->n = 0; }
+    }
+    c->len += len;
+}
+
+static void sha1_final(struct sha1 *c, uint8_t out[20])
+{
+    uint64_t bits = c->len * 8; int i;
+    uint8_t pad = 0x80;
+    sha1_update(c, &pad, 1);
+    pad = 0;
+    while (c->n != 56) sha1_update(c, &pad, 1);
+    for (i = 7; i >= 0; i--) { uint8_t b = (bits >> (i*8)) & 0xFF; sha1_update(c, &b, 1); }
+    for (i = 0; i < 5; i++) {
+        out[i*4]   = c->h[i] >> 24; out[i*4+1] = c->h[i] >> 16;
+        out[i*4+2] = c->h[i] >> 8;  out[i*4+3] = c->h[i];
+    }
+}
+
+/* HMAC-SHA1(key, msg) -> 20-byte mac */
+static void hmac_sha1(const uint8_t *key, int klen, const uint8_t *msg, int mlen,
+                      uint8_t mac[20])
+{
+    uint8_t k[64], ipad[64], opad[64], inner[20];
+    struct sha1 c; int i;
+    for (i = 0; i < 64; i++) k[i] = 0;
+    if (klen > 64) { sha1_init(&c); sha1_update(&c, key, klen); sha1_final(&c, k); }
+    else for (i = 0; i < klen; i++) k[i] = key[i];
+    for (i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5C; }
+    sha1_init(&c); sha1_update(&c, ipad, 64); sha1_update(&c, msg, mlen); sha1_final(&c, inner);
+    sha1_init(&c); sha1_update(&c, opad, 64); sha1_update(&c, inner, 20); sha1_final(&c, mac);
+}
+
+/* PBKDF2-SHA1: derive `dklen` bytes from passphrase + salt (ssid), 4096 iters. */
+static void pbkdf2_sha1(const uint8_t *pass, int plen, const uint8_t *salt, int slen,
+                        int iter, uint8_t *dk, int dklen)
+{
+    int block = 1, off = 0;
+    while (off < dklen) {
+        uint8_t salt_i[40], u[20], t[20]; int i, j, cpy;
+        for (i = 0; i < slen && i < 36; i++) salt_i[i] = salt[i];
+        salt_i[slen]   = block >> 24; salt_i[slen+1] = block >> 16;
+        salt_i[slen+2] = block >> 8;  salt_i[slen+3] = block;
+        hmac_sha1(pass, plen, salt_i, slen + 4, u);
+        for (i = 0; i < 20; i++) t[i] = u[i];
+        for (j = 1; j < iter; j++) {
+            hmac_sha1(pass, plen, u, 20, u);
+            for (i = 0; i < 20; i++) t[i] ^= u[i];
+        }
+        cpy = (dklen - off < 20) ? (dklen - off) : 20;
+        for (i = 0; i < cpy; i++) dk[off + i] = t[i];
+        off += cpy; block++;
+    }
+}
+
+/* ================================================================== *
  *  Stage 6 — join a (WPA2-PSK) access point                          *
  * ================================================================== */
 #define WLC_DOWN        3
@@ -1551,27 +1644,32 @@ static int wifi_bringup(void)
 #define WLC_SET_WSEC_PMK 268
 #define WLC_SET_SSID    26
 
-/* Configure WPA2-PSK security and hand the firmware the passphrase (the fw's
- * internal supplicant derives the PMK + runs the 4-way handshake). */
-static int wifi_set_passphrase(const char *pass)
+/* Derive the WPA2 PMK (PBKDF2-SHA1 of passphrase+ssid) and give it to the
+ * firmware via WLC_SET_WSEC_PMK.  This fw rejected the passphrase-flag form
+ * (-2), so we send the real 32-byte PMK (flags=0). */
+static int wifi_set_pmk(const char *ssid, int slen, const char *pass, int plen)
 {
-    uint8_t pmk[2 + 2 + 64];
-    int n = 0, i;
-    while (pass[n] && n < 63) n++;
-    for (i = 0; i < (int)sizeof(pmk); i++) pmk[i] = 0;
-    pmk[0] = n; pmk[1] = n >> 8;          /* key_len */
-    pmk[2] = 1; pmk[3] = 0;               /* flags = WSEC_PASSPHRASE */
-    for (i = 0; i < n; i++) pmk[4 + i] = pass[i];
-    return wifi_wlcmd(1, WLC_SET_WSEC_PMK, pmk, sizeof(pmk), NULL, 0);
+    uint8_t pmk32[32];
+    uint8_t msg[2 + 2 + 32];              /* brcmf_wsec_pmk_le: key[32] => 36 B */
+    int i;
+    pbkdf2_sha1((const uint8_t *)pass, plen, (const uint8_t *)ssid, slen, 4096, pmk32, 32);
+    wifi_log("[wifi] join: PMK %02x%02x%02x%02x...%02x%02x derived\r\n",
+             pmk32[0], pmk32[1], pmk32[2], pmk32[3], pmk32[30], pmk32[31]);
+    for (i = 0; i < (int)sizeof(msg); i++) msg[i] = 0;
+    msg[0] = 32; msg[1] = 0;              /* key_len = 32 (raw PMK) */
+    msg[2] = 0;  msg[3] = 0;              /* flags = 0 */
+    for (i = 0; i < 32; i++) msg[4 + i] = pmk32[i];
+    return wifi_wlcmd(1, WLC_SET_WSEC_PMK, msg, sizeof(msg), NULL, 0);
 }
 
 /* Join an AP.  pass==NULL/"" => open network; otherwise WPA2-PSK. */
 static int wifi_do_join(const char *ssid, const char *pass)
 {
-    uint8_t jp[72];
-    int sl = 0, i, ev, secured = (pass && pass[0]);
+    uint8_t jp[114];
+    int sl = 0, i, ev, secured = (pass && pass[0]), pl = 0;
 
     while (ssid[sl] && sl < 32) sl++;
+    if (pass) while (pass[pl] && pl < 63) pl++;
     wifi_log("[wifi] join: ssid=\"%s\" %s\r\n", ssid, secured ? "WPA2-PSK" : "open");
 
     wifi_radio_up();                             /* event_msgs/clm/country/pm */
@@ -1581,9 +1679,8 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_cmd_int(WLC_SET_WSEC, 4);          /* AES */
         wifi_set_iovar_int("wpa_auth", 0x80);   /* WPA2-PSK */
         wifi_cmd_int(165 /*WLC_SET_WPA_AUTH*/, 0x80);
-        wifi_set_iovar_int("sup_wpa", 1);       /* in-firmware supplicant */
-        if (wifi_set_passphrase(pass) != 0)
-            wifi_log("[wifi] join: set passphrase returned error (continuing)\r\n");
+        if (wifi_set_pmk(ssid, sl, pass, pl) != 0)
+            wifi_log("[wifi] join: WSEC_PMK returned error (continuing)\r\n");
     } else {
         wifi_cmd_int(WLC_SET_WSEC, 0);
         wifi_set_iovar_int("wpa_auth", 0);
@@ -1591,19 +1688,25 @@ static int wifi_do_join(const char *ssid, const char *pass)
     wifi_cmd_int(2, 1);                          /* WLC_UP */
     wifi_delay_us(50000);
 
-    /* build the "join" iovar params (ssidlen, ssid[32], scan defaults, any
-     * bssid, no channel list) */
+    /* build the extended "join" iovar (brcmf_ext_join_params_le, 114 B):
+     *   [0..35]   ssid_le (len + ssid[32])
+     *   [36..101] scan_params (ssid + bssid + bss_type + scan_type + nprobes
+     *             + active/passive/home + channel_num + channel_list[1])
+     *   [102..113] assoc_params (bssid + chanspec_num + chanspec_list[1]) */
     for (i = 0; i < (int)sizeof(jp); i++) jp[i] = 0;
-    jp[0] = sl;                                  /* ssid len */
+    jp[0] = sl;
     for (i = 0; i < sl; i++) jp[4 + i] = ssid[i];
-    /* offset 36: scan_type(4)=0xff, nprobes(4)=-1, active(4)=-1, passive(4)=-1,
-     * home(4)=-1, bssid(6)=ff.., pad(2), nchans(4)=0 */
-    jp[36] = 0xFF; jp[37] = 0xFF; jp[38] = 0xFF; jp[39] = 0xFF;  /* scan_type */
-    for (i = 40; i < 56; i++) jp[i] = 0xFF;      /* nprobes/active/passive */
-    for (i = 56; i < 60; i++) jp[i] = 0xFF;      /* home_time */
-    for (i = 60; i < 66; i++) jp[i] = 0xFF;      /* bssid = broadcast */
-    /* jp[66..67] pad, jp[68..71] nchans = 0 */
-    if (wifi_set_iovar("join", jp, 72 - 4) != 0) {
+    /* scan_params.ssid (directed) */
+    jp[36] = sl;
+    for (i = 0; i < sl; i++) jp[40 + i] = ssid[i];
+    for (i = 72; i < 78; i++) jp[i] = 0xFF;      /* scan bssid = broadcast */
+    jp[78] = 2;                                   /* bss_type = any */
+    jp[79] = 0;                                   /* scan_type = active */
+    for (i = 80; i < 96; i++) jp[i] = 0xFF;      /* nprobes/active/passive/home = -1 */
+    /* [96..99] channel_num = 0, [100..101] channel_list[0] = 0 */
+    for (i = 102; i < 108; i++) jp[i] = 0xFF;    /* assoc bssid = broadcast */
+    /* [108..111] chanspec_num = 0, [112..113] chanspec_list[0] = 0 */
+    if (wifi_set_iovar("join", jp, sizeof(jp)) != 0) {
         wifi_log("[wifi] join: 'join' iovar failed\r\n");
         return -1;
     }
