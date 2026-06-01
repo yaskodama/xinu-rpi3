@@ -1525,6 +1525,30 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wifi/trace — return the last wifi trace buffer verbatim,
+             *   WITHOUT running anything.  This responds instantly, so the TCP
+             *   body delivers reliably (unlike /join, whose ~150 s delay leaves
+             *   the large body undeliverable).  Write in <=1024-B chunks. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/trace",  19) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/trace", 20))
+            {
+                extern const char *wifi_trace(void);
+                const char *tr = wifi_trace();
+                static char thdr[96];
+                int blen = 0, off = 0, hlen;
+                while (tr[blen]) blen++;
+                hlen = sprintf(thdr, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                     "Content-Length: %d\r\n\r\n", blen);
+                write(tcpdev, thdr, hlen);
+                while (off < blen) {
+                    int n = blen - off; if (n > 1024) n = 1024;
+                    write(tcpdev, (void *)(tr + off), n);
+                    off += n;
+                }
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/wifi/join?ssid=NAME&pass=PASS — connect to an AP (WPA2-PSK
              *   if pass given, else open).  Full [wifi] trace in the reply. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/join",  18) ||

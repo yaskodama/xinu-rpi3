@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b23 (FWSUP; wsec/auth/wpa_auth via IOVARS like brcmfmac)"
+#define WIFI_BUILD_ID "wifi-stage6-b24 (FWSUP; /api/wifi/trace endpoint for full log)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
