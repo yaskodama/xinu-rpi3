@@ -38,6 +38,45 @@
 #include <string.h>
 #include <clock.h>
 #include <thread.h>
+#include <stdarg.h>
+
+/* Build id — bump on every flashed build so /api/wifi/probe (and the serial
+ * trace) unambiguously report WHICH kernel is actually running.  The slow
+ * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
+ * RAM; this removes the "is the new code even running?" guesswork. */
+#define WIFI_BUILD_ID "wifi-stage1-b3 (gpclk2 + http-trace)"
+
+extern int kprintf(const char *, ...);
+extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
+
+/* ------------------------------------------------------------------ *
+ *  Trace buffer — every [wifi] line is captured here AND echoed to    *
+ *  the serial console, so the HTTP reply can carry the whole trace.   *
+ * ------------------------------------------------------------------ */
+static char wifi_tbuf[4000];
+static int  wifi_tn;
+
+static int wifi_tputc(int c, int arg)
+{
+    (void)arg;
+    if (wifi_tn < (int)sizeof(wifi_tbuf) - 1)
+        wifi_tbuf[wifi_tn++] = (char)c;
+    return c;
+}
+
+static void wifi_log(const char *fmt, ...)
+{
+    va_list ap;
+    int start = wifi_tn;
+    va_start(ap, fmt);
+    _doprnt(fmt, ap, wifi_tputc, 0);
+    va_end(ap);
+    wifi_tbuf[wifi_tn] = '\0';
+    kprintf("%s", &wifi_tbuf[start]);   /* mirror to serial console */
+}
+
+/* Public: the captured trace from the last wifi_probe() run. */
+const char *wifi_trace(void) { return wifi_tbuf; }
 
 /* ------------------------------------------------------------------ *
  *  MMIO bases (BCM2837, peripheral base 0x3F000000)                  *
@@ -51,6 +90,16 @@
 #define GPPUD              (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x94))
 #define GPPUDCLK0          (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x98))
 #define GPPUDCLK1          (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x9C)) /* GPIO32-53 */
+#define GPFSEL4            (*(volatile uint32_t *)(WIFI_GPIO_BASE + 0x10)) /* GPIO40-49 */
+
+/* Clock manager (GPCLK2 = WIFI_CLK on GPIO43, dts gpclk2_gpio43). */
+#define WIFI_CM_BASE       0x3F101000UL
+#define CM_GP2CTL          (*(volatile uint32_t *)(WIFI_CM_BASE + 0x80))
+#define CM_GP2DIV          (*(volatile uint32_t *)(WIFI_CM_BASE + 0x84))
+#define CM_PASSWD          0x5A000000u
+#define CM_CTL_ENAB        (1u << 4)
+#define CM_CTL_BUSY        (1u << 7)
+#define CM_SRC_OSC         1          /* 19.2 MHz crystal oscillator */
 
 /* ------------------------------------------------------------------ *
  *  Arasan SDHCI register block (SDHCI v3 layout)                     *
@@ -231,6 +280,38 @@ static uint32_t wifi_fw_get_clock_rate(uint32_t clk_id)
 #define RPI_FW_EMMC_CLK_ID  1
 
 /* ================================================================== *
+ *  WIFI_CLK — GPCLK2 on GPIO43 (the chip's reference clock).         *
+ *  The BCM43455 needs a slow reference clock to come out of reset and *
+ *  respond on SDIO; on the Pi 3 this is GPCLK2 routed to GPIO43       *
+ *  (dts: gpclk2_gpio43).  Target ~32.768 kHz from the 19.2 MHz osc.   *
+ * ================================================================== */
+static void wifi_clk_setup(void)
+{
+    uint32_t sel, divi, divf;
+    int t;
+
+    /* GPIO43 -> ALT0 (GPCLK2).  GPIO43 is in GPFSEL4, bits [9:11]; ALT0=4. */
+    sel = GPFSEL4;
+    sel &= ~(7u << 9);
+    sel |=  (4u << 9);
+    GPFSEL4 = sel;
+
+    /* stop GPCLK2 before reprogramming */
+    CM_GP2CTL = CM_PASSWD | (CM_GP2CTL & ~CM_CTL_ENAB);
+    for (t = 0; t < 100000 && (CM_GP2CTL & CM_CTL_BUSY); t++) wifi_udelay(10);
+
+    /* 19.2 MHz / 32.768 kHz = 585.9375 -> DIVI=585, DIVF=0.9375*4096=3840 */
+    divi = 585; divf = 3840;
+    CM_GP2DIV = CM_PASSWD | (divi << 12) | (divf & 0xFFF);
+    /* source = oscillator, enable, MASH-1 for the fractional divider */
+    CM_GP2CTL = CM_PASSWD | (1u << 9) /* MASH=1 */ | CM_SRC_OSC;
+    CM_GP2CTL = CM_PASSWD | (1u << 9) | CM_CTL_ENAB | CM_SRC_OSC;
+    for (t = 0; t < 100000 && !(CM_GP2CTL & CM_CTL_BUSY); t++) wifi_udelay(10);
+    wifi_log("[wifi] WIFI_CLK GPCLK2 on GPIO43 ~32.768kHz (CTL=0x%08x)\r\n",
+             CM_GP2CTL);
+}
+
+/* ================================================================== *
  *  GPIO 34-39 -> ALT3 (SDIO bus to the WiFi chip)                    *
  * ================================================================== */
 static void wifi_gpio_sdio(void)
@@ -294,7 +375,7 @@ static int emmc_reset_clock(uint32_t divisor)
         wifi_udelay(100);
     }
     if (EMMC_CONTROL1 & C1_SRST_HC) {
-        kprintf("[wifi]   SRST_HC did not clear (controller dead?)\r\n");
+        wifi_log("[wifi]   SRST_HC did not clear (controller dead?)\r\n");
         return -1;
     }
 
@@ -312,7 +393,7 @@ static int emmc_reset_clock(uint32_t divisor)
         wifi_udelay(100);
     }
     if (!(EMMC_CONTROL1 & C1_CLK_STABLE)) {
-        kprintf("[wifi]   internal clock never stabilised\r\n");
+        wifi_log("[wifi]   internal clock never stabilised\r\n");
         return -1;
     }
     EMMC_CONTROL1 |= C1_CLK_EN;            /* gate clock to the chip */
@@ -330,18 +411,18 @@ static int emmc_host_init(void)
      * (This was the likely cause of the first CMD5 timeout — no bus clock.) */
     wifi_fw_set_clock_state(RPI_FW_EMMC_CLK_ID, 1);
     base = wifi_fw_get_clock_rate(RPI_FW_EMMC_CLK_ID);
-    kprintf("[wifi] EMMC base clock = %u Hz\r\n", base);
+    wifi_log("[wifi] EMMC base clock = %u Hz\r\n", base);
     if (base == 0) {
         base = 250000000u;   /* fallback to a common Pi default */
-        kprintf("[wifi]   (base=0 from firmware, assuming %u)\r\n", base);
+        wifi_log("[wifi]   (base=0 from firmware, assuming %u)\r\n", base);
     }
 
     ver = EMMC_SLOTISR_VER;
-    kprintf("[wifi] SDHCI HC version=0x%02x (SLOTISR_VER=0x%08x)\r\n",
+    wifi_log("[wifi] SDHCI HC version=0x%02x (SLOTISR_VER=0x%08x)\r\n",
             (ver >> 16) & 0xFF, ver);
 
     div = emmc_divisor(base, 400000);
-    kprintf("[wifi] SDIO init clock divisor=%u (~%u Hz)\r\n",
+    wifi_log("[wifi] SDIO init clock divisor=%u (~%u Hz)\r\n",
             div, base / (2 * div));
     if (emmc_reset_clock(div) != 0)
         return -1;
@@ -350,7 +431,7 @@ static int emmc_host_init(void)
     EMMC_IRPT_EN   = 0xFFFFFFFFu;
     EMMC_IRPT_MASK = 0xFFFFFFFFu;
     EMMC_INTERRUPT = 0xFFFFFFFFu;          /* clear stale */
-    kprintf("[wifi] SDHCI host initialised (clock on)\r\n");
+    wifi_log("[wifi] SDHCI host initialised (clock on)\r\n");
     return 0;
 }
 
@@ -380,20 +461,20 @@ static int emmc_cmd(uint32_t cmd_idx, uint32_t arg, uint32_t resp_flags,
     /* wait for CMD_DONE or error */
     for (t = 0; t < 1000000; t++) {
         intr = EMMC_INTERRUPT;
-        if (intr & INT_ERR)      { kprintf("[wifi]   cmd%d err intr=0x%08x\r\n", cmd_idx, intr); return -1; }
+        if (intr & INT_ERR)      { wifi_log("[wifi]   cmd%d err intr=0x%08x\r\n", cmd_idx, intr); return -1; }
         if (intr & INT_CMD_DONE) { EMMC_INTERRUPT = INT_CMD_DONE; break; }
     }
-    if (t >= 1000000) { kprintf("[wifi]   cmd%d timeout (no CMD_DONE)\r\n", cmd_idx); return -1; }
+    if (t >= 1000000) { wifi_log("[wifi]   cmd%d timeout (no CMD_DONE)\r\n", cmd_idx); return -1; }
 
     if (resp_out) *resp_out = EMMC_RESP0;
 
     if (read_4byte) {
         for (t = 0; t < 1000000; t++) {
             intr = EMMC_INTERRUPT;
-            if (intr & INT_ERR)       { kprintf("[wifi]   cmd%d data err 0x%08x\r\n", cmd_idx, intr); return -1; }
+            if (intr & INT_ERR)       { wifi_log("[wifi]   cmd%d data err 0x%08x\r\n", cmd_idx, intr); return -1; }
             if (intr & INT_READ_RDY)  { EMMC_INTERRUPT = INT_READ_RDY; break; }
         }
-        if (t >= 1000000) { kprintf("[wifi]   cmd%d no READ_RDY\r\n", cmd_idx); return -1; }
+        if (t >= 1000000) { wifi_log("[wifi]   cmd%d no READ_RDY\r\n", cmd_idx); return -1; }
         if (data) *data = EMMC_DATA;
         for (t = 0; t < 1000000; t++) {
             if (EMMC_INTERRUPT & INT_DATA_DONE) { EMMC_INTERRUPT = INT_DATA_DONE; break; }
@@ -464,32 +545,38 @@ int wifi_probe(void)
     uint32_t ocr = 0, rca = 0, chipid = 0;
     int r, ioe;
 
-    kprintf("[wifi] === BCM43455 SDIO bring-up (Stage 1+2) ===\r\n");
+    wifi_tn = 0;                /* reset trace buffer for this run */
+    wifi_log("[wifi] === BCM43455 SDIO bring-up (Stage 1+2) ===\r\n");
+    wifi_log("[wifi] build: %s\r\n", WIFI_BUILD_ID);
+
+    /* 0. start the chip's reference clock (GPCLK2/WIFI_CLK) BEFORE releasing
+     *    reset, so the chip has a clock as it boots. */
+    wifi_clk_setup();
 
     /* 1. power-cycle the chip via WL_REG_ON (firmware expander gpio 129):
      *    drive reset asserted (0), settle, then deasserted (1), and read it
      *    back to confirm the firmware actually drove the expander pin. */
     {
         uint32_t st = 0xDEAD;
-        kprintf("[wifi] WL_REG_ON reset cycle (fw gpio %d)...\r\n", WIFI_GPIO_WL_ON_FW);
+        wifi_log("[wifi] WL_REG_ON reset cycle (fw gpio %d)...\r\n", WIFI_GPIO_WL_ON_FW);
         wifi_fw_set_gpio(WIFI_GPIO_WL_ON_FW, 0);   /* hold in reset */
         sleep(50);
         if (wifi_fw_set_gpio(WIFI_GPIO_WL_ON_FW, 1) != 0)  /* release */
-            kprintf("[wifi]   warning: SET_GPIO_STATE response not OK\r\n");
+            wifi_log("[wifi]   warning: SET_GPIO_STATE response not OK\r\n");
         sleep(150);                                 /* regulators + LPO settle */
         if (wifi_fw_get_gpio(WIFI_GPIO_WL_ON_FW, &st) == 0)
-            kprintf("[wifi] WL_REG_ON readback state=%u (expect 1)\r\n", st);
+            wifi_log("[wifi] WL_REG_ON readback state=%u (expect 1)\r\n", st);
         else
-            kprintf("[wifi]   warning: GET_GPIO_STATE failed\r\n");
+            wifi_log("[wifi]   warning: GET_GPIO_STATE failed\r\n");
     }
 
     /* 2. route GPIO34-39 to ALT3 (SDIO bus). */
     wifi_gpio_sdio();
-    kprintf("[wifi] GPIO34-39 -> ALT3 (GPFSEL3=0x%08x)\r\n", GPFSEL3);
+    wifi_log("[wifi] GPIO34-39 -> ALT3 (GPFSEL3=0x%08x)\r\n", GPFSEL3);
 
     /* 3. bring up the Arasan SDHCI host. */
     if (emmc_host_init() != 0) {
-        kprintf("[wifi] FAILED: host controller init\r\n");
+        wifi_log("[wifi] FAILED: host controller init\r\n");
         return -1;
     }
 
@@ -501,10 +588,10 @@ int wifi_probe(void)
      * window until the chip reports ready (OCR bit 31). */
     r = emmc_cmd(SD_CMD5_IO_OP_COND, 0, CMD_RSPNS_48, &ocr, 0, NULL);
     if (r != 0) {
-        kprintf("[wifi] FAILED: CMD5 (no SDIO device responding)\r\n");
+        wifi_log("[wifi] FAILED: CMD5 (no SDIO device responding)\r\n");
         return -1;
     }
-    kprintf("[wifi] CMD5 OCR=0x%08x (numfn=%d mempresent=%d)\r\n",
+    wifi_log("[wifi] CMD5 OCR=0x%08x (numfn=%d mempresent=%d)\r\n",
             ocr, (ocr >> 28) & 7, (ocr >> 27) & 1);
 
     {
@@ -518,27 +605,27 @@ int wifi_probe(void)
         }
     }
     if (!(ocr & 0x80000000u)) {
-        kprintf("[wifi] FAILED: SDIO OCR never ready (0x%08x)\r\n", ocr);
+        wifi_log("[wifi] FAILED: SDIO OCR never ready (0x%08x)\r\n", ocr);
         return -1;
     }
-    kprintf("[wifi] SDIO power-up ready, OCR=0x%08x\r\n", ocr);
+    wifi_log("[wifi] SDIO power-up ready, OCR=0x%08x\r\n", ocr);
 
     /* 5. CMD3 -> relative card address, CMD7 -> select. */
     if (emmc_cmd(SD_CMD3_SEND_RCA, 0, CMD_RSPNS_48, &rca, 0, NULL) != 0) {
-        kprintf("[wifi] FAILED: CMD3 (no RCA)\r\n");
+        wifi_log("[wifi] FAILED: CMD3 (no RCA)\r\n");
         return -1;
     }
     rca &= 0xFFFF0000u;
-    kprintf("[wifi] RCA=0x%08x\r\n", rca);
+    wifi_log("[wifi] RCA=0x%08x\r\n", rca);
     if (emmc_cmd(SD_CMD7_SELECT, rca, CMD_RSPNS_48BUSY, NULL, 0, NULL) != 0) {
-        kprintf("[wifi] FAILED: CMD7 (select)\r\n");
+        wifi_log("[wifi] FAILED: CMD7 (select)\r\n");
         return -1;
     }
-    kprintf("[wifi] chip selected (SDIO command state)\r\n");
+    wifi_log("[wifi] chip selected (SDIO command state)\r\n");
 
     /* 6. enable backplane function 1 (CCCR IOEx bit 1) and wait IOR1. */
     if (sdio_cmd52(0, SDIO_CCCR_IOEx, 1, 0x02) < 0) {
-        kprintf("[wifi] FAILED: enable F1 (CMD52 IOEx)\r\n");
+        wifi_log("[wifi] FAILED: enable F1 (CMD52 IOEx)\r\n");
         return -1;
     }
     {
@@ -550,24 +637,24 @@ int wifi_probe(void)
         }
     }
     if (!(ioe & 0x02)) {
-        kprintf("[wifi] FAILED: F1 not ready (IOR1=0x%02x)\r\n", ioe);
+        wifi_log("[wifi] FAILED: F1 not ready (IOR1=0x%02x)\r\n", ioe);
         return -1;
     }
-    kprintf("[wifi] backplane function 1 enabled+ready\r\n");
+    wifi_log("[wifi] backplane function 1 enabled+ready\r\n");
 
     /* 7. read the silicon chip-id over the backplane (chipcommon offset 0). */
     if (wifi_backplane_read32(SI_ENUM_BASE, &chipid) != 0) {
-        kprintf("[wifi] FAILED: backplane chip-id read\r\n");
+        wifi_log("[wifi] FAILED: backplane chip-id read\r\n");
         return -1;
     }
-    kprintf("[wifi] chipcommon[0]=0x%08x  chip-id=0x%04x  rev=%d\r\n",
+    wifi_log("[wifi] chipcommon[0]=0x%08x  chip-id=0x%04x  rev=%d\r\n",
             chipid, chipid & CID_ID_MASK, (chipid >> 16) & 0xF);
 
     if ((chipid & CID_ID_MASK) == BCM43455_CHIP_ID) {
-        kprintf("[wifi] *** SUCCESS: BCM43455 (0x4345) detected over SDIO ***\r\n");
+        wifi_log("[wifi] *** SUCCESS: BCM43455 (0x4345) detected over SDIO ***\r\n");
         return 0;
     }
-    kprintf("[wifi] chip-id 0x%04x is not the expected 0x4345 "
+    wifi_log("[wifi] chip-id 0x%04x is not the expected 0x4345 "
             "(check window/access path)\r\n", chipid & CID_ID_MASK);
     return -1;
 }

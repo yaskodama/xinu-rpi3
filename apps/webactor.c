@@ -1488,18 +1488,20 @@ thread webactor_server(void)
                 0 == strncmp(reqbuf, "POST /api/wifi/probe", 20))
             {
                 extern int wifi_probe(void);
+                extern const char *wifi_trace(void);
                 int rc = wifi_probe();
-                static char wresp[200];
-                int blen = sprintf(wresp + 100,
-                    "wifi probe rc=%d (%s) — see serial console for [wifi] trace\r\n",
-                    rc, (rc == 0) ? "BCM43455 detected" : "failed/not detected");
-                int hlen = sprintf(wresp,
-                                   "HTTP/1.0 200 OK\r\n"
-                                   "Content-Type: text/plain\r\n"
-                                   "Content-Length: %d\r\n"
-                                   "\r\n", blen);
-                memcpy(wresp + hlen, wresp + 100, blen);
-                write(tcpdev, wresp, hlen + blen);
+                const char *tr = wifi_trace();
+                static char whdr[160];
+                int blen, hlen;
+                blen = 0; while (tr[blen] && blen < 3900) blen++;
+                hlen = sprintf(whdr,
+                               "HTTP/1.0 200 OK\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "X-Wifi-RC: %d\r\n"
+                               "Content-Length: %d\r\n"
+                               "\r\n", rc, blen);
+                write(tcpdev, whdr, hlen);
+                write(tcpdev, (void *)tr, blen);   /* full [wifi] trace */
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
