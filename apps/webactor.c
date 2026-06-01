@@ -1536,7 +1536,7 @@ thread webactor_server(void)
                 const char *url = strchr(reqbuf, ' ');
                 const char *q = url ? strchr(url, '?') : NULL;
                 int rc, blen, hlen; const char *tr;
-                static char jhdr[160];
+                static char jhdr[320];
                 ssid[0] = pass[0] = '\0';
                 if (q) {
                     const char *p = q + 1;
@@ -1545,11 +1545,16 @@ thread webactor_server(void)
                         if (0 == strncmp(p, "ssid=", 5)) { dst = ssid; dcap = sizeof(ssid)-1; p += 5; }
                         else if (0 == strncmp(p, "pass=", 5)) { dst = pass; dcap = sizeof(pass)-1; p += 5; }
                         while (*p && *p != '&' && *p != ' ' && *p != '\r' && *p != '\n') {
-                            if (dst && k < dcap) {
-                                char c = *p;
-                                if (c == '+') c = ' ';   /* minimal urldecode */
-                                dst[k++] = c;
+                            char c = *p;
+                            if (c == '+') {                 /* urldecode: + -> space */
+                                c = ' ';
+                            } else if (c == '%' && p[1] && p[2]) {  /* %XX -> byte */
+                                char h1 = p[1], h2 = p[2]; int v1, v2;
+                                v1 = (h1>='0'&&h1<='9')?h1-'0':(h1>='a'&&h1<='f')?h1-'a'+10:(h1>='A'&&h1<='F')?h1-'A'+10:-1;
+                                v2 = (h2>='0'&&h2<='9')?h2-'0':(h2>='a'&&h2<='f')?h2-'a'+10:(h2>='A'&&h2<='F')?h2-'A'+10:-1;
+                                if (v1 >= 0 && v2 >= 0) { c = (char)((v1<<4)|v2); p += 2; }
                             }
+                            if (dst && k < dcap) dst[k++] = c;
                             p++;
                         }
                         if (dst) dst[k] = '\0';
@@ -1559,9 +1564,22 @@ thread webactor_server(void)
                 rc = wifi_join(ssid, pass);
                 tr = wifi_trace();
                 blen = 0; while (tr[blen] && blen < 3900) blen++;
-                hlen = sprintf(jhdr,
+                {
+                    /* Surface the join diagnostics in headers — the small header
+                     * block always reaches the client even when the long join
+                     * leaves the large trace body undeliverable over TCP. */
+                    extern void wifi_diag(int*,int*,int*,int*,int*,int*,int*);
+                    int sup, pmk, nev, eapol, link, lastev, laststat;
+                    wifi_diag(&sup,&pmk,&nev,&eapol,&link,&lastev,&laststat);
+                    hlen = sprintf(jhdr,
                                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
-                               "X-Wifi-RC: %d\r\nContent-Length: %d\r\n\r\n", rc, blen);
+                               "X-Wifi-RC: %d\r\n"
+                               "X-Wifi-Sup: %d\r\nX-Wifi-Pmk: %d\r\n"
+                               "X-Wifi-Events: %d\r\nX-Wifi-LastEvent: %d\r\n"
+                               "X-Wifi-LastStatus: %d\r\nX-Wifi-Eapol: %d\r\n"
+                               "X-Wifi-Link: %d\r\nContent-Length: %d\r\n\r\n",
+                               rc, sup, pmk, nev, lastev, laststat, eapol, link, blen);
+                }
                 write(tcpdev, jhdr, hlen);
                 write(tcpdev, (void *)tr, blen);
                 close(tcpdev);

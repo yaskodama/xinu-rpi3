@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b17 (minimal fw 7.45.241 FWSUP; sup_wpa+PMK 4-way in fw)"
+#define WIFI_BUILD_ID "wifi-stage6-b18 (minimal fw FWSUP; diag in HTTP headers)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -77,6 +77,20 @@ static void wifi_log(const char *fmt, ...)
 
 /* Public: the captured trace from the last wifi_probe() run. */
 const char *wifi_trace(void) { return wifi_tbuf; }
+
+/* Last-join diagnostics, surfaced via HTTP response headers because the long
+ * (~150 s) join leaves the TCP connection unable to deliver the large trace
+ * body reliably, while the small header block always arrives. */
+static int wifi_d_sup = -999, wifi_d_pmk = -999, wifi_d_nev = 0,
+           wifi_d_eapol = 0, wifi_d_link = -1, wifi_d_lastev = -1,
+           wifi_d_laststat = 0;
+void wifi_diag(int *sup, int *pmk, int *nev, int *eapol, int *link,
+               int *lastev, int *laststat)
+{
+    *sup = wifi_d_sup; *pmk = wifi_d_pmk; *nev = wifi_d_nev;
+    *eapol = wifi_d_eapol; *link = wifi_d_link;
+    *lastev = wifi_d_lastev; *laststat = wifi_d_laststat;
+}
 
 /* ------------------------------------------------------------------ *
  *  MMIO bases (BCM2837, peripheral base 0x3F000000)                  *
@@ -1676,6 +1690,8 @@ static int wifi_do_join(const char *ssid, const char *pass)
     while (ssid[sl] && sl < 32) sl++;
     if (pass) while (pass[pl] && pl < 63) pl++;
     wifi_log("[wifi] join: ssid=\"%s\" %s\r\n", ssid, secured ? "WPA2-PSK" : "open");
+    wifi_d_sup = wifi_d_pmk = -999; wifi_d_nev = wifi_d_eapol = 0;
+    wifi_d_link = -1; wifi_d_lastev = -1; wifi_d_laststat = 0;
 
     wifi_radio_up();                             /* event_msgs/clm/country/pm */
     wifi_cmd_int(WLC_DOWN, 1);
@@ -1693,9 +1709,11 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_cmd_int(2, 1);                      /* WLC_UP */
         wifi_delay_us(50000);
         rc = wifi_set_iovar_int("sup_wpa", 1);   /* enable in-dongle supplicant */
+        wifi_d_sup = rc;
         wifi_log("[wifi] join: sup_wpa=1 rc=%d %s\r\n", rc,
                  rc ? "(FWSUP NOT available — wrong fw variant?)" : "(FWSUP on)");
         rc = wifi_set_pmk(ssid, sl, pass, pl);   /* 132-B WSEC_PMK with PMK */
+        wifi_d_pmk = rc;
         wifi_log("[wifi] join: WSEC_PMK rc=%d %s\r\n", rc,
                  rc ? "(fw rejected PMK)" : "(PMK accepted)");
     } else {
@@ -1749,9 +1767,11 @@ static int wifi_do_join(const char *ssid, const char *pass)
                 if (chan == 1) {                  /* event */
                     long status = (p[24+8]<<24)|(p[24+9]<<16)|(p[24+10]<<8)|p[24+11];
                     ev = (p[24 + 6] << 8) | p[24 + 7];
-                    if (nev++ < 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
+                    nev++; wifi_d_nev = nev; wifi_d_lastev = ev; wifi_d_laststat = (int)status;
+                    if (nev <= 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
                     if (ev == 16) {
                         int up = (p[24+2] << 8 | p[24+3]) & 1;
+                        wifi_d_link = up ? 1 : 0;
                         wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP" : "down");
                         if (up) { wifi_log("[wifi] *** associated (link up) ***\r\n"); return 0; }
                     } else if (ev == 5 || ev == 6 || ev == 12 || ev == 24) {
@@ -1761,7 +1781,7 @@ static int wifi_do_join(const char *ssid, const char *pass)
                     int et = (p[12] << 8) | p[13];
                     ndata++;
                     if (et == 0x888E) {           /* EAPOL — the 4-way handshake */
-                        eapol++;
+                        eapol++; wifi_d_eapol = eapol;
                         wifi_log("[wifi] join: EAPOL frame #%d (len=%d) — AP started 4-way!\r\n",
                                  eapol, len);
                         if (eapol == 1)
