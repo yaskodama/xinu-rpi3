@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b18 (minimal fw FWSUP; diag in HTTP headers)"
+#define WIFI_BUILD_ID "wifi-stage6-b19 (FWSUP; event-sequence in X-Wifi-EvSeq header)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -84,12 +84,20 @@ const char *wifi_trace(void) { return wifi_tbuf; }
 static int wifi_d_sup = -999, wifi_d_pmk = -999, wifi_d_nev = 0,
            wifi_d_eapol = 0, wifi_d_link = -1, wifi_d_lastev = -1,
            wifi_d_laststat = 0;
+static int wifi_d_seq[16];     /* first 16 event codes, in order */
 void wifi_diag(int *sup, int *pmk, int *nev, int *eapol, int *link,
                int *lastev, int *laststat)
 {
     *sup = wifi_d_sup; *pmk = wifi_d_pmk; *nev = wifi_d_nev;
     *eapol = wifi_d_eapol; *link = wifi_d_link;
     *lastev = wifi_d_lastev; *laststat = wifi_d_laststat;
+}
+/* Copy the recorded event-code sequence; returns how many (<=16). */
+int wifi_diag_seq(int *out, int cap)
+{
+    int i, n = wifi_d_nev; if (n > 16) n = 16; if (n > cap) n = cap;
+    for (i = 0; i < n; i++) out[i] = wifi_d_seq[i];
+    return n;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1768,6 +1776,7 @@ static int wifi_do_join(const char *ssid, const char *pass)
                     long status = (p[24+8]<<24)|(p[24+9]<<16)|(p[24+10]<<8)|p[24+11];
                     ev = (p[24 + 6] << 8) | p[24 + 7];
                     nev++; wifi_d_nev = nev; wifi_d_lastev = ev; wifi_d_laststat = (int)status;
+                    if (nev <= 16) wifi_d_seq[nev - 1] = ev;
                     if (nev <= 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
                     if (ev == 16) {
                         int up = (p[24+2] << 8 | p[24+3]) & 1;

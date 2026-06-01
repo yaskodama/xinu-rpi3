@@ -1536,7 +1536,7 @@ thread webactor_server(void)
                 const char *url = strchr(reqbuf, ' ');
                 const char *q = url ? strchr(url, '?') : NULL;
                 int rc, blen, hlen; const char *tr;
-                static char jhdr[320];
+                static char jhdr[480];
                 ssid[0] = pass[0] = '\0';
                 if (q) {
                     const char *p = q + 1;
@@ -1569,16 +1569,23 @@ thread webactor_server(void)
                      * block always reaches the client even when the long join
                      * leaves the large trace body undeliverable over TCP. */
                     extern void wifi_diag(int*,int*,int*,int*,int*,int*,int*);
+                    extern int  wifi_diag_seq(int*, int);
                     int sup, pmk, nev, eapol, link, lastev, laststat;
+                    int seq[16], sn, si, sl = 0; char seqbuf[96];
                     wifi_diag(&sup,&pmk,&nev,&eapol,&link,&lastev,&laststat);
+                    sn = wifi_diag_seq(seq, 16);
+                    for (si = 0; si < sn && sl < (int)sizeof(seqbuf)-8; si++)
+                        sl += sprintf(seqbuf + sl, si ? ",%d" : "%d", seq[si]);
+                    seqbuf[sl] = '\0';
                     hlen = sprintf(jhdr,
                                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                                "X-Wifi-RC: %d\r\n"
                                "X-Wifi-Sup: %d\r\nX-Wifi-Pmk: %d\r\n"
                                "X-Wifi-Events: %d\r\nX-Wifi-LastEvent: %d\r\n"
                                "X-Wifi-LastStatus: %d\r\nX-Wifi-Eapol: %d\r\n"
-                               "X-Wifi-Link: %d\r\nContent-Length: %d\r\n\r\n",
-                               rc, sup, pmk, nev, lastev, laststat, eapol, link, blen);
+                               "X-Wifi-Link: %d\r\nX-Wifi-EvSeq: %s\r\n"
+                               "Content-Length: %d\r\n\r\n",
+                               rc, sup, pmk, nev, lastev, laststat, eapol, link, seqbuf, blen);
                 }
                 write(tcpdev, jhdr, hlen);
                 write(tcpdev, (void *)tr, blen);
