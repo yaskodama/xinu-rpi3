@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage4-b10b (SDPCM: poll Fn2 FIFO for response)"
+#define WIFI_BUILD_ID "wifi-stage5-b11 (scan -> AP list)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1068,6 +1068,139 @@ static int wifi_get_iovar(const char *name, uint8_t *val, int len)
     return wifi_wlcmd(0, WLC_GET_VAR, (const uint8_t *)name, n, val, len);
 }
 
+/* WLC ioctl taking a single 4-byte int (e.g. PASSIVE_SCAN). */
+static int wifi_cmd_int(int op, uint32_t v)
+{
+    uint8_t b[4];
+    b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24;
+    return wifi_wlcmd(1, op, b, 4, NULL, 0);
+}
+
+/* iovar SET: name\0 + value as one payload. */
+static int wifi_set_iovar(const char *name, const uint8_t *val, int vlen)
+{
+    static uint8_t b[600];
+    int n = 0, i;
+    while (name[n]) { b[n] = name[n]; n++; }
+    b[n++] = '\0';
+    for (i = 0; i < vlen && (n + i) < (int)sizeof(b); i++) b[n + i] = val[i];
+    return wifi_wlcmd(1, WLC_SET_VAR, b, n + vlen, NULL, 0);
+}
+
+/* ================================================================== *
+ *  Stage 5 — scan for access points (escan + event parsing)         *
+ * ================================================================== */
+#define WLC_PASSIVE_SCAN 49
+#define WLC_E_ESCAN_RESULT 69
+#define WLC_E_SCAN_COMPLETE 26
+
+/* escan_params template (little-endian; plan9 ether4330.c wlscanstart):
+ * version=1 action=START(1) sync_id=0x1234, ssid(any), bssid=ff..ff,
+ * bss_type=any(2), defaults, 14 2.4GHz channels, 1 (any) ssid. */
+static const uint8_t escan_params[] = {
+    1,0,0,0,            /* version */
+    1,0,                /* action = WL_SCAN_ACTION_START */
+    0x34,0x12,          /* sync_id */
+    0,0,0,0,            /* ssid len */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ssid[32] */
+    0xff,0xff,0xff,0xff,0xff,0xff,   /* bssid = broadcast (any) */
+    2,                  /* bss_type = any */
+    0,                  /* scan_type = active */
+    0xff,0xff,0xff,0xff, /* nprobes (default) */
+    0xff,0xff,0xff,0xff, /* active_time */
+    0xff,0xff,0xff,0xff, /* passive_time */
+    0xff,0xff,0xff,0xff, /* home_time */
+    14,0,               /* nchannels */
+    1,0,                /* nssids */
+    0x01,0x2b,0x02,0x2b,0x03,0x2b,0x04,0x2b,0x05,0x2e,0x06,0x2e,0x07,0x2e,
+    0x08,0x2b,0x09,0x2b,0x0a,0x2b,0x0b,0x2b,0x0c,0x2b,0x0d,0x2b,0x0e,0x2b,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  /* ssid */
+};
+
+/* Read one SDPCM frame from the Fn2 FIFO into `buf` (cap bytes).
+ * Returns the frame length (>=12), 0 if nothing queued, -1 on error.
+ * On success *chan = channel, *doff = data offset. */
+static int wifi_read_frame(uint8_t *buf, int cap, int *chan, int *doff)
+{
+    int plen, lenck;
+    if (wifi_packetrw(0, buf, SDPCM_HDR) != 0) return -1;
+    plen = buf[0] | (buf[1] << 8);
+    lenck = buf[2] | (buf[3] << 8);
+    if (plen == 0) return 0;
+    if (lenck != ((plen ^ 0xFFFF) & 0xFFFF) || plen < SDPCM_HDR || plen > cap)
+        return 0;                              /* junk; treat as empty */
+    *chan = buf[5] & 0xF;
+    *doff = buf[7];
+    if (plen > SDPCM_HDR)
+        if (wifi_packetrw(0, buf + SDPCM_HDR, plen - SDPCM_HDR) != 0) return -1;
+    return plen;
+}
+
+/* Run a scan and append the discovered APs to the trace.  out_count gets the
+ * number of unique APs found.  Returns 0 on success. */
+static int wifi_scan(int *out_count)
+{
+    static uint8_t fr[2048];
+    static uint8_t seen[32][6];     /* dedup by BSSID */
+    int nseen = 0, tries, chan, doff, i;
+
+    *out_count = 0;
+    wifi_cmd_int(WLC_PASSIVE_SCAN, 0);
+    if (wifi_set_iovar("escan", escan_params, sizeof(escan_params)) != 0) {
+        wifi_log("[wifi] scan: escan start failed\r\n");
+        return -1;
+    }
+    wifi_log("[wifi] scan: escan started, collecting results...\r\n");
+
+    for (tries = 0; tries < 1200; tries++) {     /* ~up to several seconds */
+        uint8_t *evp, *escan, *bss;
+        int len, event, nbss, bdc;
+
+        len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (len < 0) break;
+        if (len == 0) { wifi_delay_us(5000); continue; }
+        if (chan != 1) continue;                 /* only event frames carry results */
+        if (len < doff + 4) continue;
+        bdc = 4 + (fr[doff + 3] << 2);
+        evp = fr + doff + bdc;                    /* 802.3 event frame */
+        if ((int)(evp - fr) + 24 + 64 > len) continue;
+        event = (evp[24 + 6] << 8) | evp[24 + 7]; /* big-endian event number */
+        if (event == WLC_E_SCAN_COMPLETE) { wifi_log("[wifi] scan: complete event\r\n"); break; }
+        if (event != WLC_E_ESCAN_RESULT) continue;
+        escan = evp + 24 + 48;
+        if ((int)(escan - fr) + 12 > len) continue;
+        nbss = escan[10] | (escan[11] << 8);
+        if (nbss == 0) { wifi_log("[wifi] scan: escan done (nbss=0)\r\n"); break; }
+        bss = escan + 12;
+        if ((int)(bss - fr) + 82 > len) continue;
+        {
+            uint8_t *bssid = bss + 8;
+            int ssidlen = bss[18]; if (ssidlen > 32) ssidlen = 32;
+            short rssi = (short)(bss[78] | (bss[79] << 8));
+            int ch = (bss[72] | (bss[73] << 8)) & 0xFF;
+            int dup = 0;
+            for (i = 0; i < nseen; i++)
+                if (seen[i][0]==bssid[0]&&seen[i][1]==bssid[1]&&seen[i][2]==bssid[2]&&
+                    seen[i][3]==bssid[3]&&seen[i][4]==bssid[4]&&seen[i][5]==bssid[5]) { dup=1; break; }
+            if (dup) continue;
+            if (nseen < 32) { for (i=0;i<6;i++) seen[nseen][i]=bssid[i]; nseen++; }
+            {
+                char ssid[33];
+                for (i = 0; i < ssidlen; i++) {
+                    uint8_t c = bss[19 + i];
+                    ssid[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+                }
+                ssid[ssidlen] = '\0';
+                wifi_log("[wifi] AP %2d: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x ch=%d rssi=%d\r\n",
+                         nseen, ssidlen ? ssid : "(hidden)",
+                         bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], ch, rssi);
+            }
+        }
+    }
+    *out_count = nseen;
+    return 0;
+}
+
 /* ================================================================== *
  *  Public: power on the chip and probe its SDIO identity + chip-id.  *
  * ================================================================== */
@@ -1294,7 +1427,17 @@ int wifi_probe(void)
         for (i = 0; i < (int)sizeof(ver) - 1; i++)
             if (ver[i] == '\r' || ver[i] == '\n') { ver[i] = '\0'; break; }
         wifi_log("[wifi] firmware version: %s\r\n", (char *)ver);
-        wifi_log("[wifi] *** SUCCESS: Stage 4 — SDPCM ioctl works (fw responds) ***\r\n");
+        wifi_log("[wifi] Stage 4 — SDPCM ioctl works (fw responds)\r\n");
+    }
+
+    /* ---- Stage 5: scan for access points ---- */
+    {
+        int n = 0;
+        if (wifi_scan(&n) != 0) {
+            wifi_log("[wifi] FAILED: scan\r\n");
+            return -1;
+        }
+        wifi_log("[wifi] *** SUCCESS: Stage 5 — scan found %d access point(s) ***\r\n", n);
     }
     return 0;
 }
