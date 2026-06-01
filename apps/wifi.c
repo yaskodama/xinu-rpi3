@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage3a-b8 (CMD53 PIO + corescan + ramscan)"
+#define WIFI_BUILD_ID "wifi-stage3a-b8b (set F1/F2 block size for block-mode CMD53)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -909,6 +909,18 @@ int wifi_probe(void)
         return -1;
     }
     wifi_log("[wifi] backplane function 1 enabled+ready\r\n");
+
+    /* 6b. set SDIO function block sizes.  Block-mode CMD53 (used by the bulk
+     * backplane transfers / firmware download) frames data into fixed-size
+     * blocks each with its own CRC16; without programming the function block
+     * size the device CRC-mismatches (the b8 DCRC error 0x208000).  plan9
+     * uses 64 for F1 (backplane) and 512 for F2 (WLAN data).
+     * FBR1 blksize @ CCCR 0x110, FBR2 @ 0x210. */
+    sdio_cmd52(0, 0x110, 1, 64);
+    sdio_cmd52(0, 0x111, 1, 0);
+    sdio_cmd52(0, 0x210, 1, 512 & 0xFF);
+    sdio_cmd52(0, 0x211, 1, (512 >> 8) & 0xFF);
+    wifi_log("[wifi] F1 blksize=64, F2 blksize=512\r\n");
 
     /* 7. read the silicon chip-id over the backplane (chipcommon offset 0). */
     if (wifi_backplane_read32(SI_ENUM_BASE, &chipid) != 0) {
