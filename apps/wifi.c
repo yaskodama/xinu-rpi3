@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b26 (FWSUP; 114-B ext_join + iovar security)"
+#define WIFI_BUILD_ID "wifi-stage6-b27 (FWSUP; broadcast scan-all join + iovar rc log)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1764,11 +1764,13 @@ static int wifi_do_join(const char *ssid, const char *pass)
          *   set_pmk         : WLC_SET_WSEC_PMK (the only command)
          * Setting wsec/auth via commands (134/165/22) earlier left the bsscfg
          * iovars the join/FWSUP path reads at 0 -> probed but never associated. */
-        int rc;
-        wifi_set_iovar_int("wpa_auth", 0xc0);    /* WPA2_AUTH_PSK | UNSPECIFIED */
-        wifi_set_iovar_int("auth", 0);           /* open auth */
-        wifi_set_iovar_int("wsec", 4);           /* AES_ENABLED (CCMP) */
-        wifi_set_iovar_int("wpa_auth", 0x80);    /* WPA2_AUTH_PSK */
+        int rc, r1, r2, r3, r4;
+        r1 = wifi_set_iovar_int("wpa_auth", 0xc0); /* WPA2_AUTH_PSK | UNSPECIFIED */
+        r2 = wifi_set_iovar_int("auth", 0);        /* open auth */
+        r3 = wifi_set_iovar_int("wsec", 4);        /* AES_ENABLED (CCMP) */
+        r4 = wifi_set_iovar_int("wpa_auth", 0x80); /* WPA2_AUTH_PSK */
+        wifi_log("[wifi] join: iovar rc wpa_auth(c0)=%d auth=%d wsec=%d wpa_auth(80)=%d\r\n",
+                 r1, r2, r3, r4);
         rc = wifi_set_iovar_int("sup_wpa", 1);   /* enable in-dongle supplicant */
         wifi_d_sup = rc;
         wifi_log("[wifi] join: sup_wpa=1 rc=%d %s\r\n", rc,
@@ -1804,24 +1806,15 @@ static int wifi_do_join(const char *ssid, const char *pass)
     for (i = 72; i < 78; i++) jp[i] = 0xFF;       /* scan bssid = broadcast */
     jp[78] = 2;                                   /* bss_type = any */
     jp[79] = 0;                                   /* scan_type = active */
-    if (wifi_tgt_found) {
-        jp[80] = 2;                               /* nprobes = 2 */
-        jp[84] = 120;                             /* active_time = 120 ms */
-        jp[88] = 0x86; jp[89] = 0x01;             /* passive_time = 390 ms */
-        jp[92]=0xFF; jp[93]=0xFF; jp[94]=0xFF; jp[95]=0xFF;   /* home = -1 */
-        jp[96] = 1;                               /* channel_num = 1 */
-        jp[100] = wifi_tgt_chanspec & 0xFF;
-        jp[101] = (wifi_tgt_chanspec >> 8) & 0xFF;
-        for (i = 0; i < 6; i++) jp[102 + i] = wifi_tgt_bssid[i];  /* assoc bssid */
-        jp[108] = 1;                              /* chanspec_num = 1 */
-        jp[112] = wifi_tgt_chanspec & 0xFF;
-        jp[113] = (wifi_tgt_chanspec >> 8) & 0xFF;
-    } else {
-        for (i = 80; i < 96; i++) jp[i] = 0xFF;   /* nprobes/active/passive/home = -1 */
-        /* channel_num = 0; channel_list = 0 */
-        for (i = 102; i < 108; i++) jp[i] = 0xFF; /* assoc bssid = broadcast */
-        /* chanspec_num = 0; chanspec_list[0] = 0 */
-    }
+    /* Broadcast scan-all join (directed by SSID only): let the firmware scan
+     * every channel and associate to the named SSID itself.  The directed
+     * single-channel form (chanspec from the scan) was accepted but the fw
+     * never associated (GET_BSSID -17) — removing the chanspec eliminates that
+     * variable.  All timers = -1 (default), channel_num = 0, assoc bcast. */
+    for (i = 80; i < 96; i++) jp[i] = 0xFF;       /* nprobes/active/passive/home = -1 */
+    /* channel_num = 0; channel_list = 0 */
+    for (i = 102; i < 108; i++) jp[i] = 0xFF;     /* assoc bssid = broadcast */
+    /* chanspec_num = 0; chanspec_list[0] = 0 */
     jsz = 114;
     if (wifi_set_iovar("join", jp, jsz) != 0) {
         wifi_log("[wifi] join: 'join' iovar failed\r\n");
