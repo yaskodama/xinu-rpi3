@@ -1480,6 +1480,30 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wifi/probe — Stage 1+2 WiFi (BCM43455) SDIO bring-up:
+             *   power the chip, enumerate SDIO, read back the silicon
+             *   chip-id.  All detail is on the serial console ([wifi] ...);
+             *   the HTTP reply only carries the final rc. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/probe",  19) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/probe", 20))
+            {
+                extern int wifi_probe(void);
+                int rc = wifi_probe();
+                static char wresp[200];
+                int blen = sprintf(wresp + 100,
+                    "wifi probe rc=%d (%s) — see serial console for [wifi] trace\r\n",
+                    rc, (rc == 0) ? "BCM43455 detected" : "failed/not detected");
+                int hlen = sprintf(wresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(wresp + hlen, wresp + 100, blen);
+                write(tcpdev, wresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/init — spin up Dispatcher + 4 Workers if
              *   not already running.  Idempotent.  After cold boot
              *   the load-balancer actors don't exist; this creates
