@@ -21,6 +21,16 @@
 
 **2026-05-27**: ethernet ping 完全動作 (LAN78xx ドライバ + DWC NAK 修正)
 **2026-06-01**: AIPL/JIT/loadbal/MMU/kexec/TCP 高速化 + loadbal Tier 1+2 + GC actor + N-Queens 分散ベンチ (LaTeX PDF レポート付) + dining 5 哲学者ベンチ WIP — 計 **39 commits**
+**2026-06-01 (続き)**: ✅ **Chandy-Misra dining (mode=3) 実機検証完了** — 5 人 × 50 食を
+~7.4s で **n_done=5/5** 完走 (deadlock/livelock/飢餓なし)。legacy mode=0 (parallel) の
+3/5 livelock を CM が解決することを実機確認。spawn クラスは ForkCM(7)×5 + PhilCM(8)×5。
+★**kexec は実機で不安定と判明** — `/upload` + `/kexec` を 2 回試行 → 1 回目は SD 旧カーネルに
+リセット、2 回目は Pi をハードハング (シリアル無音 = UART 出力前の early fault、watchdog reset も
+かからず)。alignment fix (`upload_slot_data` 16B 整列 `0x7fc9b0`) は入っているのに落ちる。
+→ **CM カーネルは SD 物理スワップで起動** (`cp xinu.boot /Volumes/XINU/kernel.img`、md5 一致確認、
+電源 ON で確実に boot)。**今後 CM 検証や確実な deploy は SD swap を使う** (kexec は flaky)。
+SD 現在状態 = CM build (329420 B, commit 5617f6e)。tftpboot にも CM を staged、
+旧 build は `kernel.img.pre-cm-bak` にバックアップ済。
 
 ## 2026-06-01 セッション概要 (39 commits)
 

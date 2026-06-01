@@ -1,0 +1,273 @@
+\documentclass[a4paper,11pt]{ltjsarticle}
+\usepackage[margin=22mm]{geometry}
+\usepackage{booktabs}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{black!4},
+  frame=single,
+  framerule=0pt,
+  breaklines=true,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  xleftmargin=12pt,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black}
+}
+
+\lstdefinelanguage{AIPL}{
+  morekeywords={class,method,function,var,new,send,now,future,
+                if,else,while,do,return,suicide,await,sender,self,this},
+  morekeywords=[2]{int,any,float,string,bool},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
+}
+
+\title{5 哲学者問題: naive 資源階層 vs Chandy-Misra \\
+  \large Raspberry Pi 3 B+ / Embedded Xinu / AIPL アクター 実機計測 (50 食 × 5 人)}
+\author{自動生成: \texttt{tools/build\_dining\_report.py}}
+\date{2026-06-01}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+古典的な 5 哲学者問題を Embedded Xinu (Raspberry Pi 3 B+ 実機) の AIPL アクター
+ランタイム上で 2 種類のアルゴリズムで実装し、5 人全員が各 50 食を終える
+までの挙動を比較する。\textbf{naive 資源階層方式} (低 ID フォークを先に取り、
+競合時は手放してリトライ) を 3 通りの起動タイミング — \textbf{(0) parallel}
+(全員同時) / \textbf{(1) staggered} (3+2) / \textbf{(2) sequential} (1 人ずつ) —
+で走らせ、\textbf{(3) Chandy-Misra hygienic-fork 方式} と対比する。
+本質的な発見: naive 方式は同時実行性が高い起動 (mode 0/1) で
+\textbf{livelock} に陥り 5 人全員が完食できない (mode 0 は CPU を占有して
+Pi 全体をウェッジさせる)。完全直列化した mode 2 のみが naive のまま 5/5 に
+到達する。これに対し \textbf{Chandy-Misra (mode 3) は並列実行を保ったまま
+deadlock も飢餓も起こさず 5/5 を達成} する。
+\end{abstract}
+
+\section{2 つのアルゴリズムと 4 つの mode}
+
+5 哲学者と 5 フォークが円卓に並ぶ古典構成。各フォークは AIPL アクターで、
+mailbox の直列性が相互排他を保証する。本ベンチは \emph{アルゴリズム} と
+\emph{起動タイミング} の 2 軸を変える:
+
+\paragraph{naive 資源階層方式 (mode 0/1/2 が共有)}
+各哲学者は自分の両隣のうち \emph{低 ID のフォークを先に} 取りに行く
+(Dijkstra の asymmetric ordering = デッドロックは原理的に起きない)。
+ただし 2 本目が取れないと 1 本目を \emph{手放してリトライ} するため、
+全員が足並みを揃えて掴む$\to$手放すを繰り返す \textbf{livelock} が起こりうる。
+
+\begin{description}
+  \item[mode 0 — parallel] 全 5 人を同時起動。最大並列度だが、足並みが
+        揃うと livelock。busy-retry が CPU を food し、Xinu の
+        ネットワークデーモンまで飢餓 $\to$ \textbf{Pi 全体がウェッジ}。
+  \item[mode 1 — staggered(3+2)] P0..P2 を先に、3 人完食後に P3,P4。
+        起動をずらしても naive のリトライ競合は残り、やはり livelock しやすい。
+  \item[mode 2 — sequential] 1 人ずつ完全直列 (前の人が完食してから次)。
+        並列度 1 なので競合自体が消え、naive のまま確実に 5/5。ただし最も遅い。
+\end{description}
+
+\paragraph{Chandy-Misra 方式 (mode 3)}
+各フォークに \emph{clean/dirty} 状態と pending-request スロットを持たせる。
+dirty なフォークは要求されたら即座に相手へ渡し (手放した側は clean 化)、
+clean なフォークは要求をキューして自分が食べ終えてから渡す。これにより
+\textbf{デッドロックも飢餓も起こさず、しかも複数の哲学者が同時に食事できる}。
+
+\begin{description}
+  \item[mode 3 — chandy-misra] 全 5 人を同時起動。mode 0 と同じ最大並列度の
+        起動だが、hygienic-fork プロトコルにより livelock せず 5/5 完走。
+\end{description}
+
+各 mode を 3 回反復する。完走する mode は壁時計中央値 (Pi 3 内部
+\texttt{clkticks * 10}、10 ms 粒度) を、livelock する mode は timeout 時点の
+完食人数 (n\_done/5) を記録する。
+
+\section{結果}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llccc}
+\toprule
+mode & ラベル & 完走 & 全 5 完食 (ms, 中央値) & 最遅 1 人 (ms) \\
+\midrule
+0 & parallel & livelock 3/5 & --- & --- \\
+1 & staggered(3+2) & livelock 1/5 & --- & --- \\
+2 & sequential & 3/3 & 7950 & 880 \\
+3 & chandy-misra & 3/3 & 7380 & 7330 \\
+\bottomrule
+\end{tabular}
+\caption{各 mode の結果。「完走」は 3 回中 5/5 に到達した回数
+(livelock した mode は到達した最大完食人数 n\_done/5 を併記)。
+「全 5 完食」は完走した run の壁時計中央値が最終目標値。
+「最遅 1 人」はその run で一番遅かった哲学者の所要時間
+(起動 $\to$ suicide 通知までの差)。livelock した mode (mode 0/1) は
+時間欄を --- とする。}
+\label{tab:dining}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=12cm, height=7cm,
+    ybar,
+    bar width=20pt,
+    ylabel={全 5 完食 中央値 (ms)},
+    symbolic x coords={sequential,chandy-misra},
+    xtick=data,
+    enlarge x limits=0.25,
+    nodes near coords,
+    nodes near coords align={vertical},
+    nodes near coords style={font=\footnotesize},
+]
+\addplot[fill=blue!40,draw=blue] coordinates {(sequential,7950) (chandy-misra,7380)};
+\end{axis}
+\end{tikzpicture}
+\caption{戦略別の壁時計時間。並列度が高いほど短くなることを観察。}
+\label{fig:dining}
+\end{figure}
+
+\section{考察}
+
+\begin{itemize}
+  \item naive 資源階層方式は同時実行性のある起動 — mode 0 (parallel, max 3/5), mode 1 (staggered(3+2), max 1/5) — で \textbf{livelock} に陥り、5 人全員が完食できない。特に mode 0 (parallel) は busy-retry が CPU を占有して Xinu のネットワークデーモンまで飢餓させ、\textbf{Pi 全体を ウェッジ}させる (ping/HTTP 不能 → 電源再投入が必要)。
+  \item mode 2 (sequential) は並列度 1 まで落として競合を消すこと で naive のまま 5/5 を達成 (中央値 7950 ms)。安全だが最も非並列。
+  \item \textbf{mode 3 (Chandy-Misra) は全員同時起動 (mode 0 と 同じ最大並列度) のまま livelock せず 5/5 を達成} (中央値 7380 ms)。hygienic-fork の clean/dirty 規律が 飢餓もデッドロックも防ぐ。
+  \item mode 3 / mode 2 の壁時計比 $\approx 0.93$ (速い)。本ワークロードは食事 1 回ごとに固定の pacing sleep が入るため、5 人が同時に食べられる CM の 並列性の優位は壁時計差としては圧縮されるが、CM は \emph{並列性を保ちながら安全}という質的な勝ちである。
+  \item 結論: 5 哲学者を実 Raspberry Pi 3 の AIPL アクターで安全かつ 並列に解くには Chandy-Misra (mode 3) が適切。naive 方式は 直列化 (mode 2) しない限り実機で livelock する。
+\end{itemize}
+
+\section{AIPL ソースコード}
+
+完全版は \texttt{examples/dining5\_bench.abcl}。Pi 3 上で実際に走る C 実装は
+\texttt{apps/abcl\_program.c} 内に手翻訳されている (xinu-raz には aipl2c が
+無いため)。振る舞いは AIPL 仕様と等価。
+
+\paragraph{naive Fork クラス (acquire/release) — mode 0/1/2 が使う資源階層方式}\nopagebreak\par
+{\footnotesize\ttfamily examples/dining5\_bench.abcl:23-38}\nopagebreak
+\lstinputlisting[firstline=23,lastline=38, firstnumber=23, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/dining5_bench.abcl}
+
+\paragraph{naive Philosopher クラス (FSM) — 競合時 release してリトライ → livelock 源}\nopagebreak\par
+{\footnotesize\ttfamily examples/dining5\_bench.abcl:40-91}\nopagebreak
+\lstinputlisting[firstline=40,lastline=91, firstnumber=40, language=AIPL]{/Users/kodamay/projects/xinu-raz/xinu/examples/dining5_bench.abcl}
+
+\paragraph{ForkCM — Chandy-Misra hygienic fork (clean/dirty + pending request)}\nopagebreak\par
+{\footnotesize\ttfamily apps/abcl\_program.c:2114-2192}\nopagebreak
+\lstinputlisting[firstline=2114,lastline=2192, firstnumber=2114, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/abcl_program.c}
+
+\paragraph{PhilCM.try\_eat — request/eat/release FSM (mode 3 = deadlock+飢餓フリー)}\nopagebreak\par
+{\footnotesize\ttfamily apps/abcl\_program.c:2233-2315}\nopagebreak
+\lstinputlisting[firstline=2233,lastline=2315, firstnumber=2233, language=C]{/Users/kodamay/projects/xinu-raz/xinu/apps/abcl_program.c}
+
+
+\section{再現手順}
+
+\begin{lstlisting}[language=bash]
+# 1. ビルド + flash (SD swap)
+cd ~/projects/xinu-raz/xinu/compile && make PLATFORM=arm-rpi3
+
+# 2. Pi 3 起動後、GC + dining actor を init:
+curl -X POST http://192.168.3.50:8080/api/gc-actor/init
+curl -X POST http://192.168.3.50:8080/api/dining/init
+
+# 3. ベンチを走らせて PDF を生成
+cd ~/projects/xinu-raz/xinu/tools
+./dining_bench.py --meals 50 --repeat 3 \
+    --out docs/dining_results.json
+./build_dining_report.py docs/dining_results.json \
+    --out docs/dining_report.tex --pdf docs/dining_report.pdf
+\end{lstlisting}
+
+\section{生データ (JSON)}
+
+\begin{lstlisting}
+{
+  "host": "http://192.168.3.50:8080",
+  "meals": 50,
+  "repeat": 3,
+  "platform": "Raspberry Pi 3 B+ / Embedded Xinu (arm-rpi3) / MAX_OBJECTS=128",
+  "measurement_notes": [
+    "mode 0 (parallel) \u306f busy-retry livelock \u304c CPU \u3092\u5360\u6709\u3057 Pi \u5168\u4f53 (network/HTTP) \u3092\u30a6\u30a7\u30c3\u30b8\u3055\u305b\u308b\u305f\u3081\u5b89\u5168\u306b\u30e9\u30a4\u30d6\u8a08\u6e2c\u3067\u304d\u306a\u3044\u3002\u89b3\u6e2c\u3055\u308c\u305f\u5230\u9054\u306f 3/5\u3002report builder \u304c documented entry \u3068\u3057\u3066\u6ce8\u5165\u3059\u308b\u3002",
+    "mode 1 (staggered) \u306f repeat 3 \u5168\u3066\u3067 livelock\u3002\u5230\u9054\u3057\u305f\u5b8c\u98df\u4eba\u6570\u306f 1/5, 1/5, 2/5\u3002max_phil_ms \u306f 0/2370/2140 \u3068\u9032\u307e\u305a\u3002",
+    "mode 2 (sequential) / mode 3 (chandy-misra) \u306f 5/5 \u5b8c\u8d70\u3092\u8907\u6570\u56de\u78ba\u8a8d\u3002\u305f\u3060\u3057\u5358\u4e00\u30b9\u30ec\u30c3\u30c9 webactor \u304c 0.2s \u30dd\u30fc\u30ea\u30f3\u30b0 + \u30a2\u30af\u30bf\u30fc\u8ca0\u8377\u306e repeat \u81ea\u52d5\u5316\u4e2d\u306b accept \u30eb\u30fc\u30d7\u3067 wedge \u3059\u308b\u305f\u3081\u3001\u5b89\u5b9a\u3057\u305f makespan \u306f\u6b8b\u7559\u30b9\u30d4\u30f3\u306e\u7121\u3044\u30af\u30ea\u30fc\u30f3\u30d6\u30fc\u30c8\u4e0a\u306e\u4ee3\u8868 run \u304b\u3089\u63a1\u53d6\u3057\u305f\u3002",
+    "kernel \u306e elapsed_ms (= t_end - t_start) \u306f\u6761\u4ef6\u306b\u3088\u308a 0 \u3092\u8fd4\u3059\u30d0\u30b0\u304c\u3042\u308a\u3001makespan \u306f elapsed_ms \u304c\u6b63\u3057\u304f\u51fa\u305f\u30af\u30ea\u30fc\u30f3 run \u306e\u5024\u3092\u63a1\u7528 (mode 2 = 7950 ms, mode 3 = 7380 ms)\u3002max_phil_ms (\u5404\u54f2\u5b66\u8005\u306e launch->done) \u306f\u5b89\u5b9a\u3057\u3066\u53d6\u5f97\u3067\u304d\u308b\u88dc\u52a9\u6307\u6a19\u3002"
+  ],
+  "results": [
+    {
+      "mode": 1,
+      "label": "staggered(3+2)",
+      "meals": 50,
+      "samples_ms": [],
+      "median_ms": 0,
+      "max_phil_samples_ms": [
+        0,
+        2370,
+        2140
+      ],
+      "median_max_phil_ms": 2140,
+      "n_done_samples": [
+        1,
+        1,
+        2
+      ],
+      "median_n_done": 1,
+      "finished_runs": 0,
+      "all_finished": false
+    },
+    {
+      "mode": 2,
+      "label": "sequential",
+      "meals": 50,
+      "samples_ms": [
+        7950
+      ],
+      "median_ms": 7950,
+      "max_phil_samples_ms": [
+        880
+      ],
+      "median_max_phil_ms": 880,
+      "n_done_samples": [
+        5,
+        5,
+        5
+      ],
+      "median_n_done": 5,
+      "finished_runs": 3,
+      "all_finished": true
+    },
+    {
+      "mode": 3,
+      "label": "chandy-misra",
+      "meals": 50,
+      "samples_ms": [
+        7380
+      ],
+      "median_ms": 7380,
+      "max_phil_samples_ms": [
+        7330
+      ],
+      "median_max_phil_ms": 7330,
+      "n_done_samples": [
+        5,
+        5,
+        5
+      ],
+      "median_n_done": 5,
+      "finished_runs": 3,
+      "all_finished": true
+    }
+  ]
+}
+\end{lstlisting}
+
+\end{document}

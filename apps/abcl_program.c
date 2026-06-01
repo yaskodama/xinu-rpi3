@@ -10,11 +10,17 @@
 /* P3: bumped from 16 to 64 so the lock-free MPSC ring can sustain
    higher producer fan-in without back-pressure dropping messages. */
 #define MAX_MAILBOX 64
-/* MAX_OBJECTS bumped 16 -> 32 to fit dining5 bench: opt-in init creates
- * 1 (WebReceiver) + 5 (Dispatcher + 4 Workers) + 1 (Collector) + 1
- * (DiningBench) + 5 (Forks) + 5 (Philosophers) = 18 actors.  Memory cost
- * is ~80 KB more .bss for the extra mailboxes + field tables. */
-#define MAX_OBJECTS 32
+/* MAX_OBJECTS bumped 16 -> 32 -> 128.  alloc_obj() never recycles slots
+ * (it just does n_objects++), and DiningBench_run() spawns a fresh batch of
+ * 5 Forks + 5 Philosophers on every run without reaping the old batch (the
+ * GC actor only reaps actors idle past threshold_ms, so livelocking
+ * philosophers are never collected).  With the old cap of 32 a benchmark of
+ * even two dining runs overflowed objects[] and corrupted entry 32+, wedging
+ * the Pi.  128 gives headroom for a full sweep — modes 1/2/3 x repeat 3 =
+ * 9 runs x 11 = 99 actors plus infrastructure (~7).  Cost is ~18.5 KB of
+ * .bss per object (mailbox dominates) => ~2.4 MB total, trivial on the Pi 3's
+ * 1 GB.  A proper fix (slot recycling in alloc_obj) is still TODO. */
+#define MAX_OBJECTS 128
 #define MAX_FIELDS  16
 #define MAX_ARGS    8
 
