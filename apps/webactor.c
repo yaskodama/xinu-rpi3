@@ -154,6 +154,9 @@ thread webactor_server(void)
     static char reqbuf[WEB_BUFSZ];
     char   msg[256];
     int    n;
+    /* draw the default 3-window layout on the HDMI framebuffer as the initial
+     * screen (Shell + Soft keyboard panels + Browser placeholder). */
+    { extern void wifi_desktop_initial(void); wifi_desktop_initial(); }
     static const char resp[] =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/plain\r\n"
