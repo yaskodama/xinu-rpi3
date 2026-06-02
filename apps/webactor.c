@@ -1588,6 +1588,37 @@ thread webactor_server(void)
                     "X-Wifi-NtpUnix: %lu\r\nContent-Length: 0\r\n\r\n", t);
                 write(tcpdev, nh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
             }
+            /* /api/wifi/desktop?... — draw a multi-window desktop (Browser +
+             *   Soft keyboard + Shell) at designed geometries on the HDMI fb. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/desktop", 21)) {
+                extern int wifi_desktop(const unsigned char*, const char*,
+                                        int,int,int,int, int,int,int,int, int,int,int,int);
+                extern int atoi(const char *);
+                unsigned char ip[4] = {160,251,151,122};
+                static char host[64] = "kodamay.org";
+                const char *qh = strstr(reqbuf, "host="), *qi = strstr(reqbuf, "ip=");
+                const char *p; static char dh[120]; int n, hlen;
+                int bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh;
+                if (qh) { int k=0; const char *q=qh+5;
+                    for (; *q && *q!=' '&&*q!='&' && k<(int)sizeof(host)-1; q++) host[k++]=*q;
+                    host[k]='\0';
+                }
+                if (qi) { int o=0,v=0; const char *q=qi+3;
+                    for (; *q && *q!=' '&&*q!='&'; q++) {
+                        if (*q=='.') { if(o<4) ip[o]=v; o++; v=0; }
+                        else if (*q>='0'&&*q<='9') v=v*10+(*q-'0');
+                    } if (o<4) ip[o]=v;
+                }
+                #define WGET(k,def) ((p=strstr(reqbuf,k))?atoi(p+3):(def))
+                bx=WGET("bx=",40); by=WGET("by=",40); bw=WGET("bw=",560); bh=WGET("bh=",360);
+                kx=WGET("kx=",40); ky=WGET("ky=",440); kw=WGET("kw=",720); kh=WGET("kh=",260);
+                sx=WGET("sx=",620); sy=WGET("sy=",40); sw=WGET("sw=",380); sh=WGET("sh=",260);
+                #undef WGET
+                n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh);
+                hlen = sprintf(dh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "X-Wifi-BrowseBytes: %d\r\nContent-Length: 0\r\n\r\n", n);
+                write(tcpdev, dh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/wifi/browse?ip=&host= — fetch http://host and render it as a
              *   window on the HDMI framebuffer (Xinu's screen). */
             if (0 == strncmp(reqbuf, "GET /api/wifi/browse", 20)) {

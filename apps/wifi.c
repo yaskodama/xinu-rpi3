@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b43 (browse window geometry wx/wy/ww/wh for Pi3 designer)"
+#define WIFI_BUILD_ID "wifi-stage6-b44 (multi-window desktop: browser + soft keyboard + shell)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2505,6 +2505,52 @@ extern void drawChar(char, int, int, unsigned long);
 #define CHAR_WIDTH_  8     /* matches framebuffer_rpi font cell */
 #define CHAR_HEIGHT_ 12
 
+/* Draw a titled window frame: drop shadow + body fill + title bar + 2px border
+ * + title-bar separator + white title text.  Corners (x,y)-(x2,y2). */
+static void draw_win_frame(int x, int y, int x2, int y2, const char *title,
+                           unsigned long body, unsigned long titlebar)
+{
+    const int TBH = 22; int i;
+    fillRect(x+8, y+8, x2+8, y2+8, 0xFF202020, 0);   /* drop shadow */
+    fillRect(x, y, x2, y2, body, 0);
+    fillRect(x, y, x2, y+TBH, titlebar, 0);
+    drawRect(x, y, x2, y2, 0xFF000000);
+    drawRect(x-1, y-1, x2+1, y2+1, 0xFF000000);
+    drawLine(x, y+TBH, x2, y+TBH, 0xFF000000);
+    for (i = 0; title[i] && x+8+i*CHAR_WIDTH_ < x2-4; i++)
+        drawChar(title[i], x+8+i*CHAR_WIDTH_, y+5, 0xFFFFFFFF);
+}
+
+/* A non-functional on-screen "soft keyboard" panel (key cells + labels). */
+static void draw_softkbd(int x, int y, int x2, int y2)
+{
+    static const char *rows[5] = {
+        "1234567890-=", "QWERTYUIOP[]", "ASDFGHJKL;", "ZXCVBNM,./", "  SPACE   Enter" };
+    int r, c, kx, ky;
+    draw_win_frame(x, y, x2, y2, "Soft keyboard", 0xFFE8E8E8, 0xFF504030);
+    ky = y + 30;
+    for (r = 0; r < 5; r++) {
+        const char *row = rows[r]; kx = x + 8;
+        for (c = 0; row[c]; c++) {
+            if (kx + 18 > x2 - 4) break;
+            drawRect(kx, ky, kx+18, ky+18, 0xFF808080);
+            if (row[c] != ' ') drawChar(row[c], kx+5, ky+4, 0xFF000000);
+            kx += 22;
+        }
+        ky += 24;
+        if (ky + 18 > y2 - 4) break;
+    }
+}
+
+/* A "Shell (UART)" panel with a green prompt on black. */
+static void draw_shell_win(int x, int y, int x2, int y2)
+{
+    const char *p = "xsh $ _";
+    int i;
+    draw_win_frame(x, y, x2, y2, "Shell (UART)", 0xFF000000, 0xFF705030);
+    for (i = 0; p[i]; i++) drawChar(p[i], x+8+i*CHAR_WIDTH_, y+32, 0xFF00FF00);
+}
+
 /* Crudely convert HTML -> plain text: drop <script>/<style> blocks and all
  * tags, collapse whitespace.  ASCII only. */
 static int html_to_text(const char *s, char *d, int cap)
@@ -2615,6 +2661,19 @@ int wifi_browse_xy(const uint8_t *ip, const char *host, int wx, int wy, int ww, 
 int wifi_browse(const uint8_t *ip, const char *host)
 {
     return wifi_browse_xy(ip, host, 160, 140, 704, 480);
+}
+
+/* Multi-window "desktop": draw a Shell panel + a Soft-keyboard panel, then the
+ * Browser window (which fetches `host` and renders on top).  Each window's
+ * geometry comes from the Py-I screen-design page. */
+int wifi_desktop(const uint8_t *ip, const char *host,
+                 int bx, int by, int bw, int bh,
+                 int kx, int ky, int kw, int kh,
+                 int sx, int sy, int sw, int sh)
+{
+    if (sw > 40 && sh > 40) draw_shell_win(sx, sy, sx+sw, sy+sh);
+    if (kw > 40 && kh > 40) draw_softkbd(kx, ky, kx+kw, ky+kh);
+    return wifi_browse_xy(ip, host, bx, by, bw, bh);   /* browser on top */
 }
 
 /* ================================================================== *
