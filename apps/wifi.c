@@ -38,13 +38,14 @@
 #include <string.h>
 #include <clock.h>
 #include <thread.h>
+#include <semaphore.h>
 #include <stdarg.h>
 
 /* Build id — bump on every flashed build so /api/wifi/probe (and the serial
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b36 (ICMP ping client + NTP time via gateway)"
+#define WIFI_BUILD_ID "wifi-stage6-b37 (NTP/ping: SDIO sem lock + quiet/fast empty reads)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -669,12 +670,12 @@ static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
         if (blkmode) cmd |= (1u << 5) | (1u << 1); /* multiblock + blkcnt-en */
         ew(&EMMC_CMDTM, cmd);
     }
-    for (t = 0; t < 1000000; t++) {
+    for (t = 0; t < 50000; t++) {
         intr = EMMC_INTERRUPT;
         if (intr & INT_ERR)      { wifi_log("[wifi]   cmd53 err 0x%08x\r\n", intr); return -1; }
         if (intr & INT_CMD_DONE) { ew(&EMMC_INTERRUPT, INT_CMD_DONE); break; }
     }
-    if (t >= 1000000) { wifi_log("[wifi]   cmd53 no CMD_DONE\r\n"); return -1; }
+    if (t >= 50000) return -1;   /* no CMD_DONE (e.g. empty FIFO poll) — quiet */
 
     /* PIO: the controller raises READ_RDY/WRITE_RDY before each block-sized
      * buffer; transfer it word-by-word via the DATA register. */
@@ -685,12 +686,12 @@ static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
             uint32_t flag = write ? INT_WRITE_RDY : INT_READ_RDY;
             uint32_t chunk = (total > bsize && (words - done) > (bsize / 4))
                              ? (bsize / 4) : (words - done);
-            for (t = 0; t < 1000000; t++) {
+            for (t = 0; t < 50000; t++) {
                 intr = EMMC_INTERRUPT;
                 if (intr & INT_ERR)  { wifi_log("[wifi]   cmd53 data err 0x%08x\r\n", intr); return -1; }
                 if (intr & flag)     { EMMC_INTERRUPT = flag; break; }
             }
-            if (t >= 1000000) { wifi_log("[wifi]   cmd53 no data rdy\r\n"); return -1; }
+            if (t >= 50000) return -1;   /* no data ready (empty FIFO poll) — quiet */
             for (w = 0; w < chunk; w++) {
                 uint32_t idx = (done + w) * 4;
                 if (write) {
@@ -1000,6 +1001,11 @@ static uint8_t  wl_txseq;
  * else the fw silently drops the frame.  Updated from every RX SDPCM header. */
 static uint8_t  wl_txwindow = 1;
 static uint8_t  wl_fcmask = 0;
+/* Serialize SDIO FIFO access between the net-service thread and client ops
+ * (ping/NTP), so a frame read+reply never interleaves with a client's send/
+ * recv on the same controller.  Created in wifi_bringup(). */
+static semaphore wl_io_sem = 0;
+static int       wl_io_ready = 0;
 static uint16_t wl_reqid;
 
 /* Fn2 bulk transfer to/from the fixed FIFO address (incr=0).  Split into
@@ -1371,6 +1377,7 @@ static int wifi_bringup(void)
     uint32_t ocr = 0, rca = 0, chipid = 0;
     int r, ioe;
 
+    if (!wl_io_ready) { wl_io_sem = semcreate(1); wl_io_ready = 1; }  /* SDIO mutex */
     if (wifi_ready) { wifi_log("[wifi] (chip already up)\r\n"); return 0; }
     wifi_log("[wifi] === BCM43455 SDIO bring-up ===\r\n");
     wifi_log("[wifi] build: %s\r\n", WIFI_BUILD_ID);
@@ -2167,9 +2174,11 @@ void wifi_net_service(void)
     for (;;) {
         int n;
         if (wifi_net_pause) { wifi_delay_us(5000); continue; }  /* yield RX to a client op */
+        wait(wl_io_sem);                       /* atomic read+reply vs client ops */
         n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
-        if (n <= 0) { wifi_delay_us(2000); continue; }
-        if (chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        signal(wl_io_sem);
+        if (n <= 0) wifi_delay_us(2000);
     }
 }
 int wifi_net_active(void) { return wifi_net_running; }
@@ -2230,9 +2239,10 @@ int wifi_ping(const uint8_t *ip, int count)
     wifi_tn = 0;
     wifi_log("[wifi] === PING %d.%d.%d.%d (%d) ===\r\n", ip[0],ip[1],ip[2],ip[3], count);
     if (!wifi_have_ip) { wifi_log("[wifi] ping: no IP yet\r\n"); return -1; }
-    wifi_net_pause = 1; wifi_delay_us(40000);          /* take RX from net thread */
+    wifi_net_pause = 1; wifi_delay_us(40000); wait(wl_io_sem);  /* own the RX FIFO */
     if (wifi_nexthop_mac(ip, nh) != 0) {
-        wifi_log("[wifi] ping: ARP/next-hop failed\r\n"); wifi_net_pause = 0; return -1;
+        wifi_log("[wifi] ping: ARP/next-hop failed\r\n");
+        signal(wl_io_sem); wifi_net_pause = 0; return -1;
     }
     wifi_log("[wifi] ping: next-hop %02x:%02x:%02x:%02x:%02x:%02x\r\n",
              nh[0],nh[1],nh[2],nh[3],nh[4],nh[5]);
@@ -2270,7 +2280,7 @@ int wifi_ping(const uint8_t *ip, int count)
         else        wifi_log("[wifi] ping: timeout seq=%d\r\n", seq);
         wifi_delay_us(300000);
     }
-    wifi_net_pause = 0;
+    signal(wl_io_sem); wifi_net_pause = 0;
     wifi_log("[wifi] *** ping %d.%d.%d.%d: %d/%d ***\r\n", ip[0],ip[1],ip[2],ip[3], replies, count);
     return replies;
 }
@@ -2288,9 +2298,10 @@ unsigned long wifi_ntp(const uint8_t *srv)
     wifi_tn = 0;
     wifi_log("[wifi] === NTP %d.%d.%d.%d ===\r\n", srv[0],srv[1],srv[2],srv[3]);
     if (!wifi_have_ip) { wifi_log("[wifi] ntp: no IP yet\r\n"); return 0; }
-    wifi_net_pause = 1; wifi_delay_us(40000);
+    wifi_net_pause = 1; wifi_delay_us(40000); wait(wl_io_sem);
     if (wifi_nexthop_mac(srv, nh) != 0) {
-        wifi_log("[wifi] ntp: next-hop ARP failed\r\n"); wifi_net_pause = 0; return 0;
+        wifi_log("[wifi] ntp: next-hop ARP failed\r\n");
+        signal(wl_io_sem); wifi_net_pause = 0; return 0;
     }
     /* eth + IP(20) + UDP(8) + NTP(48) */
     { int udplen = 8 + 48, iptot = 20 + udplen, framelen = 14 + iptot;
@@ -2329,7 +2340,7 @@ unsigned long wifi_ntp(const uint8_t *srv)
           }
         }
     }
-    wifi_net_pause = 0;
+    signal(wl_io_sem); wifi_net_pause = 0;
     if (secs) {
         /* format the JST (UTC+9) civil date/time (Howard Hinnant's algorithm) */
         unsigned long jst = secs + 9UL*3600;
