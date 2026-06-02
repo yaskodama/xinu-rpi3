@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b35 (SDPCM tx credit window/flow ctl -> pingable)"
+#define WIFI_BUILD_ID "wifi-stage6-b36 (ICMP ping client + NTP time via gateway)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2153,8 +2153,10 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
 }
 
 /* Network service loop (a thread): poll the WLAN RX FIFO and answer ARP/ICMP.
- * Started once after DHCP succeeds; sole consumer of chan-2 frames thereafter. */
+ * Started once after DHCP succeeds; sole consumer of chan-2 frames thereafter.
+ * wifi_net_pause lets a client op (ping/NTP) take over the RX FIFO briefly. */
 static int wifi_net_running = 0;
+static volatile int wifi_net_pause = 0;
 void wifi_net_service(void)
 {
     static uint8_t fr[2048];
@@ -2163,12 +2165,191 @@ void wifi_net_service(void)
     wifi_log("[wifi] net service: ARP/ICMP responder up on %d.%d.%d.%d\r\n",
              wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
     for (;;) {
-        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        int n;
+        if (wifi_net_pause) { wifi_delay_us(5000); continue; }  /* yield RX to a client op */
+        n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
         if (n <= 0) { wifi_delay_us(2000); continue; }
         if (chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
     }
 }
 int wifi_net_active(void) { return wifi_net_running; }
+
+/* Resolve an IP to a MAC via ARP.  PRECONDITION: the net thread is paused
+ * (wifi_net_pause=1) so we own the RX FIFO.  Returns 0 + mac on success. */
+static int wifi_arp_resolve(const uint8_t *ip, uint8_t *mac)
+{
+    static uint8_t fr[2048], tx[42];
+    int i, chan, doff, tries, w;
+    for (tries = 0; tries < 12; tries++) {
+        for (i = 0; i < 6; i++) tx[i] = 0xFF;          /* dst bcast */
+        for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];
+        tx[12] = 0x08; tx[13] = 0x06;
+        { uint8_t *a = tx + 14;
+          a[0]=0;a[1]=1;a[2]=0x08;a[3]=0;a[4]=6;a[5]=4;a[6]=0;a[7]=1;   /* request */
+          for (i=0;i<6;i++) a[8+i]  = wifi_mac[i];     /* sender mac */
+          for (i=0;i<4;i++) a[14+i] = wifi_ip[i];      /* sender ip */
+          for (i=0;i<6;i++) a[18+i] = 0;               /* target mac unknown */
+          for (i=0;i<4;i++) a[24+i] = ip[i];           /* target ip */
+        }
+        wifi_data_tx(tx, 42);
+        for (w = 0; w < 40; w++) {
+            int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (n <= 0) { wifi_delay_us(5000); continue; }
+            if (chan != 2 || n < doff + 4) continue;
+            { int bdc = 4 + (fr[doff+3]<<2); uint8_t *e = fr+doff+bdc; int el = n-(doff+bdc);
+              if (el >= 42 && e[12]==0x08 && e[13]==0x06) {
+                uint8_t *a = e + 14; int op = (a[6]<<8)|a[7];
+                if (op == 2 && a[14]==ip[0]&&a[15]==ip[1]&&a[16]==ip[2]&&a[17]==ip[3]) {
+                    for (i=0;i<6;i++) mac[i] = a[8+i];
+                    return 0;
+                }
+              }
+            }
+        }
+    }
+    return -1;
+}
+
+/* Decide the next-hop MAC for a destination IP: ARP the host if it is on our
+ * subnet, otherwise ARP the default gateway (off-subnet -> route via gw). */
+static int wifi_nexthop_mac(const uint8_t *dst, uint8_t *mac)
+{
+    int i, onsub = 1;
+    for (i = 0; i < 4; i++)
+        if ((dst[i] & wifi_mask[i]) != (wifi_ip[i] & wifi_mask[i])) onsub = 0;
+    return wifi_arp_resolve(onsub ? dst : wifi_gw, mac);
+}
+
+/* ICMP echo client: ping `ip` `count` times.  Returns # replies. */
+int wifi_ping(const uint8_t *ip, int count)
+{
+    static uint8_t fr[2048], tx[128];
+    uint8_t nh[6];
+    int i, chan, doff, seq, w, replies = 0, paylen = 32;
+    uint16_t c;
+    wifi_tn = 0;
+    wifi_log("[wifi] === PING %d.%d.%d.%d (%d) ===\r\n", ip[0],ip[1],ip[2],ip[3], count);
+    if (!wifi_have_ip) { wifi_log("[wifi] ping: no IP yet\r\n"); return -1; }
+    wifi_net_pause = 1; wifi_delay_us(40000);          /* take RX from net thread */
+    if (wifi_nexthop_mac(ip, nh) != 0) {
+        wifi_log("[wifi] ping: ARP/next-hop failed\r\n"); wifi_net_pause = 0; return -1;
+    }
+    wifi_log("[wifi] ping: next-hop %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+             nh[0],nh[1],nh[2],nh[3],nh[4],nh[5]);
+    for (seq = 0; seq < count; seq++) {
+        int icmplen = 8 + paylen, iptot = 20 + icmplen, framelen = 14 + iptot, rcvd = 0;
+        for (i=0;i<6;i++) tx[i] = nh[i];
+        for (i=0;i<6;i++) tx[6+i] = wifi_mac[i];
+        tx[12]=0x08; tx[13]=0x00;
+        { uint8_t *ip4 = tx + 14, *ic;
+          for (i=0;i<20;i++) ip4[i]=0;
+          ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=seq+1; ip4[8]=64; ip4[9]=1;
+          for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+          for (i=0;i<4;i++) ip4[16+i]=ip[i];
+          c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+          ic = ip4 + 20;
+          for (i=0;i<icmplen;i++) ic[i]=0;
+          ic[0]=8; ic[4]=0xBE; ic[5]=0xEF; ic[6]=seq>>8; ic[7]=seq&0xFF;
+          for (i=0;i<paylen;i++) ic[8+i]=(uint8_t)(0x61+(i%26));
+          c=ip_cksum(ic,icmplen,0); ic[2]=c>>8; ic[3]=c&0xFF;
+        }
+        wifi_data_tx(tx, framelen);
+        for (w = 0; w < 60 && !rcvd; w++) {
+            int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (n <= 0) { wifi_delay_us(5000); continue; }
+            if (chan != 2 || n < doff + 4) continue;
+            { int bdc = 4 + (fr[doff+3]<<2); uint8_t *e = fr+doff+bdc; int el = n-(doff+bdc);
+              if (el >= 14+20+8 && e[12]==0x08 && e[13]==0x00) {
+                uint8_t *ip4 = e+14; int ihl = (ip4[0]&0xF)*4; uint8_t *ic = ip4+ihl;
+                if (ip4[9]==1 && ip4[12]==ip[0]&&ip4[13]==ip[1]&&ip4[14]==ip[2]&&ip4[15]==ip[3]
+                    && ic[0]==0 && (((ic[6]<<8)|ic[7])==seq)) rcvd = 1;
+              }
+            }
+        }
+        if (rcvd) { replies++; wifi_log("[wifi] ping: reply seq=%d\r\n", seq); }
+        else        wifi_log("[wifi] ping: timeout seq=%d\r\n", seq);
+        wifi_delay_us(300000);
+    }
+    wifi_net_pause = 0;
+    wifi_log("[wifi] *** ping %d.%d.%d.%d: %d/%d ***\r\n", ip[0],ip[1],ip[2],ip[3], replies, count);
+    return replies;
+}
+
+/* NTP time client: query an NTP server (UDP/123) through the gateway and
+ * return the Unix time (seconds since 1970), or 0 on failure.  `srv` is the
+ * NTP server IPv4 (off-subnet -> routed via the default gateway). */
+unsigned long wifi_ntp(const uint8_t *srv)
+{
+    static uint8_t fr[2048], tx[90];
+    uint8_t nh[6];
+    int i, chan, doff, w;
+    uint16_t c;
+    unsigned long secs = 0;
+    wifi_tn = 0;
+    wifi_log("[wifi] === NTP %d.%d.%d.%d ===\r\n", srv[0],srv[1],srv[2],srv[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] ntp: no IP yet\r\n"); return 0; }
+    wifi_net_pause = 1; wifi_delay_us(40000);
+    if (wifi_nexthop_mac(srv, nh) != 0) {
+        wifi_log("[wifi] ntp: next-hop ARP failed\r\n"); wifi_net_pause = 0; return 0;
+    }
+    /* eth + IP(20) + UDP(8) + NTP(48) */
+    { int udplen = 8 + 48, iptot = 20 + udplen, framelen = 14 + iptot;
+      uint8_t *ip4 = tx + 14, *udp, *ntp;
+      for (i=0;i<6;i++) tx[i] = nh[i];
+      for (i=0;i<6;i++) tx[6+i] = wifi_mac[i];
+      tx[12]=0x08; tx[13]=0x00;
+      for (i=0;i<framelen-14;i++) ip4[i]=0;
+      ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=17;
+      for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+      for (i=0;i<4;i++) ip4[16+i]=srv[i];
+      c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+      udp = ip4 + 20;
+      udp[0]=0x00; udp[1]=0x7b;          /* sport 123 */
+      udp[2]=0x00; udp[3]=0x7b;          /* dport 123 */
+      udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;   /* csum 0 */
+      ntp = udp + 8;
+      ntp[0] = 0x1b;                     /* LI=0 VN=3 Mode=3 (client) */
+      wifi_data_tx(tx, framelen);
+    }
+    for (w = 0; w < 120; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(5000); continue; }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); uint8_t *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el >= 14+20+8+48 && e[12]==0x08 && e[13]==0x00) {
+            uint8_t *ip4 = e+14; int ihl = (ip4[0]&0xF)*4; uint8_t *udp = ip4+ihl, *ntp = udp+8;
+            if (ip4[9]==17 && udp[2]==0x00 && udp[3]==0x7b
+                && ip4[12]==srv[0]&&ip4[13]==srv[1]&&ip4[14]==srv[2]&&ip4[15]==srv[3]) {
+                /* NTP transmit timestamp: bytes 40..43 = seconds since 1900 */
+                unsigned long ntp_secs = ((unsigned long)ntp[40]<<24)|((unsigned long)ntp[41]<<16)
+                                       | ((unsigned long)ntp[42]<<8)|ntp[43];
+                secs = ntp_secs - 2208988800UL;   /* 1900 -> 1970 epoch */
+                break;
+            }
+          }
+        }
+    }
+    wifi_net_pause = 0;
+    if (secs) {
+        /* format the JST (UTC+9) civil date/time (Howard Hinnant's algorithm) */
+        unsigned long jst = secs + 9UL*3600;
+        long z = (long)(jst / 86400) + 719468;
+        long era = (z >= 0 ? z : z - 146096) / 146097;
+        unsigned doe = (unsigned)(z - era*146097);
+        unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        long yy = (long)yoe + era*400;
+        unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+        unsigned mp = (5*doy + 2)/153;
+        unsigned dd = doy - (153*mp+2)/5 + 1;
+        unsigned mm = mp < 10 ? mp+3 : mp-9;
+        int Y = (int)(yy + (mm <= 2)), tod = (int)(jst % 86400);
+        wifi_log("[wifi] *** NTP unix=%lu  JST=%04d-%02u-%02u %02d:%02d:%02d ***\r\n",
+                 secs, Y, mm, dd, tod/3600, (tod%3600)/60, tod%60);
+    } else {
+        wifi_log("[wifi] ntp: no reply (timeout)\r\n");
+    }
+    return secs;
+}
 
 /* ================================================================== *
  *  Public entry points (called from the HTTP routes in webactor.c)   *

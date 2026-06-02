@@ -1549,6 +1549,45 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wifi/ping?ip=A.B.C.D — ICMP echo client (default 8.8.8.8).
+             * /api/wifi/ntp?server=A.B.C.D — NTP time client (default Cloudflare
+             *   162.159.200.123).  Both route off-subnet via the gateway, so they
+             *   reach the internet through e.g. an iPhone hotspot.  Full log in
+             *   /api/wifi/trace; result summary in headers. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/ping", 18)) {
+                extern int wifi_ping(const unsigned char*, int);
+                unsigned char ip[4] = {8,8,8,8};
+                const char *q = strstr(reqbuf, "ip=");
+                static char ph[160]; int rc, hlen;
+                if (q) { int o=0,v=0; const char *p=q+3;
+                    for (; *p && *p!=' '&&*p!='&'; p++) {
+                        if (*p=='.') { if(o<4) ip[o]=v; o++; v=0; }
+                        else if (*p>='0'&&*p<='9') v=v*10+(*p-'0');
+                    }
+                    if (o<4) ip[o]=v;
+                }
+                rc = wifi_ping(ip, 4);
+                hlen = sprintf(ph, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "X-Wifi-PingReplies: %d\r\nContent-Length: 0\r\n\r\n", rc);
+                write(tcpdev, ph, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/wifi/ntp", 17)) {
+                extern unsigned long wifi_ntp(const unsigned char*);
+                unsigned char srv[4] = {162,159,200,123};   /* time.cloudflare.com (anycast) */
+                const char *q = strstr(reqbuf, "server=");
+                static char nh[160]; unsigned long t; int hlen;
+                if (q) { int o=0,v=0; const char *p=q+7;
+                    for (; *p && *p!=' '&&*p!='&'; p++) {
+                        if (*p=='.') { if(o<4) srv[o]=v; o++; v=0; }
+                        else if (*p>='0'&&*p<='9') v=v*10+(*p-'0');
+                    }
+                    if (o<4) srv[o]=v;
+                }
+                t = wifi_ntp(srv);
+                hlen = sprintf(nh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "X-Wifi-NtpUnix: %lu\r\nContent-Length: 0\r\n\r\n", t);
+                write(tcpdev, nh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/wifi/dhcp — run a DHCP DISCOVER/REQUEST over the associated
              *   link and report the leased IP.  (Read /api/wifi/trace for the
              *   full DHCP log.) */
