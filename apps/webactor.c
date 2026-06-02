@@ -1616,11 +1616,11 @@ thread webactor_server(void)
                     } if (o<4) ip[o]=v;
                 }
                 #define WGET(k,def) ((p=strstr(reqbuf,k))?atoi(p+3):(def))
-                bx=WGET("bx=",40);  by=WGET("by=",40);  bw=WGET("bw=",520); bh=WGET("bh=",300);
-                sx=WGET("sx=",580); sy=WGET("sy=",40);  sw=WGET("sw=",400); sh=WGET("sh=",200);
-                ax=WGET("ax=",580); ay=WGET("ay=",260); aw=WGET("aw=",400); ah=WGET("ah=",250);
-                px=WGET("px=",40);  py=WGET("py=",360); pw=WGET("pw=",520); ph=WGET("ph=",150);
-                kx=WGET("kx=",40);  ky=WGET("ky=",530); kw=WGET("kw=",940); kh=WGET("kh=",210);
+                bx=WGET("bx=",40);   by=WGET("by=",40);  bw=WGET("bw=",1000); bh=WGET("bh=",560);
+                sx=WGET("sx=",1060); sy=WGET("sy=",40);  sw=WGET("sw=",820);  sh=WGET("sh=",360);
+                ax=WGET("ax=",1060); ay=WGET("ay=",420); aw=WGET("aw=",820);  ah=WGET("ah=",380);
+                px=WGET("px=",40);   py=WGET("py=",620); pw=WGET("pw=",1000); ph=WGET("ph=",180);
+                kx=WGET("kx=",40);   ky=WGET("ky=",820); kw=WGET("kw=",1840); kh=WGET("kh=",230);
                 #undef WGET
                 n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh,
                                  px,py,pw,ph, ax,ay,aw,ah, fetch);

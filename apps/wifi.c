@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b48 (5-window desktop: +Window System +Actors)"
+#define WIFI_BUILD_ID "wifi-stage6-b49 (1920x1080 screen + 5-window desktop)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2566,7 +2566,7 @@ static void draw_winsys(int x, int y, int x2, int y2)
     extern int abcl_n_objects(void);
     sprintf(line, "Build: %s", WIFI_BUILD_ID);
     draw_text_line(x+8, y+30, line, 0xFF000000, x2-4);
-    sprintf(line, "IP: %d.%d.%d.%d   Screen: 1024x768x32",
+    sprintf(line, "IP: %d.%d.%d.%d   Screen: 1920x1080x32",
             wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
     draw_text_line(x+8, y+46, line, 0xFF000000, x2-4);
     draw_text_line(x+8, y+62, "Windows: Browser/Soft kbd/Shell/Actors/WinSys", 0xFF000000, x2-4);
@@ -2665,11 +2665,11 @@ int wifi_browse_xyf(const uint8_t *ip, const char *host, int wx, int wy, int ww,
     int n, tn, i, col, x, y;
     int WX, WY, WX2, WY2; const int TBH=22;
     int TX0, TY0, TXMAX, TYMAX;
-    /* clamp geometry to the 1024x768 screen; fall back to a centred window */
-    if (ww <= 40 || wh <= 40) { wx=160; wy=140; ww=704; wh=480; }
+    /* clamp geometry to the 1920x1080 screen; fall back to a centred window */
+    if (ww <= 40 || wh <= 40) { wx=300; wy=200; ww=1000; wh=600; }
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    if (wx + ww > 1016) ww = 1016 - wx;
-    if (wy + wh > 760)  wh = 760 - wy;
+    if (wx + ww > 1912) ww = 1912 - wx;
+    if (wy + wh > 1072) wh = 1072 - wy;
     WX=wx; WY=wy; WX2=wx+ww; WY2=wy+wh;
     TX0=WX+8; TY0=WY+TBH+6; TXMAX=WX2-8; TYMAX=WY2-10;
 
@@ -2744,13 +2744,13 @@ void wifi_desktop_initial(void)
     const char *ph = "WiFi not connected yet - use the Py-I design page to load a URL";
     int i;
     screenClear(0xFF503820);   /* clean desktop background */
-    /* default 5-window layout (matches the /api/wifi/desktop defaults) */
-    draw_shell_win(580, 40, 580+400, 40+200);
-    draw_actors(580, 260, 580+400, 260+250);
-    draw_winsys(40, 360, 40+520, 360+150);
-    draw_softkbd(40, 530, 40+940, 530+210);
-    draw_win_frame(40, 40, 40+520, 40+300, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
-    for (i = 0; ph[i] && 48+i*CHAR_WIDTH_ < 552; i++)
+    /* default 5-window layout for 1920x1080 (matches /api/wifi/desktop defaults) */
+    draw_shell_win(1060, 40, 1060+820, 40+360);
+    draw_actors(1060, 420, 1060+820, 420+380);
+    draw_winsys(40, 620, 40+1000, 620+180);
+    draw_softkbd(40, 820, 40+1840, 820+230);
+    draw_win_frame(40, 40, 40+1000, 40+560, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
+    for (i = 0; ph[i] && 48+i*CHAR_WIDTH_ < 1032; i++)
         drawChar(ph[i], 48+i*CHAR_WIDTH_, 70, 0xFF606060);
 }
 
