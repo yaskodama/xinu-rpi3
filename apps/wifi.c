@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b41 (browser as a floating window, no full-screen clear)"
+#define WIFI_BUILD_ID "wifi-stage6-b42 (browser window: source-view fallback so it's never empty)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2532,6 +2532,31 @@ static int html_to_text(const char *s, char *d, int cap)
     return n;
 }
 
+/* HTML "source view": keep tags + line structure but drop <script>/<style>
+ * blocks.  Used as a fallback when the visible text is empty (e.g. only the
+ * <head> was fetched), so the window always shows real page content. */
+static int html_to_source(const char *s, char *d, int cap)
+{
+    int n = 0;
+    while (*s && n < cap - 1) {
+        if (!strncmp(s,"<script",7) || !strncmp(s,"<SCRIPT",7)) {
+            const char *e = strstr(s, "</script>"); if (!e) e = strstr(s, "</SCRIPT>");
+            if (e) { s = e + 9; continue; } else break;
+        }
+        if (!strncmp(s,"<style",6) || !strncmp(s,"<STYLE",6)) {
+            const char *e = strstr(s, "</style>"); if (!e) e = strstr(s, "</STYLE>");
+            if (e) { s = e + 8; continue; } else break;
+        }
+        { char c = *s++;
+          if (c == '\n') d[n++] = '\n';
+          else if (c == '\t') d[n++] = ' ';
+          else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) d[n++] = c;
+        }
+    }
+    d[n] = '\0';
+    return n;
+}
+
 /* Fetch http://<host>/ and render it as a window on the HDMI framebuffer. */
 int wifi_browse(const uint8_t *ip, const char *host)
 {
@@ -2550,6 +2575,8 @@ int wifi_browse(const uint8_t *ip, const char *host)
     body = strstr(wifi_http_buf, "\r\n\r\n");
     body = body ? body + 4 : wifi_http_buf;
     tn = html_to_text(body, text, sizeof(text));
+    if (tn < 40)   /* little/no visible text (only head fetched) -> show source */
+        tn = html_to_source(body, text, sizeof(text));
 
     /* --- draw the window (no full-screen clear: it floats over the console) --- */
     fillRect(WX+8, WY+8, WX2+8, WY2+8, 0xFF202020, 0); /* drop shadow */
@@ -2567,6 +2594,7 @@ int wifi_browse(const uint8_t *ip, const char *host)
     x = TX0; y = TY0; col = 0; (void)col;
     for (i = 0; i < tn && y <= TYMAX; i++) {
         char c = text[i];
+        if (c == '\n') { x = TX0; y += CHAR_HEIGHT_ + 2; continue; }   /* line break */
         if (x + CHAR_WIDTH_ > TXMAX) { x = TX0; y += CHAR_HEIGHT_ + 2; if (y > TYMAX) break; }
         if (c == ' ' && x == TX0) continue;           /* no leading space */
         drawChar(c, x, y, 0xFF000000);
