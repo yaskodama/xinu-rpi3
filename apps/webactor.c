@@ -1591,10 +1591,15 @@ thread webactor_server(void)
             /* /api/wifi/browse?ip=&host= — fetch http://host and render it as a
              *   window on the HDMI framebuffer (Xinu's screen). */
             if (0 == strncmp(reqbuf, "GET /api/wifi/browse", 20)) {
-                extern int wifi_browse(const unsigned char*, const char*);
+                extern int wifi_browse_xy(const unsigned char*, const char*, int, int, int, int);
+                extern int atoi(const char *);
                 unsigned char ip[4] = {160,251,151,122};
                 static char host[64] = "kodamay.org";
                 const char *qi = strstr(reqbuf, "ip="), *qh = strstr(reqbuf, "host=");
+                const char *qwx=strstr(reqbuf,"wx="), *qwy=strstr(reqbuf,"wy=");
+                const char *qww=strstr(reqbuf,"ww="), *qwh=strstr(reqbuf,"wh=");
+                int wx = qwx?atoi(qwx+3):160, wy = qwy?atoi(qwy+3):140;
+                int ww = qww?atoi(qww+3):704, wh = qwh?atoi(qwh+3):480;
                 static char bh[120]; int n, hlen;
                 if (qi) { int o=0,v=0; const char *p=qi+3;
                     for (; *p && *p!=' '&&*p!='&'; p++) {
@@ -1606,7 +1611,7 @@ thread webactor_server(void)
                     for (; *p && *p!=' '&&*p!='&' && k<(int)sizeof(host)-1; p++) host[k++]=*p;
                     host[k]='\0';
                 }
-                n = wifi_browse(ip, host);
+                n = wifi_browse_xy(ip, host, wx, wy, ww, wh);
                 hlen = sprintf(bh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "X-Wifi-BrowseBytes: %d\r\nContent-Length: 0\r\n\r\n", n);
                 write(tcpdev, bh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;

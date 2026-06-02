@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b42 (browser window: source-view fallback so it's never empty)"
+#define WIFI_BUILD_ID "wifi-stage6-b43 (browse window geometry wx/wy/ww/wh for Pi3 designer)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2557,16 +2557,23 @@ static int html_to_source(const char *s, char *d, int cap)
     return n;
 }
 
-/* Fetch http://<host>/ and render it as a window on the HDMI framebuffer. */
-int wifi_browse(const uint8_t *ip, const char *host)
+/* Fetch http://<host>/ and render it as a window on the HDMI framebuffer.
+ * wx,wy = top-left; ww,wh = window size (<=0 => default centred 704x480).  The
+ * geometry lets the Py-I "screen design" page place the window. */
+int wifi_browse_xy(const uint8_t *ip, const char *host, int wx, int wy, int ww, int wh)
 {
     static char text[8192];
     const char *body;
     int n, tn, i, col, x, y;
-    /* A discrete window centred on the 1024x768 screen — do NOT clear the whole
-     * screen, so it floats as a window over the existing console. */
-    const int WX=160, WY=140, WX2=864, WY2=620, TBH=22;
-    const int TX0=WX+8, TY0=WY+TBH+6, TXMAX=WX2-8, TYMAX=WY2-10;
+    int WX, WY, WX2, WY2; const int TBH=22;
+    int TX0, TY0, TXMAX, TYMAX;
+    /* clamp geometry to the 1024x768 screen; fall back to a centred window */
+    if (ww <= 40 || wh <= 40) { wx=160; wy=140; ww=704; wh=480; }
+    if (wx < 0) wx = 0; if (wy < 0) wy = 0;
+    if (wx + ww > 1016) ww = 1016 - wx;
+    if (wy + wh > 760)  wh = 760 - wy;
+    WX=wx; WY=wy; WX2=wx+ww; WY2=wy+wh;
+    TX0=WX+8; TY0=WY+TBH+6; TXMAX=WX2-8; TYMAX=WY2-10;
 
     n = wifi_http(ip, host);                  /* fills wifi_http_buf */
     if (n <= 0) return -1;
@@ -2602,6 +2609,12 @@ int wifi_browse(const uint8_t *ip, const char *host)
     }
     wifi_log("[wifi] browse: rendered %d text bytes of %s to framebuffer\r\n", tn, host);
     return n;
+}
+
+/* Default-geometry wrapper (centred window). */
+int wifi_browse(const uint8_t *ip, const char *host)
+{
+    return wifi_browse_xy(ip, host, 160, 140, 704, 480);
 }
 
 /* ================================================================== *
