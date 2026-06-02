@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b38 (NTP: revert cmd53 spin to 1M; keep quiet logs + sem)"
+#define WIFI_BUILD_ID "wifi-stage6-b39 (minimal TCP+HTTP/1.0 client -> fetch http page)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2360,6 +2360,138 @@ unsigned long wifi_ntp(const uint8_t *srv)
         wifi_log("[wifi] ntp: no reply (timeout)\r\n");
     }
     return secs;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Minimal TCP + HTTP/1.0 client (text "browser") over the WLAN.      *
+ * ------------------------------------------------------------------ */
+static char     wifi_http_buf[6144];   /* fetched response (headers+body) */
+static int      wifi_http_len = 0;
+int wifi_http_get_buf(char **p) { *p = wifi_http_buf; return wifi_http_len; }
+
+/* Send one TCP segment (eth+IP+TCP[+data]) to dip via next-hop nh. */
+static void wifi_tcp_send(const uint8_t *nh, const uint8_t *dip, int sport, int dport,
+                          uint32_t seq, uint32_t ack, int flags,
+                          const uint8_t *data, int dlen)
+{
+    static uint8_t tx[700];
+    int i, tcplen = 20 + dlen, iptot = 20 + tcplen, framelen = 14 + iptot;
+    uint8_t *ip4, *tcp; uint32_t psum; uint16_t c;
+    if (framelen > (int)sizeof(tx)) return;
+    for (i = 0; i < 6; i++) tx[i] = nh[i];
+    for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];
+    tx[12] = 0x08; tx[13] = 0x00;
+    ip4 = tx + 14;
+    for (i = 0; i < 20; i++) ip4[i] = 0;
+    ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=6; /* TCP */
+    for (i = 0; i < 4; i++) ip4[12+i] = wifi_ip[i];
+    for (i = 0; i < 4; i++) ip4[16+i] = dip[i];
+    c = ip_cksum(ip4, 20, 0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+    tcp = ip4 + 20;
+    for (i = 0; i < 20; i++) tcp[i] = 0;
+    tcp[0]=sport>>8; tcp[1]=sport&0xFF; tcp[2]=dport>>8; tcp[3]=dport&0xFF;
+    tcp[4]=seq>>24; tcp[5]=seq>>16; tcp[6]=seq>>8; tcp[7]=seq;
+    tcp[8]=ack>>24; tcp[9]=ack>>16; tcp[10]=ack>>8; tcp[11]=ack;
+    tcp[12]=5<<4; tcp[13]=flags; tcp[14]=0x20; tcp[15]=0x00;  /* data-off 5, window 8192 */
+    for (i = 0; i < dlen; i++) tcp[20+i] = data[i];
+    psum = ((uint32_t)wifi_ip[0]<<8|wifi_ip[1]) + ((uint32_t)wifi_ip[2]<<8|wifi_ip[3])
+         + ((uint32_t)dip[0]<<8|dip[1]) + ((uint32_t)dip[2]<<8|dip[3]) + 6 + tcplen;
+    c = ip_cksum(tcp, tcplen, psum); tcp[16]=c>>8; tcp[17]=c&0xFF;
+    wifi_data_tx(tx, framelen);
+}
+
+/* HTTP/1.0 GET http://<host>/ at `ip`:80.  Stores the response (capped) in
+ * wifi_http_buf and mirrors it to the serial console (Xinu's screen). */
+int wifi_http(const uint8_t *ip, const char *host)
+{
+    static uint8_t fr[2048];
+    static char req[256];
+    uint8_t nh[6];
+    uint32_t iss = 0x015A0000, our_seq, our_ack = 0, their_seq;
+    int chan, doff, w, sport = 0xC0DE, reqn, got_synack = 0, fin = 0, idle = 0;
+    wifi_http_len = 0;
+    wifi_tn = 0;
+    wifi_log("[wifi] === HTTP GET http://%s/  (%d.%d.%d.%d:80) ===\r\n",
+             host, ip[0],ip[1],ip[2],ip[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] http: no IP yet\r\n"); return -1; }
+    wifi_net_pause = 1; wifi_delay_us(40000); wait(wl_io_sem);
+    if (wifi_nexthop_mac(ip, nh) != 0) {
+        wifi_log("[wifi] http: next-hop ARP failed\r\n");
+        signal(wl_io_sem); wifi_net_pause = 0; return -1;
+    }
+
+    /* --- TCP 3-way handshake: SYN -> SYN/ACK -> ACK --- */
+    wifi_tcp_send(nh, ip, sport, 80, iss, 0, 0x02, NULL, 0);   /* SYN */
+    for (w = 0; w < 200 && !got_synack; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(5000); continue; }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); uint8_t *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el >= 14+20+20 && e[12]==0x08 && e[13]==0x00) {
+            uint8_t *ip4 = e+14; int ihl=(ip4[0]&0xF)*4; uint8_t *tcp = ip4+ihl;
+            int dport = (tcp[2]<<8)|tcp[3];
+            if (ip4[9]==6 && dport==sport && (tcp[13] & 0x12)==0x12) {  /* SYN+ACK */
+                their_seq = ((uint32_t)tcp[4]<<24)|((uint32_t)tcp[5]<<16)|((uint32_t)tcp[6]<<8)|tcp[7];
+                got_synack = 1;
+            }
+          }
+        }
+    }
+    if (!got_synack) { wifi_log("[wifi] http: no SYN-ACK (timeout)\r\n");
+        signal(wl_io_sem); wifi_net_pause = 0; return -1; }
+    our_seq = iss + 1; our_ack = their_seq + 1;
+    wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, NULL, 0);  /* ACK */
+    wifi_log("[wifi] http: connected, sending GET\r\n");
+
+    /* --- send the request --- */
+    reqn = sprintf(req, "GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+    wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x18, (uint8_t*)req, reqn); /* PSH|ACK */
+    our_seq += reqn;
+
+    /* --- receive loop: ACK in-order data, accumulate, stop on FIN --- */
+    for (w = 0; w < 2000 && !fin; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(3000); if (++idle > 400) break; continue; }
+        idle = 0;
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); uint8_t *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el < 14+20+20 || e[12]!=0x08 || e[13]!=0x00) continue;
+          { uint8_t *ip4 = e+14; int ihl=(ip4[0]&0xF)*4;
+            int iptot = (ip4[2]<<8)|ip4[3];          /* IP total length */
+            uint8_t *tcp = ip4+ihl; int thl = (tcp[12]>>4)*4;
+            int dport = (tcp[2]<<8)|tcp[3];
+            uint32_t sseq;
+            int dlen;
+            if (ip4[9]!=6 || dport!=sport) continue;
+            sseq = ((uint32_t)tcp[4]<<24)|((uint32_t)tcp[5]<<16)|((uint32_t)tcp[6]<<8)|tcp[7];
+            dlen = iptot - ihl - thl;
+            if (dlen < 0) dlen = 0;
+            if (dlen > 0 && sseq == our_ack) {       /* in-order data */
+                uint8_t *payload = tcp + thl; int k;
+                for (k = 0; k < dlen && wifi_http_len < (int)sizeof(wifi_http_buf)-1; k++)
+                    wifi_http_buf[wifi_http_len++] = payload[k];
+                our_ack += dlen;
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, NULL, 0); /* ACK */
+            } else if (dlen > 0) {
+                /* out-of-order / retransmit: re-ACK our current position */
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, NULL, 0);
+            }
+            if (tcp[13] & 0x01) {                    /* FIN */
+                our_ack += 1;
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x11, NULL, 0); /* FIN|ACK */
+                fin = 1;
+            }
+            if (wifi_http_len >= (int)sizeof(wifi_http_buf)-1) break;
+          }
+        }
+    }
+    wifi_http_buf[wifi_http_len] = '\0';
+    signal(wl_io_sem); wifi_net_pause = 0;
+    wifi_log("[wifi] *** HTTP got %d bytes from %s (fin=%d) ***\r\n", wifi_http_len, host, fin);
+    /* mirror the page to the serial console = Xinu's screen */
+    kprintf("\r\n---- http://%s/ ----\r\n%s\r\n---- end (%d bytes) ----\r\n",
+            host, wifi_http_buf, wifi_http_len);
+    return wifi_http_len;
 }
 
 /* ================================================================== *

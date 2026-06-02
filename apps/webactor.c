@@ -1588,6 +1588,35 @@ thread webactor_server(void)
                     "X-Wifi-NtpUnix: %lu\r\nContent-Length: 0\r\n\r\n", t);
                 write(tcpdev, nh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
             }
+            /* /api/wifi/http?ip=A.B.C.D&host=NAME — minimal HTTP/1.0 GET over a
+             *   hand-rolled TCP client (default kodamay.org 160.251.151.122).
+             *   Returns the fetched page as the body; also printed to serial. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/http", 18)) {
+                extern int wifi_http(const unsigned char*, const char*);
+                extern int wifi_http_get_buf(char**);
+                unsigned char ip[4] = {160,251,151,122};
+                static char host[64] = "kodamay.org";
+                const char *qi = strstr(reqbuf, "ip="), *qh = strstr(reqbuf, "host=");
+                static char hh[96]; char *body; int blen, off=0, hlen, n;
+                if (qi) { int o=0,v=0; const char *p=qi+3;
+                    for (; *p && *p!=' '&&*p!='&'; p++) {
+                        if (*p=='.') { if(o<4) ip[o]=v; o++; v=0; }
+                        else if (*p>='0'&&*p<='9') v=v*10+(*p-'0');
+                    } if (o<4) ip[o]=v;
+                }
+                if (qh) { int k=0; const char *p=qh+5;
+                    for (; *p && *p!=' '&&*p!='&' && k<(int)sizeof(host)-1; p++) host[k++]=*p;
+                    host[k]='\0';
+                }
+                n = wifi_http(ip, host);
+                blen = wifi_http_get_buf(&body);
+                hlen = sprintf(hh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "X-Wifi-HttpBytes: %d\r\nContent-Length: %d\r\n\r\n", n, blen > 0 ? blen : 0);
+                write(tcpdev, hh, hlen);
+                while (off < blen) { int c = blen-off; if (c>1024) c=1024;
+                    write(tcpdev, body+off, c); off += c; }
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/wifi/dhcp — run a DHCP DISCOVER/REQUEST over the associated
              *   link and report the leased IP.  (Read /api/wifi/trace for the
              *   full DHCP log.) */
