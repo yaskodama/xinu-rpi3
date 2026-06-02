@@ -1591,6 +1591,18 @@ thread webactor_server(void)
                     "X-Wifi-NtpUnix: %lu\r\nContent-Length: 0\r\n\r\n", t);
                 write(tcpdev, nh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
             }
+            /* /api/wifi/key?c=N — feed a keystroke (char code) typed in the Mac
+             *   browser into the Shell window and redraw it on the HDMI fb. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/key", 17)) {
+                extern void wifi_shell_key(int);
+                extern int atoi(const char *);
+                const char *qc = strstr(reqbuf, "c=");
+                static char kh2[80]; int hlen;
+                if (qc) wifi_shell_key(atoi(qc+2));
+                hlen = sprintf(kh2, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: 0\r\n\r\n");
+                write(tcpdev, kh2, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/wifi/desktop?... — draw a multi-window desktop (Browser +
              *   Soft keyboard + Shell) at designed geometries on the HDMI fb. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/desktop", 21)) {
@@ -1616,11 +1628,11 @@ thread webactor_server(void)
                     } if (o<4) ip[o]=v;
                 }
                 #define WGET(k,def) ((p=strstr(reqbuf,k))?atoi(p+3):(def))
-                bx=WGET("bx=",40);   by=WGET("by=",40);  bw=WGET("bw=",1000); bh=WGET("bh=",560);
-                sx=WGET("sx=",1060); sy=WGET("sy=",40);  sw=WGET("sw=",820);  sh=WGET("sh=",360);
-                ax=WGET("ax=",1060); ay=WGET("ay=",420); aw=WGET("aw=",820);  ah=WGET("ah=",380);
-                px=WGET("px=",40);   py=WGET("py=",620); pw=WGET("pw=",1000); ph=WGET("ph=",180);
-                kx=WGET("kx=",40);   ky=WGET("ky=",820); kw=WGET("kw=",1840); kh=WGET("kh=",230);
+                bx=WGET("bx=",20);  by=WGET("by=",20);  bw=WGET("bw=",680);  bh=WGET("bh=",440);
+                sx=WGET("sx=",720); sy=WGET("sy=",20);  sw=WGET("sw=",540);  sh=WGET("sh=",300);
+                ax=WGET("ax=",720); ay=WGET("ay=",340); aw=WGET("aw=",540);  ah=WGET("ah=",300);
+                px=WGET("px=",20);  py=WGET("py=",480); pw=WGET("pw=",680);  ph=WGET("ph=",140);
+                kx=WGET("kx=",20);  ky=WGET("ky=",640); kw=WGET("kw=",1240); kh=WGET("kh=",150);
                 #undef WGET
                 n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh,
                                  px,py,pw,ph, ax,ay,aw,ah, fetch);

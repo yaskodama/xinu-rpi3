@@ -27,8 +27,8 @@
 #define CHAR_HEIGHT 12
 extern unsigned char FONT[];
 
-#define DEFAULT_HEIGHT 1080
-#define DEFAULT_WIDTH 1920
+#define DEFAULT_HEIGHT 800
+#define DEFAULT_WIDTH 1280
 #define BIT_DEPTH 32
 
 #define MAXRETRIES 3 //if screen fails to initialize after three tries, halt

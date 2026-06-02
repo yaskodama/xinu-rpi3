@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b49 (1920x1080 screen + 5-window desktop)"
+#define WIFI_BUILD_ID "wifi-stage6-b50 (1280x800 + Shell keyboard input via /api/wifi/key)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2542,13 +2542,38 @@ static void draw_softkbd(int x, int y, int x2, int y2)
     }
 }
 
-/* A "Shell (UART)" panel with a green prompt on black. */
+/* Shell window state: text typed from the Mac browser (via /api/wifi/key). */
+static char wifi_shell_buf[512];
+static int  wifi_shell_len = 0;
+static int  wifi_shell_gx = 720, wifi_shell_gy = 20, wifi_shell_gx2 = 1260, wifi_shell_gy2 = 320;
+
+/* A "Shell (UART)" panel: green prompt + the typed text on black.  Remembers
+ * its geometry so a keystroke can redraw just this window. */
 static void draw_shell_win(int x, int y, int x2, int y2)
 {
-    const char *p = "xsh $ _";
-    int i;
+    int cx = x+8, cy = y+30, i;
+    wifi_shell_gx=x; wifi_shell_gy=y; wifi_shell_gx2=x2; wifi_shell_gy2=y2;
     draw_win_frame(x, y, x2, y2, "Shell (UART)", 0xFF000000, 0xFF705030);
-    for (i = 0; p[i]; i++) drawChar(p[i], x+8+i*CHAR_WIDTH_, y+32, 0xFF00FF00);
+    { const char *pr = "xsh $ "; for (i = 0; pr[i]; i++) { drawChar(pr[i], cx, cy, 0xFF00FF00); cx += CHAR_WIDTH_; } }
+    for (i = 0; i < wifi_shell_len; i++) {
+        char c = wifi_shell_buf[i];
+        if (c == '\n') { cx = x+8; cy += CHAR_HEIGHT_ + 2; }
+        else { if (cx+CHAR_WIDTH_ > x2-4) { cx = x+8; cy += CHAR_HEIGHT_ + 2; }
+               if (cy > y2-12) break;
+               drawChar(c, cx, cy, 0xFF00FF00); cx += CHAR_WIDTH_; }
+    }
+    if (cy <= y2-12) drawChar('_', cx, cy, 0xFF00FF00);   /* cursor */
+}
+
+/* Append a key (char code) typed in the Mac browser to the shell buffer and
+ * redraw just the Shell window.  8/127=backspace, 13/10=newline. */
+void wifi_shell_key(int c)
+{
+    if (c == 8 || c == 127) { if (wifi_shell_len > 0) wifi_shell_len--; }
+    else if (c == 13 || c == 10) { if (wifi_shell_len < (int)sizeof(wifi_shell_buf)-1) wifi_shell_buf[wifi_shell_len++] = '\n'; }
+    else if (c >= 0x20 && c < 0x7f) { if (wifi_shell_len < (int)sizeof(wifi_shell_buf)-1) wifi_shell_buf[wifi_shell_len++] = (char)c; }
+    wifi_shell_buf[wifi_shell_len] = '\0';
+    draw_shell_win(wifi_shell_gx, wifi_shell_gy, wifi_shell_gx2, wifi_shell_gy2);
 }
 
 /* draw a clipped text line at (x,y) up to xmax. */
@@ -2566,7 +2591,7 @@ static void draw_winsys(int x, int y, int x2, int y2)
     extern int abcl_n_objects(void);
     sprintf(line, "Build: %s", WIFI_BUILD_ID);
     draw_text_line(x+8, y+30, line, 0xFF000000, x2-4);
-    sprintf(line, "IP: %d.%d.%d.%d   Screen: 1920x1080x32",
+    sprintf(line, "IP: %d.%d.%d.%d   Screen: 1280x800x32",
             wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
     draw_text_line(x+8, y+46, line, 0xFF000000, x2-4);
     draw_text_line(x+8, y+62, "Windows: Browser/Soft kbd/Shell/Actors/WinSys", 0xFF000000, x2-4);
@@ -2665,11 +2690,11 @@ int wifi_browse_xyf(const uint8_t *ip, const char *host, int wx, int wy, int ww,
     int n, tn, i, col, x, y;
     int WX, WY, WX2, WY2; const int TBH=22;
     int TX0, TY0, TXMAX, TYMAX;
-    /* clamp geometry to the 1920x1080 screen; fall back to a centred window */
-    if (ww <= 40 || wh <= 40) { wx=300; wy=200; ww=1000; wh=600; }
+    /* clamp geometry to the 1280x800 screen; fall back to a centred window */
+    if (ww <= 40 || wh <= 40) { wx=200; wy=140; ww=700; wh=440; }
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    if (wx + ww > 1912) ww = 1912 - wx;
-    if (wy + wh > 1072) wh = 1072 - wy;
+    if (wx + ww > 1272) ww = 1272 - wx;
+    if (wy + wh > 792)  wh = 792 - wy;
     WX=wx; WY=wy; WX2=wx+ww; WY2=wy+wh;
     TX0=WX+8; TY0=WY+TBH+6; TXMAX=WX2-8; TYMAX=WY2-10;
 
@@ -2744,14 +2769,14 @@ void wifi_desktop_initial(void)
     const char *ph = "WiFi not connected yet - use the Py-I design page to load a URL";
     int i;
     screenClear(0xFF503820);   /* clean desktop background */
-    /* default 5-window layout for 1920x1080 (matches /api/wifi/desktop defaults) */
-    draw_shell_win(1060, 40, 1060+820, 40+360);
-    draw_actors(1060, 420, 1060+820, 420+380);
-    draw_winsys(40, 620, 40+1000, 620+180);
-    draw_softkbd(40, 820, 40+1840, 820+230);
-    draw_win_frame(40, 40, 40+1000, 40+560, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
-    for (i = 0; ph[i] && 48+i*CHAR_WIDTH_ < 1032; i++)
-        drawChar(ph[i], 48+i*CHAR_WIDTH_, 70, 0xFF606060);
+    /* default 5-window layout for 1280x800 (matches /api/wifi/desktop defaults) */
+    draw_shell_win(720, 20, 720+540, 20+300);
+    draw_actors(720, 340, 720+540, 340+300);
+    draw_winsys(20, 480, 20+680, 480+140);
+    draw_softkbd(20, 640, 20+1240, 640+150);
+    draw_win_frame(20, 20, 20+680, 20+440, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
+    for (i = 0; ph[i] && 28+i*CHAR_WIDTH_ < 692; i++)
+        drawChar(ph[i], 28+i*CHAR_WIDTH_, 50, 0xFF606060);
 }
 
 /* ================================================================== *
