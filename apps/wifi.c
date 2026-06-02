@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b31 (WPA2 connected; data TX + DHCP client)"
+#define WIFI_BUILD_ID "wifi-stage6-b32 (WPA2+DHCP; join retry x4, no body wedge)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1819,75 +1819,65 @@ static int wifi_do_join(const char *ssid, const char *pass)
         /* chanspec_num = 0; omit chanspec_list+pad */
         jsz = 68;
     }
-    if (wifi_set_iovar("join", jp, jsz) != 0) {
-        wifi_log("[wifi] join: 'join' iovar failed\r\n");
-        return -1;
-    }
-    wifi_log("[wifi] join: request sent, waiting for link event...\r\n");
-
-    /* Wait for the firmware supplicant to finish.  Success path: E_SET_SSID
-     * (0) status 0 -> the fw runs the 4-way -> E_PSK_SUP (46) status 6
-     * (WLC_SUP_KEYED) -> E_LINK (16) flags&1 = link up.  We return 0 on link
-     * up.  Channel-2 EAPOL frames should NOT appear now (the fw consumes them
-     * internally); if they do, FWSUP didn't engage. */
+    /* Send the join + wait for association, retrying a few times: the assoc
+     * can stall at AUTH and fall back to scanning (PROBREQ), and a fresh join
+     * iovar then usually completes.  Success path: E_SET_SSID(0) -> fw 4-way ->
+     * E_PSK_SUP(46) status 6 (WLC_SUP_KEYED) -> E_LINK(16) up.  GET_BSSID is the
+     * ground-truth "are we on?" poll (a fast directed join can beat the FIFO). */
     {
         static uint8_t fr[2048];
-        int chan, doff, tries, nev = 0, ndata = 0, eapol = 0;
-        for (tries = 0; tries < 1500; tries++) {
-            int len;
-            /* Ground-truth association check, independent of catching events:
-             * ask the fw which BSSID we're associated to.  A directed join can
-             * complete + raise/clear E_LINK faster than we poll the FIFO, so
-             * GET_BSSID is the reliable "are we on?" signal. */
-            if ((tries % 80) == 40) {
-                uint8_t bss[6]; int k, nz = 0;
-                if (wifi_wlcmd(0, WLC_GET_BSSID, NULL, 0, bss, 6) == 0)
-                    for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
-                if (nz) {
-                    wifi_d_link = 1;
-                    wifi_log("[wifi] join: GET_BSSID %02x:%02x:%02x:%02x:%02x:%02x -> *** associated ***\r\n",
-                             bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]);
-                    return 0;
-                }
+        int attempt, chan, doff, tries, nev, ndata, eapol;
+        for (attempt = 0; attempt < 4; attempt++) {
+            if (wifi_set_iovar("join", jp, jsz) != 0) {
+                wifi_log("[wifi] join: 'join' iovar failed\r\n");
+                return -1;
             }
-            len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
-            if (len < 0) break;
-            if (len == 0) { wifi_delay_us(10000); continue; }
-            if (len < doff + 4) continue;
-            {
-                int bdc = 4 + (fr[doff + 3] << 2);
-                uint8_t *p = fr + doff + bdc;     /* 802.3 frame */
-                if ((int)(p - fr) + 16 > len) continue;
-                if (chan == 1) {                  /* event */
-                    long status = (p[24+8]<<24)|(p[24+9]<<16)|(p[24+10]<<8)|p[24+11];
-                    ev = (p[24 + 6] << 8) | p[24 + 7];
-                    nev++; wifi_d_nev = nev; wifi_d_lastev = ev; wifi_d_laststat = (int)status;
-                    if (nev <= 16) wifi_d_seq[nev - 1] = ev;
-                    if (nev <= 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
-                    if (ev == 16) {
-                        int up = (p[24+2] << 8 | p[24+3]) & 1;
-                        wifi_d_link = up ? 1 : 0;
-                        wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP" : "down");
-                        if (up) { wifi_log("[wifi] *** associated (link up) ***\r\n"); return 0; }
-                    } else if (ev == 5 || ev == 6 || ev == 12 || ev == 24) {
-                        wifi_log("[wifi] join: deauth/disassoc event %d\r\n", ev);
+            wifi_log("[wifi] join: request sent (attempt %d), waiting...\r\n", attempt + 1);
+            nev = ndata = eapol = 0;
+            for (tries = 0; tries < 600; tries++) {     /* ~6 s per attempt */
+                int len;
+                if ((tries % 80) == 40) {
+                    uint8_t bss[6]; int k, nz = 0;
+                    if (wifi_wlcmd(0, WLC_GET_BSSID, NULL, 0, bss, 6) == 0)
+                        for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
+                    if (nz) {
+                        wifi_d_link = 1;
+                        wifi_log("[wifi] join: GET_BSSID %02x:%02x:%02x:%02x:%02x:%02x -> *** associated ***\r\n",
+                                 bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]);
+                        return 0;
                     }
-                } else if (chan == 2) {           /* data frame */
-                    int et = (p[12] << 8) | p[13];
-                    ndata++;
-                    if (et == 0x888E) {           /* EAPOL — the 4-way handshake */
-                        eapol++; wifi_d_eapol = eapol;
-                        wifi_log("[wifi] join: EAPOL frame #%d (len=%d) — AP started 4-way!\r\n",
-                                 eapol, len);
-                        if (eapol == 1)
-                            wifi_log("[wifi] *** host-supplicant VIABLE: fw forwards EAPOL ***\r\n");
-                    } else if (ndata <= 6) {
-                        wifi_log("[wifi] join: data frame ethertype=0x%04x len=%d\r\n", et, len);
+                }
+                len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+                if (len < 0) break;
+                if (len == 0) { wifi_delay_us(10000); continue; }
+                if (len < doff + 4) continue;
+                {
+                    int bdc = 4 + (fr[doff + 3] << 2);
+                    uint8_t *p = fr + doff + bdc;     /* 802.3 frame */
+                    if ((int)(p - fr) + 16 > len) continue;
+                    if (chan == 1) {                  /* event */
+                        long status = (p[24+8]<<24)|(p[24+9]<<16)|(p[24+10]<<8)|p[24+11];
+                        ev = (p[24 + 6] << 8) | p[24 + 7];
+                        nev++; wifi_d_nev = nev; wifi_d_lastev = ev; wifi_d_laststat = (int)status;
+                        if (nev <= 16) wifi_d_seq[nev - 1] = ev;
+                        if (nev <= 16) wifi_log("[wifi] join: event %d status %ld\r\n", ev, status);
+                        if (ev == 16) {
+                            int up = (p[24+2] << 8 | p[24+3]) & 1;
+                            wifi_d_link = up ? 1 : 0;
+                            wifi_log("[wifi] join: E_LINK %s\r\n", up ? "UP" : "down");
+                            if (up) { wifi_log("[wifi] *** associated (link up) ***\r\n"); return 0; }
+                        } else if (ev == 5 || ev == 6 || ev == 12 || ev == 24) {
+                            wifi_log("[wifi] join: deauth/disassoc event %d\r\n", ev);
+                        }
+                    } else if (chan == 2) {           /* data frame */
+                        int et = (p[12] << 8) | p[13];
+                        ndata++;
+                        if (et == 0x888E) { eapol++; wifi_d_eapol = eapol; }
                     }
                 }
             }
+            wifi_log("[wifi] join: attempt %d timeout (events=%d)\r\n", attempt + 1, nev);
         }
-        wifi_log("[wifi] join: timeout (events=%d data=%d eapol=%d)\r\n", nev, ndata, eapol);
     }
     return -1;
 }

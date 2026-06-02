@@ -1612,8 +1612,12 @@ thread webactor_server(void)
                     }
                 }
                 rc = wifi_join(ssid, pass);
-                tr = wifi_trace();
-                blen = 0; while (tr[blen] && blen < 3900) blen++;
+                tr = wifi_trace(); (void)tr;
+                /* Do NOT send the large trace as the body: a multi-KB write
+                 * right after the long join can block Xinu's TCP and wedge the
+                 * webactor for the next request.  Diagnostics go in the headers;
+                 * fetch the full log separately via GET /api/wifi/trace. */
+                blen = 0;
                 {
                     /* Surface the join diagnostics in headers — the small header
                      * block always reaches the client even when the long join
@@ -1642,8 +1646,7 @@ thread webactor_server(void)
                                rc, sup, pmk, nev, lastev, laststat, eapol, link,
                                seqbuf, tfound, tchsp, blen);
                 }
-                write(tcpdev, jhdr, hlen);
-                write(tcpdev, (void *)tr, blen);
+                write(tcpdev, jhdr, hlen);   /* headers only; body is empty */
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
