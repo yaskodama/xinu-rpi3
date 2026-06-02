@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b39 (minimal TCP+HTTP/1.0 client -> fetch http page)"
+#define WIFI_BUILD_ID "wifi-stage6-b40 (framebuffer browser window: render http://kodamay.org)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2365,7 +2365,7 @@ unsigned long wifi_ntp(const uint8_t *srv)
 /* ------------------------------------------------------------------ *
  *  Minimal TCP + HTTP/1.0 client (text "browser") over the WLAN.      *
  * ------------------------------------------------------------------ */
-static char     wifi_http_buf[6144];   /* fetched response (headers+body) */
+static char     wifi_http_buf[12288];  /* fetched response (headers+body) */
 static int      wifi_http_len = 0;
 int wifi_http_get_buf(char **p) { *p = wifi_http_buf; return wifi_http_len; }
 
@@ -2492,6 +2492,83 @@ int wifi_http(const uint8_t *ip, const char *host)
     kprintf("\r\n---- http://%s/ ----\r\n%s\r\n---- end (%d bytes) ----\r\n",
             host, wifi_http_buf, wifi_http_len);
     return wifi_http_len;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Simple framebuffer "browser": draw a window + render fetched HTML.  *
+ * ------------------------------------------------------------------ */
+extern void screenClear(unsigned long);
+extern void fillRect(int, int, int, int, unsigned long, int);
+extern void drawRect(int, int, int, int, unsigned long);
+extern void drawChar(char, int, int, unsigned long);
+#define CHAR_WIDTH_  8     /* matches framebuffer_rpi font cell */
+#define CHAR_HEIGHT_ 12
+
+/* Crudely convert HTML -> plain text: drop <script>/<style> blocks and all
+ * tags, collapse whitespace.  ASCII only. */
+static int html_to_text(const char *s, char *d, int cap)
+{
+    int n = 0, intag = 0, lastsp = 1;
+    while (*s && n < cap - 1) {
+        if (!intag && s[0] == '<') {
+            if (!strncmp(s,"<script",7) || !strncmp(s,"<SCRIPT",7)) {
+                const char *e = strstr(s, "</script>"); if (!e) e = strstr(s, "</SCRIPT>");
+                if (e) { s = e + 9; continue; } else break;
+            }
+            if (!strncmp(s,"<style",6) || !strncmp(s,"<STYLE",6)) {
+                const char *e = strstr(s, "</style>"); if (!e) e = strstr(s, "</STYLE>");
+                if (e) { s = e + 8; continue; } else break;
+            }
+            intag = 1; s++; continue;
+        }
+        if (intag) { if (*s == '>') intag = 0; s++; continue; }
+        { char c = *s++;
+          if (c==' '||c=='\t'||c=='\r'||c=='\n') { if (!lastsp) { d[n++]=' '; lastsp=1; } }
+          else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) { d[n++]=c; lastsp=0; }
+        }
+    }
+    d[n] = '\0';
+    return n;
+}
+
+/* Fetch http://<host>/ and render it as a window on the HDMI framebuffer. */
+int wifi_browse(const uint8_t *ip, const char *host)
+{
+    static char text[8192];
+    const char *body;
+    int n, tn, i, col, x, y;
+    const int WX=40, WY=30, WX2=983, WY2=737, TBH=22;   /* 1024x768 window */
+    const int TX0=WX+8, TY0=WY+TBH+6, TXMAX=WX2-8, TYMAX=WY2-14;
+
+    n = wifi_http(ip, host);                  /* fills wifi_http_buf */
+    if (n <= 0) return -1;
+
+    /* skip HTTP headers (to after the blank line) before converting to text */
+    body = strstr(wifi_http_buf, "\r\n\r\n");
+    body = body ? body + 4 : wifi_http_buf;
+    tn = html_to_text(body, text, sizeof(text));
+
+    /* --- draw the window --- */
+    screenClear(0xFF402000);                          /* desktop: dark blue */
+    fillRect(WX, WY, WX2, WY2, 0xFFFFFFFF, 0);        /* page area: white */
+    drawRect(WX, WY, WX2, WY2, 0xFF000000);
+    fillRect(WX, WY, WX2, WY+TBH, 0xFFC05000, 0);     /* title bar: blue */
+    { char title[80]; int tl;
+      tl = sprintf(title, "Xinu Browser   http://%s/", host);
+      for (i = 0; i < tl; i++) drawChar(title[i], WX+8+i*CHAR_WIDTH_, WY+5, 0xFFFFFFFF);
+    }
+
+    /* --- render the text, word-wrapped, clipped to the window --- */
+    x = TX0; y = TY0; col = 0; (void)col;
+    for (i = 0; i < tn && y <= TYMAX; i++) {
+        char c = text[i];
+        if (x + CHAR_WIDTH_ > TXMAX) { x = TX0; y += CHAR_HEIGHT_ + 2; if (y > TYMAX) break; }
+        if (c == ' ' && x == TX0) continue;           /* no leading space */
+        drawChar(c, x, y, 0xFF000000);
+        x += CHAR_WIDTH_;
+    }
+    wifi_log("[wifi] browse: rendered %d text bytes of %s to framebuffer\r\n", tn, host);
+    return n;
 }
 
 /* ================================================================== *
