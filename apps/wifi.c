@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b33 (WPA2+DHCP+ARP/ICMP responder; pingable)"
+#define WIFI_BUILD_ID "wifi-stage6-b34 (ARP/ICMP responder + RX frame logging)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2087,12 +2087,20 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
     int bdc = 4 + (fr[doff + 3] << 2);
     uint8_t *e = fr + doff + bdc;            /* 802.3 frame */
     int elen = len - (doff + bdc), et, i;
+    static int dbgn = 0;
     if (elen < 14) return;
     et = (e[12] << 8) | e[13];
+    if (dbgn < 40) {
+        dbgn++;
+        wifi_log("[wifi] rx et=0x%04x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x len=%d\r\n",
+                 et, e[0],e[1],e[2],e[3],e[4],e[5], e[6],e[7],e[8],e[9],e[10],e[11], elen);
+    }
 
     if (et == 0x0806 && elen >= 42) {        /* ARP */
         uint8_t *a = e + 14;
         int op = (a[6] << 8) | a[7];
+        if (dbgn < 40) wifi_log("[wifi] rx ARP op=%d tgtip=%d.%d.%d.%d (ourip=%d.%d.%d.%d)\r\n",
+                                op, a[24],a[25],a[26],a[27], wifi_ip[0],wifi_ip[1],wifi_ip[2],wifi_ip[3]);
         if (op == 1 && wifi_ip_eq(a + 24)) { /* request for our IP */
             static uint8_t tx[42];
             for (i = 0; i < 6; i++) tx[i]     = e[6 + i];   /* dst = requester */
@@ -2106,6 +2114,8 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
               for (i=0;i<4;i++) r[24+i] = a[14+i];         /* target ip  = requester */
             }
             wifi_data_tx(tx, 42);
+            wifi_log("[wifi] -> ARP reply to %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                     e[6],e[7],e[8],e[9],e[10],e[11]);
         }
     } else if (et == 0x0800 && elen >= 14 + 20 + 8) {   /* IPv4 */
         uint8_t *ip = e + 14;
@@ -2122,6 +2132,7 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
                 ic[2] = ic[3] = 0; c = ip_cksum(ic, iclen, 0); ic[2]=c>>8; ic[3]=c&0xFF;
                 ip[10]=ip[11]=0; c = ip_cksum(ip, ihl, 0); ip[10]=c>>8; ip[11]=c&0xFF;
                 wifi_data_tx(e, 14 + iptot);
+                wifi_log("[wifi] -> ICMP echo reply\r\n");
             }
         }
     }
