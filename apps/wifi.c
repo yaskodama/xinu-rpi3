@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b29 (FWSUP; wl_extjoin_params_t 72-B layout like ether4330)"
+#define WIFI_BUILD_ID "wifi-stage6-b30 (FWSUP; aligned 70-B ext_join, exact brcmfmac size)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1783,12 +1783,14 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_set_iovar_int("auth", 0);
     }
 
-    /* Build the "join" iovar = wl_extjoin_params_t, EXACTLY as the proven
-     * plan9/circle ether4330 driver lays it out for this chip family.  My
-     * earlier brcmf_ext_join_params_le layout (nested scan ssid_le at +36) was
-     * the wrong struct: the fw accepted the 114-B length but misread the scan/
-     * assoc fields, so the join-scan produced one event and never associated.
-     * wl_extjoin_params_t (72 B with 1 chanspec):
+    /* Build the "join" iovar.  ★ KEY: brcmf_ext_join_params_le is NOT __packed
+     * (only one __packed in all of fwil_types.h, not these), so it's NATURALLY
+     * ALIGNED — scan_type(1)+3pad+4*le32 = 20, assoc bssid(6)+2pad+chanspec_num
+     * (4)+chanspec(2).  Real join_params_size = offsetof(assoc_le)=56 + offsetof
+     * (chanspec_list)=12 + 2 = 70 B (with channel), 68 (without).  That is why
+     * a 65-B packed guess got -14 BUFTOOSHORT — and the aligned layout is
+     * byte-identical to the proven ether4330 wl_extjoin_params_t.  Layout
+     * (70 B with 1 chanspec):
      *   [0..3]   ssid.SSID_len        [4..35]  SSID[32]
      *   --- wl_join_scan_params_t (20 B) ---
      *   [36..39] scan_type(u8)+pad = 0xff   [40..43] nprobes
@@ -1810,7 +1812,7 @@ static int wifi_do_join(const char *ssid, const char *pass)
         jp[64] = 1;                               /* chanspec_num = 1 */
         jp[68] = wifi_tgt_chanspec & 0xFF;
         jp[69] = (wifi_tgt_chanspec >> 8) & 0xFF;
-        jsz = 72;
+        jsz = 70;   /* EXACT brcmfmac size: offsetof(assoc_le)56 + 12 + 2 */
     } else {
         for (i = 40; i < 56; i++) jp[i] = 0xFF;   /* nprobes/active/passive/home = -1 */
         for (i = 56; i < 62; i++) jp[i] = 0xFF;   /* assoc bssid = broadcast */
