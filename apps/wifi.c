@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b45 (boot initial screen: 3-window desktop)"
+#define WIFI_BUILD_ID "wifi-stage6-b46 (desktop: fetch flag for live drag redraw from cache)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2603,10 +2603,20 @@ static int html_to_source(const char *s, char *d, int cap)
     return n;
 }
 
+int wifi_browse_xyf(const uint8_t *ip, const char *host, int wx, int wy, int ww, int wh, int fetch);
+
 /* Fetch http://<host>/ and render it as a window on the HDMI framebuffer.
  * wx,wy = top-left; ww,wh = window size (<=0 => default centred 704x480).  The
  * geometry lets the Py-I "screen design" page place the window. */
 int wifi_browse_xy(const uint8_t *ip, const char *host, int wx, int wy, int ww, int wh)
+{
+    return wifi_browse_xyf(ip, host, wx, wy, ww, wh, 1);   /* fetch */
+}
+
+/* As wifi_browse_xy, but `fetch`==0 re-renders the CACHED page (wifi_http_buf)
+ * without a network round-trip — used for live drag/resize so moving the window
+ * is instant (no re-fetch). */
+int wifi_browse_xyf(const uint8_t *ip, const char *host, int wx, int wy, int ww, int wh, int fetch)
 {
     static char text[8192];
     const char *body;
@@ -2621,7 +2631,8 @@ int wifi_browse_xy(const uint8_t *ip, const char *host, int wx, int wy, int ww, 
     WX=wx; WY=wy; WX2=wx+ww; WY2=wy+wh;
     TX0=WX+8; TY0=WY+TBH+6; TXMAX=WX2-8; TYMAX=WY2-10;
 
-    n = wifi_http(ip, host);                  /* fills wifi_http_buf */
+    if (fetch) { n = wifi_http(ip, host); }   /* fills wifi_http_buf */
+    else       { n = wifi_http_len; }         /* reuse the cached page */
     if (n <= 0) return -1;
 
     /* skip HTTP headers (to after the blank line) before converting to text */
@@ -2669,11 +2680,11 @@ int wifi_browse(const uint8_t *ip, const char *host)
 int wifi_desktop(const uint8_t *ip, const char *host,
                  int bx, int by, int bw, int bh,
                  int kx, int ky, int kw, int kh,
-                 int sx, int sy, int sw, int sh)
+                 int sx, int sy, int sw, int sh, int fetch)
 {
     if (sw > 40 && sh > 40) draw_shell_win(sx, sy, sx+sw, sy+sh);
     if (kw > 40 && kh > 40) draw_softkbd(kx, ky, kx+kw, ky+kh);
-    return wifi_browse_xy(ip, host, bx, by, bw, bh);   /* browser on top */
+    return wifi_browse_xyf(ip, host, bx, by, bw, bh, fetch);   /* browser on top */
 }
 
 /* Draw the default 3-window layout as the boot-time "initial screen".  The

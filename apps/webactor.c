@@ -1595,11 +1595,13 @@ thread webactor_server(void)
              *   Soft keyboard + Shell) at designed geometries on the HDMI fb. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/desktop", 21)) {
                 extern int wifi_desktop(const unsigned char*, const char*,
-                                        int,int,int,int, int,int,int,int, int,int,int,int);
+                                        int,int,int,int, int,int,int,int, int,int,int,int, int);
                 extern int atoi(const char *);
                 unsigned char ip[4] = {160,251,151,122};
                 static char host[64] = "kodamay.org";
                 const char *qh = strstr(reqbuf, "host="), *qi = strstr(reqbuf, "ip=");
+                const char *qf = strstr(reqbuf, "fetch=");
+                int fetch = qf ? atoi(qf+6) : 1;   /* fetch=0 -> live redraw from cache */
                 const char *p; static char dh[120]; int n, hlen;
                 int bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh;
                 if (qh) { int k=0; const char *q=qh+5;
@@ -1617,7 +1619,7 @@ thread webactor_server(void)
                 kx=WGET("kx=",40); ky=WGET("ky=",440); kw=WGET("kw=",720); kh=WGET("kh=",260);
                 sx=WGET("sx=",620); sy=WGET("sy=",40); sw=WGET("sw=",380); sh=WGET("sh=",260);
                 #undef WGET
-                n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh);
+                n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh, fetch);
                 hlen = sprintf(dh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "X-Wifi-BrowseBytes: %d\r\nContent-Length: 0\r\n\r\n", n);
                 write(tcpdev, dh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
