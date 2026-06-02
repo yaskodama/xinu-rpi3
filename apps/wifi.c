@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b47 (desktop: screenClear before redraw — fix move ghosting)"
+#define WIFI_BUILD_ID "wifi-stage6-b48 (5-window desktop: +Window System +Actors)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2551,6 +2551,48 @@ static void draw_shell_win(int x, int y, int x2, int y2)
     for (i = 0; p[i]; i++) drawChar(p[i], x+8+i*CHAR_WIDTH_, y+32, 0xFF00FF00);
 }
 
+/* draw a clipped text line at (x,y) up to xmax. */
+static void draw_text_line(int x, int y, const char *s, unsigned long col, int xmax)
+{
+    int i;
+    for (i = 0; s[i] && x+i*CHAR_WIDTH_ < xmax; i++) drawChar(s[i], x+i*CHAR_WIDTH_, y, col);
+}
+
+/* "Xinu Pi3 Window System" info window. */
+static void draw_winsys(int x, int y, int x2, int y2)
+{
+    char line[96];
+    draw_win_frame(x, y, x2, y2, "Xinu Pi3 Window System", 0xFFF0F0F0, 0xFF206040);
+    extern int abcl_n_objects(void);
+    sprintf(line, "Build: %s", WIFI_BUILD_ID);
+    draw_text_line(x+8, y+30, line, 0xFF000000, x2-4);
+    sprintf(line, "IP: %d.%d.%d.%d   Screen: 1024x768x32",
+            wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
+    draw_text_line(x+8, y+46, line, 0xFF000000, x2-4);
+    draw_text_line(x+8, y+62, "Windows: Browser/Soft kbd/Shell/Actors/WinSys", 0xFF000000, x2-4);
+    sprintf(line, "Actors loaded: %d", abcl_n_objects());
+    draw_text_line(x+8, y+78, line, 0xFF000000, x2-4);
+}
+
+/* "Actors" window: the AIPL actor inventory (id, class, state, mbox backlog). */
+static void draw_actors(int x, int y, int x2, int y2)
+{
+    extern int abcl_n_objects(void); extern int abcl_object_class_id(int);
+    extern int abcl_object_started(int); extern int abcl_object_dead(int);
+    extern int abcl_object_enq(int); extern int abcl_object_deq(int);
+    int n = abcl_n_objects(), i, ly = y + 30;
+    char line[64];
+    draw_win_frame(x, y, x2, y2, "Actors", 0xFF101018, 0xFF603040);
+    draw_text_line(x+8, ly, "id cls state mbox", 0xFF80C0FF, x2-4); ly += 16;
+    for (i = 0; i < n && ly+12 < y2-4; i++) {
+        const char *st = abcl_object_dead(i) ? "dead" : (abcl_object_started(i) ? "run " : "idle");
+        sprintf(line, "%2d  %2d  %s  %d", i, abcl_object_class_id(i), st,
+                abcl_object_enq(i) - abcl_object_deq(i));
+        draw_text_line(x+8, ly, line, 0xFF00FF80, x2-4); ly += 14;
+    }
+    if (n == 0) draw_text_line(x+8, ly, "(no actors loaded)", 0xFF808080, x2-4);
+}
+
 /* Crudely convert HTML -> plain text: drop <script>/<style> blocks and all
  * tags, collapse whitespace.  ASCII only. */
 static int html_to_text(const char *s, char *d, int cap)
@@ -2680,11 +2722,16 @@ int wifi_browse(const uint8_t *ip, const char *host)
 int wifi_desktop(const uint8_t *ip, const char *host,
                  int bx, int by, int bw, int bh,
                  int kx, int ky, int kw, int kh,
-                 int sx, int sy, int sw, int sh, int fetch)
+                 int sx, int sy, int sw, int sh,
+                 int px, int py, int pw, int ph,    /* Window System */
+                 int ax, int ay, int aw, int ah,    /* Actors */
+                 int fetch)
 {
     screenClear(0xFF503820);   /* desktop bg — erases windows' previous positions */
     if (sw > 40 && sh > 40) draw_shell_win(sx, sy, sx+sw, sy+sh);
     if (kw > 40 && kh > 40) draw_softkbd(kx, ky, kx+kw, ky+kh);
+    if (pw > 40 && ph > 40) draw_winsys(px, py, px+pw, py+ph);
+    if (aw > 40 && ah > 40) draw_actors(ax, ay, ax+aw, ay+ah);
     return wifi_browse_xyf(ip, host, bx, by, bw, bh, fetch);   /* browser on top */
 }
 
@@ -2697,10 +2744,13 @@ void wifi_desktop_initial(void)
     const char *ph = "WiFi not connected yet - use the Py-I design page to load a URL";
     int i;
     screenClear(0xFF503820);   /* clean desktop background */
-    draw_shell_win(620, 40, 620+380, 40+260);
-    draw_softkbd(40, 440, 40+720, 440+260);
-    draw_win_frame(40, 40, 40+560, 40+360, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
-    for (i = 0; ph[i] && 48+i*CHAR_WIDTH_ < 592; i++)
+    /* default 5-window layout (matches the /api/wifi/desktop defaults) */
+    draw_shell_win(580, 40, 580+400, 40+200);
+    draw_actors(580, 260, 580+400, 260+250);
+    draw_winsys(40, 360, 40+520, 360+150);
+    draw_softkbd(40, 530, 40+940, 530+210);
+    draw_win_frame(40, 40, 40+520, 40+300, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
+    for (i = 0; ph[i] && 48+i*CHAR_WIDTH_ < 552; i++)
         drawChar(ph[i], 48+i*CHAR_WIDTH_, 70, 0xFF606060);
 }
 

@@ -1595,7 +1595,8 @@ thread webactor_server(void)
              *   Soft keyboard + Shell) at designed geometries on the HDMI fb. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/desktop", 21)) {
                 extern int wifi_desktop(const unsigned char*, const char*,
-                                        int,int,int,int, int,int,int,int, int,int,int,int, int);
+                                        int,int,int,int, int,int,int,int, int,int,int,int,
+                                        int,int,int,int, int,int,int,int, int);
                 extern int atoi(const char *);
                 unsigned char ip[4] = {160,251,151,122};
                 static char host[64] = "kodamay.org";
@@ -1603,7 +1604,7 @@ thread webactor_server(void)
                 const char *qf = strstr(reqbuf, "fetch=");
                 int fetch = qf ? atoi(qf+6) : 1;   /* fetch=0 -> live redraw from cache */
                 const char *p; static char dh[120]; int n, hlen;
-                int bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh;
+                int bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh, px,py,pw,ph, ax,ay,aw,ah;
                 if (qh) { int k=0; const char *q=qh+5;
                     for (; *q && *q!=' '&&*q!='&' && k<(int)sizeof(host)-1; q++) host[k++]=*q;
                     host[k]='\0';
@@ -1615,11 +1616,14 @@ thread webactor_server(void)
                     } if (o<4) ip[o]=v;
                 }
                 #define WGET(k,def) ((p=strstr(reqbuf,k))?atoi(p+3):(def))
-                bx=WGET("bx=",40); by=WGET("by=",40); bw=WGET("bw=",560); bh=WGET("bh=",360);
-                kx=WGET("kx=",40); ky=WGET("ky=",440); kw=WGET("kw=",720); kh=WGET("kh=",260);
-                sx=WGET("sx=",620); sy=WGET("sy=",40); sw=WGET("sw=",380); sh=WGET("sh=",260);
+                bx=WGET("bx=",40);  by=WGET("by=",40);  bw=WGET("bw=",520); bh=WGET("bh=",300);
+                sx=WGET("sx=",580); sy=WGET("sy=",40);  sw=WGET("sw=",400); sh=WGET("sh=",200);
+                ax=WGET("ax=",580); ay=WGET("ay=",260); aw=WGET("aw=",400); ah=WGET("ah=",250);
+                px=WGET("px=",40);  py=WGET("py=",360); pw=WGET("pw=",520); ph=WGET("ph=",150);
+                kx=WGET("kx=",40);  ky=WGET("ky=",530); kw=WGET("kw=",940); kh=WGET("kh=",210);
                 #undef WGET
-                n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh, fetch);
+                n = wifi_desktop(ip, host, bx,by,bw,bh, kx,ky,kw,kh, sx,sy,sw,sh,
+                                 px,py,pw,ph, ax,ay,aw,ah, fetch);
                 hlen = sprintf(dh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "X-Wifi-BrowseBytes: %d\r\nContent-Length: 0\r\n\r\n", n);
                 write(tcpdev, dh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
