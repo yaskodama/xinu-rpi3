@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b37 (NTP/ping: SDIO sem lock + quiet/fast empty reads)"
+#define WIFI_BUILD_ID "wifi-stage6-b38 (NTP: revert cmd53 spin to 1M; keep quiet logs + sem)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -670,12 +670,12 @@ static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
         if (blkmode) cmd |= (1u << 5) | (1u << 1); /* multiblock + blkcnt-en */
         ew(&EMMC_CMDTM, cmd);
     }
-    for (t = 0; t < 50000; t++) {
+    for (t = 0; t < 1000000; t++) {
         intr = EMMC_INTERRUPT;
         if (intr & INT_ERR)      { wifi_log("[wifi]   cmd53 err 0x%08x\r\n", intr); return -1; }
         if (intr & INT_CMD_DONE) { ew(&EMMC_INTERRUPT, INT_CMD_DONE); break; }
     }
-    if (t >= 50000) return -1;   /* no CMD_DONE (e.g. empty FIFO poll) — quiet */
+    if (t >= 1000000) return -1;   /* no CMD_DONE (e.g. empty FIFO poll) — quiet */
 
     /* PIO: the controller raises READ_RDY/WRITE_RDY before each block-sized
      * buffer; transfer it word-by-word via the DATA register. */
@@ -686,12 +686,12 @@ static int wifi_cmd53_pio(int write, int fn, uint32_t off, uint8_t *buf,
             uint32_t flag = write ? INT_WRITE_RDY : INT_READ_RDY;
             uint32_t chunk = (total > bsize && (words - done) > (bsize / 4))
                              ? (bsize / 4) : (words - done);
-            for (t = 0; t < 50000; t++) {
+            for (t = 0; t < 1000000; t++) {
                 intr = EMMC_INTERRUPT;
                 if (intr & INT_ERR)  { wifi_log("[wifi]   cmd53 data err 0x%08x\r\n", intr); return -1; }
                 if (intr & flag)     { EMMC_INTERRUPT = flag; break; }
             }
-            if (t >= 50000) return -1;   /* no data ready (empty FIFO poll) — quiet */
+            if (t >= 1000000) return -1;   /* no data ready (empty FIFO poll) — quiet */
             for (w = 0; w < chunk; w++) {
                 uint32_t idx = (done + w) * 4;
                 if (write) {
