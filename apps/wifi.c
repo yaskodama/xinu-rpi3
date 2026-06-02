@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b46 (desktop: fetch flag for live drag redraw from cache)"
+#define WIFI_BUILD_ID "wifi-stage6-b47 (desktop: screenClear before redraw — fix move ghosting)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2682,6 +2682,7 @@ int wifi_desktop(const uint8_t *ip, const char *host,
                  int kx, int ky, int kw, int kh,
                  int sx, int sy, int sw, int sh, int fetch)
 {
+    screenClear(0xFF503820);   /* desktop bg — erases windows' previous positions */
     if (sw > 40 && sh > 40) draw_shell_win(sx, sy, sx+sw, sy+sh);
     if (kw > 40 && kh > 40) draw_softkbd(kx, ky, kx+kw, ky+kh);
     return wifi_browse_xyf(ip, host, bx, by, bw, bh, fetch);   /* browser on top */
@@ -2695,6 +2696,7 @@ void wifi_desktop_initial(void)
 {
     const char *ph = "WiFi not connected yet - use the Py-I design page to load a URL";
     int i;
+    screenClear(0xFF503820);   /* clean desktop background */
     draw_shell_win(620, 40, 620+380, 40+260);
     draw_softkbd(40, 440, 40+720, 440+260);
     draw_win_frame(40, 40, 40+560, 40+360, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
