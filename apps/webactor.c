@@ -1549,6 +1549,32 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wifi/dhcp — run a DHCP DISCOVER/REQUEST over the associated
+             *   link and report the leased IP.  (Read /api/wifi/trace for the
+             *   full DHCP log.) */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/dhcp",  18) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/dhcp", 19))
+            {
+                extern int  wifi_dhcp(void);
+                extern void wifi_dhcp_diag(unsigned char*, unsigned char*, int*);
+                static char dhdr[256], dbody[160];
+                unsigned char ip[4], gw[4]; int have, rc, blen, hlen;
+                rc = wifi_dhcp();
+                wifi_dhcp_diag(ip, gw, &have);
+                blen = sprintf(dbody, "dhcp rc=%d have_ip=%d ip=%d.%d.%d.%d gw=%d.%d.%d.%d\r\n",
+                               rc, have, ip[0],ip[1],ip[2],ip[3], gw[0],gw[1],gw[2],gw[3]);
+                hlen = sprintf(dhdr,
+                               "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                               "X-Wifi-DhcpRC: %d\r\nX-Wifi-HaveIP: %d\r\n"
+                               "X-Wifi-IP: %d.%d.%d.%d\r\nX-Wifi-GW: %d.%d.%d.%d\r\n"
+                               "Content-Length: %d\r\n\r\n",
+                               rc, have, ip[0],ip[1],ip[2],ip[3], gw[0],gw[1],gw[2],gw[3], blen);
+                write(tcpdev, dhdr, hlen);
+                write(tcpdev, dbody, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/wifi/join?ssid=NAME&pass=PASS — connect to an AP (WPA2-PSK
              *   if pass given, else open).  Full [wifi] trace in the reply. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/join",  18) ||

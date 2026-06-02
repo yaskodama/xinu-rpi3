@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b30 (FWSUP; aligned 70-B ext_join, exact brcmfmac size)"
+#define WIFI_BUILD_ID "wifi-stage6-b31 (WPA2 connected; data TX + DHCP client)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1890,6 +1890,198 @@ static int wifi_do_join(const char *ssid, const char *pass)
         wifi_log("[wifi] join: timeout (events=%d data=%d eapol=%d)\r\n", nev, ndata, eapol);
     }
     return -1;
+}
+
+/* ================================================================== *
+ *  Data path (SDPCM channel 2) + a minimal DHCP client                *
+ * ================================================================== */
+
+/* Transmit one 802.3 Ethernet frame over the WLAN data channel.
+ * Framing (matches ether4330 txstart): SDPCM hdr (12, chanflg=2, doffset=12)
+ * + BDC hdr (4 bytes, flags byte 0x20 = BDC proto ver 2) + the ethernet frame. */
+static int wifi_data_tx(const uint8_t *eth, int ethlen)
+{
+    static uint8_t pkt[1600];
+    int len = SDPCM_HDR + 4 + ethlen, i;
+    if (len > (int)sizeof(pkt)) return -1;
+    for (i = 0; i < len; i++) pkt[i] = 0;
+    pkt[0] = len & 0xFF; pkt[1] = (len >> 8) & 0xFF;
+    pkt[2] = ~len & 0xFF; pkt[3] = (~len >> 8) & 0xFF;
+    pkt[4] = wl_txseq;
+    pkt[5] = 2;                 /* channel 2 = data */
+    pkt[7] = SDPCM_HDR;         /* doffset -> BDC header */
+    pkt[SDPCM_HDR + 0] = 0x20;  /* BDC: proto ver 2, prio 0, data_offset 0 */
+    for (i = 0; i < ethlen; i++) pkt[SDPCM_HDR + 4 + i] = eth[i];
+    if (wifi_packetrw(1, pkt, len) != 0) return -1;
+    wl_txseq++;
+    return 0;
+}
+
+/* 16-bit one's-complement checksum (IP header / UDP). */
+static uint16_t ip_cksum(const uint8_t *p, int n, uint32_t sum)
+{
+    int i;
+    for (i = 0; i + 1 < n; i += 2) sum += (p[i] << 8) | p[i + 1];
+    if (i < n) sum += p[i] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+/* DHCP results (also surfaced via headers). */
+static uint8_t wifi_ip[4], wifi_mask[4], wifi_gw[4], wifi_dns[4], wifi_mac[6];
+static int     wifi_have_ip = 0;
+void wifi_dhcp_diag(uint8_t *ip, uint8_t *gw, int *have) {
+    int i; for (i=0;i<4;i++){ ip[i]=wifi_ip[i]; gw[i]=wifi_gw[i]; } *have = wifi_have_ip;
+}
+
+/* Build a DHCP packet (DISCOVER if reqip==NULL, else REQUEST) into `out`.
+ * Returns total ethernet frame length.  xid identifies our exchange. */
+static int dhcp_build(uint8_t *out, const uint8_t *mac, uint32_t xid,
+                      const uint8_t *reqip, const uint8_t *srvid)
+{
+    uint8_t *e = out, *ip, *udp, *bootp, *opt;
+    int dhcplen, udplen, iplen, i;
+
+    /* Ethernet: dst broadcast, src mac, type IPv4 */
+    for (i = 0; i < 6; i++) e[i] = 0xFF;
+    for (i = 0; i < 6; i++) e[6 + i] = mac[i];
+    e[12] = 0x08; e[13] = 0x00;
+    ip = e + 14;
+    udp = ip + 20;
+    bootp = udp + 8;
+
+    /* BOOTP/DHCP fixed 236 bytes */
+    for (i = 0; i < 236; i++) bootp[i] = 0;
+    bootp[0] = 1; bootp[1] = 1; bootp[2] = 6;          /* op=REQUEST htype=ETH hlen=6 */
+    bootp[4] = xid >> 24; bootp[5] = xid >> 16; bootp[6] = xid >> 8; bootp[7] = xid;
+    bootp[10] = 0x80;                                   /* flags = broadcast */
+    for (i = 0; i < 6; i++) bootp[28 + i] = mac[i];     /* chaddr */
+    opt = bootp + 236;
+    opt[0] = 0x63; opt[1] = 0x82; opt[2] = 0x53; opt[3] = 0x63;  /* magic cookie */
+    opt += 4;
+    *opt++ = 53; *opt++ = 1; *opt++ = reqip ? 3 : 1;    /* msg type: REQUEST/DISCOVER */
+    if (reqip) {
+        *opt++ = 50; *opt++ = 4; for (i=0;i<4;i++) *opt++ = reqip[i];   /* requested IP */
+        *opt++ = 54; *opt++ = 4; for (i=0;i<4;i++) *opt++ = srvid[i];   /* server id */
+    }
+    *opt++ = 55; *opt++ = 4; *opt++ = 1; *opt++ = 3; *opt++ = 6; *opt++ = 51; /* params */
+    *opt++ = 255;                                        /* end */
+    dhcplen = (int)(opt - bootp);
+
+    /* UDP: sport 68, dport 67 */
+    udplen = 8 + dhcplen;
+    udp[0]=0; udp[1]=68; udp[2]=0; udp[3]=67;
+    udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;  /* csum 0 (optional) */
+
+    /* IPv4 header */
+    iplen = 20 + udplen;
+    for (i = 0; i < 20; i++) ip[i] = 0;
+    ip[0]=0x45; ip[2]=iplen>>8; ip[3]=iplen&0xFF; ip[8]=64; ip[9]=17;  /* ttl, proto UDP */
+    /* src 0.0.0.0, dst 255.255.255.255 */
+    for (i = 0; i < 4; i++) ip[16 + i] = 0xFF;
+    { uint16_t c = ip_cksum(ip, 20, 0); ip[10]=c>>8; ip[11]=c&0xFF; }
+
+    return 14 + iplen;
+}
+
+/* Parse a received DHCP reply.  Returns the DHCP msg type (2=OFFER,5=ACK) or
+ * 0, fills yiaddr + server id + mask/gw/dns from options.  `eth`/`elen` is the
+ * 802.3 frame (after SDPCM+BDC). */
+static int dhcp_parse(const uint8_t *eth, int elen, uint32_t xid,
+                      uint8_t *yiaddr, uint8_t *srvid,
+                      uint8_t *mask, uint8_t *gw, uint8_t *dns)
+{
+    const uint8_t *ip, *udp, *bootp, *o, *end;
+    int ihl, mtype = 0, i;
+    if (elen < 14 + 20 + 8 + 240) return 0;
+    if (eth[12] != 0x08 || eth[13] != 0x00) return 0;     /* IPv4 */
+    ip = eth + 14;
+    ihl = (ip[0] & 0x0F) * 4;
+    if (ip[9] != 17) return 0;                            /* UDP */
+    udp = ip + ihl;
+    if (udp[2] != 0 || udp[3] != 68) return 0;            /* dport 68 (to client) */
+    bootp = udp + 8;
+    if (bootp[0] != 2) return 0;                          /* BOOTREPLY */
+    if (((uint32_t)bootp[4]<<24|bootp[5]<<16|bootp[6]<<8|bootp[7]) != xid) return 0;
+    for (i = 0; i < 4; i++) yiaddr[i] = bootp[16 + i];    /* offered IP */
+    o = bootp + 236;
+    if (o[0]!=0x63||o[1]!=0x82||o[2]!=0x53||o[3]!=0x63) return 0;
+    o += 4; end = eth + elen;
+    while (o < end && *o != 255) {
+        int t = *o++, l; if (o >= end) break; l = *o++;
+        if (o + l > end) break;
+        if (t == 53 && l >= 1) mtype = o[0];
+        else if (t == 54 && l >= 4) for (i=0;i<4;i++) srvid[i]=o[i];
+        else if (t == 1  && l >= 4) for (i=0;i<4;i++) mask[i]=o[i];
+        else if (t == 3  && l >= 4) for (i=0;i<4;i++) gw[i]=o[i];
+        else if (t == 6  && l >= 4) for (i=0;i<4;i++) dns[i]=o[i];
+        o += l;
+    }
+    return mtype;
+}
+
+/* Wait for a DHCP reply of the wanted msg type (2 or 5).  Returns msg type. */
+static int dhcp_wait(uint32_t xid, int want, uint8_t *yiaddr, uint8_t *srvid,
+                     uint8_t *mask, uint8_t *gw, uint8_t *dns)
+{
+    static uint8_t fr[2048];
+    int chan, doff, tries;
+    for (tries = 0; tries < 800; tries++) {
+        int len = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (len < 0) break;
+        if (len == 0) { wifi_delay_us(10000); continue; }
+        if (chan != 2 || len < doff + 4) continue;
+        {
+            int bdc = 4 + (fr[doff + 3] << 2);
+            const uint8_t *eth = fr + doff + bdc;
+            int elen = len - (doff + bdc);
+            int t = dhcp_parse(eth, elen, xid, yiaddr, srvid, mask, gw, dns);
+            if (t == want) return t;
+        }
+    }
+    return 0;
+}
+
+/* Run a DHCP DISCOVER/REQUEST exchange over the (already associated) link. */
+int wifi_dhcp(void)
+{
+    static uint8_t pkt[600];
+    uint8_t yi[4]={0}, srv[4]={0}, mask[4]={0}, gw[4]={0}, dns[4]={0};
+    uint32_t xid;
+    int n, t;
+
+    wifi_have_ip = 0;
+    wifi_tn = 0;                /* trace shows only the DHCP exchange */
+    wifi_log("[wifi] === DHCP ===\r\n");
+    if (wifi_get_iovar("cur_etheraddr", wifi_mac, 6) != 0) {
+        wifi_log("[wifi] dhcp: cur_etheraddr failed\r\n"); return -1;
+    }
+    wifi_log("[wifi] dhcp: mac %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+             wifi_mac[0],wifi_mac[1],wifi_mac[2],wifi_mac[3],wifi_mac[4],wifi_mac[5]);
+    xid = 0x52610000u | (wifi_mac[4] << 8) | wifi_mac[5];  /* 'Ra' + mac tail */
+
+    n = dhcp_build(pkt, wifi_mac, xid, NULL, NULL);         /* DISCOVER */
+    if (wifi_data_tx(pkt, n) != 0) { wifi_log("[wifi] dhcp: DISCOVER tx failed\r\n"); return -1; }
+    wifi_log("[wifi] dhcp: DISCOVER sent (%d B), waiting for OFFER...\r\n", n);
+    t = dhcp_wait(xid, 2, yi, srv, mask, gw, dns);
+    if (t != 2) { wifi_log("[wifi] dhcp: no OFFER (timeout)\r\n"); return -1; }
+    wifi_log("[wifi] dhcp: OFFER ip=%d.%d.%d.%d server=%d.%d.%d.%d\r\n",
+             yi[0],yi[1],yi[2],yi[3], srv[0],srv[1],srv[2],srv[3]);
+
+    n = dhcp_build(pkt, wifi_mac, xid, yi, srv);            /* REQUEST */
+    if (wifi_data_tx(pkt, n) != 0) { wifi_log("[wifi] dhcp: REQUEST tx failed\r\n"); return -1; }
+    wifi_log("[wifi] dhcp: REQUEST sent, waiting for ACK...\r\n");
+    t = dhcp_wait(xid, 5, yi, srv, mask, gw, dns);
+    if (t != 5) { wifi_log("[wifi] dhcp: no ACK (timeout)\r\n"); return -1; }
+
+    for (n = 0; n < 4; n++) { wifi_ip[n]=yi[n]; wifi_mask[n]=mask[n]; wifi_gw[n]=gw[n]; wifi_dns[n]=dns[n]; }
+    wifi_have_ip = 1;
+    wifi_log("[wifi] *** DHCP ACK: ip=%d.%d.%d.%d mask=%d.%d.%d.%d gw=%d.%d.%d.%d dns=%d.%d.%d.%d ***\r\n",
+             wifi_ip[0],wifi_ip[1],wifi_ip[2],wifi_ip[3],
+             wifi_mask[0],wifi_mask[1],wifi_mask[2],wifi_mask[3],
+             wifi_gw[0],wifi_gw[1],wifi_gw[2],wifi_gw[3],
+             wifi_dns[0],wifi_dns[1],wifi_dns[2],wifi_dns[3]);
+    return 0;
 }
 
 /* ================================================================== *
