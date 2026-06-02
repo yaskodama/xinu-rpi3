@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b34 (ARP/ICMP responder + RX frame logging)"
+#define WIFI_BUILD_ID "wifi-stage6-b35 (SDPCM tx credit window/flow ctl -> pingable)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -994,6 +994,12 @@ static int wifi_sbenable(void)
 #define WLC_SET_VAR   263
 
 static uint8_t  wl_txseq;
+/* SDPCM tx flow control: the fw advertises a credit window (max_seq, byte 9)
+ * and a per-channel flow-control mask (byte 8) in EVERY frame it sends.  We
+ * must not transmit when txseq == txwindow or when data-channel FC is set,
+ * else the fw silently drops the frame.  Updated from every RX SDPCM header. */
+static uint8_t  wl_txwindow = 1;
+static uint8_t  wl_fcmask = 0;
 static uint16_t wl_reqid;
 
 /* Fn2 bulk transfer to/from the fixed FIFO address (incr=0).  Split into
@@ -1077,6 +1083,7 @@ static int wifi_wlcmd(int write, int op, const uint8_t *data, int dlen,
         }
         chan = pkt[5] & 0xF;
         doff = pkt[7];
+        wl_fcmask = pkt[8]; wl_txwindow = pkt[9];   /* tx credit window + flow ctl */
         if (plen > SDPCM_HDR)
             if (wifi_packetrw(0, pkt + SDPCM_HDR, plen - SDPCM_HDR) != 0) return -1;
         if (chan != 0) { wifi_log("[wifi] wlcmd: drained chan %d frame\r\n", chan); continue; }
@@ -1219,6 +1226,7 @@ static int wifi_read_frame(uint8_t *buf, int cap, int *chan, int *doff)
         return 0;                              /* junk; treat as empty */
     *chan = buf[5] & 0xF;
     *doff = buf[7];
+    wl_fcmask = buf[8]; wl_txwindow = buf[9];   /* tx credit window + flow ctl */
     if (plen > SDPCM_HDR)
         if (wifi_packetrw(0, buf + SDPCM_HDR, plen - SDPCM_HDR) != 0) return -1;
     return plen;
@@ -1892,8 +1900,14 @@ static int wifi_do_join(const char *ssid, const char *pass)
 static int wifi_data_tx(const uint8_t *eth, int ethlen)
 {
     static uint8_t pkt[1600];
-    int len = SDPCM_HDR + 4 + ethlen, i;
+    int len = SDPCM_HDR + 4 + ethlen, i, spin;
     if (len > (int)sizeof(pkt)) return -1;
+    /* Respect the fw tx credit window + data-channel flow control; if closed,
+     * drain RX frames (which carry fresh window/fcmask) until it reopens. */
+    for (spin = 0; spin < 60; spin++) {
+        if (!(wl_fcmask & (1 << 2)) && wl_txseq != wl_txwindow) break;
+        { static uint8_t t[2048]; int c, d; if (wifi_read_frame(t, sizeof(t), &c, &d) <= 0) wifi_delay_us(2000); }
+    }
     for (i = 0; i < len; i++) pkt[i] = 0;
     pkt[0] = len & 0xFF; pkt[1] = (len >> 8) & 0xFF;
     pkt[2] = ~len & 0xFF; pkt[3] = (~len >> 8) & 0xFF;
