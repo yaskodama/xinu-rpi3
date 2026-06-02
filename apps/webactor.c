@@ -1557,10 +1557,20 @@ thread webactor_server(void)
             {
                 extern int  wifi_dhcp(void);
                 extern void wifi_dhcp_diag(unsigned char*, unsigned char*, int*);
+                extern void wifi_net_service(void);
+                extern int  wifi_net_active(void);
                 static char dhdr[256], dbody[160];
+                static int  net_started = 0;
                 unsigned char ip[4], gw[4]; int have, rc, blen, hlen;
                 rc = wifi_dhcp();
                 wifi_dhcp_diag(ip, gw, &have);
+                /* once we have an IP, start the ARP/ICMP responder so the host
+                 * can ping/reach us over wlan (idempotent) */
+                if (rc == 0 && have && !net_started && !wifi_net_active()) {
+                    tid_typ nt = create((void *)wifi_net_service, 8192, INITPRIO,
+                                        "wifi-net", 0);
+                    if (nt != SYSERR) { ready(nt, RESCHED_NO); net_started = 1; }
+                }
                 blen = sprintf(dbody, "dhcp rc=%d have_ip=%d ip=%d.%d.%d.%d gw=%d.%d.%d.%d\r\n",
                                rc, have, ip[0],ip[1],ip[2],ip[3], gw[0],gw[1],gw[2],gw[3]);
                 hlen = sprintf(dhdr,

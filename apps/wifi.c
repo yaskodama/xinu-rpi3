@@ -44,7 +44,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b32 (WPA2+DHCP; join retry x4, no body wedge)"
+#define WIFI_BUILD_ID "wifi-stage6-b33 (WPA2+DHCP+ARP/ICMP responder; pingable)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2073,6 +2073,77 @@ int wifi_dhcp(void)
              wifi_dns[0],wifi_dns[1],wifi_dns[2],wifi_dns[3]);
     return 0;
 }
+
+/* ------------------------------------------------------------------ *
+ *  Minimal IP responder: ARP + ICMP echo, so the host can ping us.    *
+ * ------------------------------------------------------------------ */
+static int wifi_ip_eq(const uint8_t *p) {
+    return p[0]==wifi_ip[0] && p[1]==wifi_ip[1] && p[2]==wifi_ip[2] && p[3]==wifi_ip[3];
+}
+
+/* Process one received 802.3 frame; reply to ARP-who-has-us and ICMP echo. */
+static void wifi_handle_frame(uint8_t *fr, int len, int doff)
+{
+    int bdc = 4 + (fr[doff + 3] << 2);
+    uint8_t *e = fr + doff + bdc;            /* 802.3 frame */
+    int elen = len - (doff + bdc), et, i;
+    if (elen < 14) return;
+    et = (e[12] << 8) | e[13];
+
+    if (et == 0x0806 && elen >= 42) {        /* ARP */
+        uint8_t *a = e + 14;
+        int op = (a[6] << 8) | a[7];
+        if (op == 1 && wifi_ip_eq(a + 24)) { /* request for our IP */
+            static uint8_t tx[42];
+            for (i = 0; i < 6; i++) tx[i]     = e[6 + i];   /* dst = requester */
+            for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];/* src = us */
+            tx[12] = 0x08; tx[13] = 0x06;
+            { uint8_t *r = tx + 14;
+              r[0]=0;r[1]=1; r[2]=0x08;r[3]=0; r[4]=6;r[5]=4; r[6]=0;r[7]=2; /* reply */
+              for (i=0;i<6;i++) r[8+i]  = wifi_mac[i];     /* sender mac = us */
+              for (i=0;i<4;i++) r[14+i] = wifi_ip[i];      /* sender ip  = us */
+              for (i=0;i<6;i++) r[18+i] = a[8+i];          /* target mac = requester */
+              for (i=0;i<4;i++) r[24+i] = a[14+i];         /* target ip  = requester */
+            }
+            wifi_data_tx(tx, 42);
+        }
+    } else if (et == 0x0800 && elen >= 14 + 20 + 8) {   /* IPv4 */
+        uint8_t *ip = e + 14;
+        int ihl = (ip[0] & 0x0F) * 4;
+        if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {        /* ICMP to us */
+            uint8_t *ic = ip + ihl;
+            int iptot = (ip[2] << 8) | ip[3];
+            int iclen = iptot - ihl;
+            if (ic[0] == 8 && iclen >= 8 && 14 + iptot <= elen) {  /* echo request */
+                uint8_t m[6]; uint16_t c;
+                for (i=0;i<6;i++){ m[i]=e[i]; e[i]=e[6+i]; e[6+i]=m[i]; }   /* swap eth */
+                for (i=0;i<4;i++){ uint8_t t=ip[12+i]; ip[12+i]=ip[16+i]; ip[16+i]=t; } /* swap IP */
+                ic[0] = 0;                               /* echo reply */
+                ic[2] = ic[3] = 0; c = ip_cksum(ic, iclen, 0); ic[2]=c>>8; ic[3]=c&0xFF;
+                ip[10]=ip[11]=0; c = ip_cksum(ip, ihl, 0); ip[10]=c>>8; ip[11]=c&0xFF;
+                wifi_data_tx(e, 14 + iptot);
+            }
+        }
+    }
+}
+
+/* Network service loop (a thread): poll the WLAN RX FIFO and answer ARP/ICMP.
+ * Started once after DHCP succeeds; sole consumer of chan-2 frames thereafter. */
+static int wifi_net_running = 0;
+void wifi_net_service(void)
+{
+    static uint8_t fr[2048];
+    int chan, doff;
+    wifi_net_running = 1;
+    wifi_log("[wifi] net service: ARP/ICMP responder up on %d.%d.%d.%d\r\n",
+             wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
+    for (;;) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(2000); continue; }
+        if (chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+    }
+}
+int wifi_net_active(void) { return wifi_net_running; }
 
 /* ================================================================== *
  *  Public entry points (called from the HTTP routes in webactor.c)   *
