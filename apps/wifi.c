@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b40 (framebuffer browser window: render http://kodamay.org)"
+#define WIFI_BUILD_ID "wifi-stage6-b41 (browser as a floating window, no full-screen clear)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -2500,6 +2500,7 @@ int wifi_http(const uint8_t *ip, const char *host)
 extern void screenClear(unsigned long);
 extern void fillRect(int, int, int, int, unsigned long, int);
 extern void drawRect(int, int, int, int, unsigned long);
+extern void drawLine(int, int, int, int, unsigned long);
 extern void drawChar(char, int, int, unsigned long);
 #define CHAR_WIDTH_  8     /* matches framebuffer_rpi font cell */
 #define CHAR_HEIGHT_ 12
@@ -2537,8 +2538,10 @@ int wifi_browse(const uint8_t *ip, const char *host)
     static char text[8192];
     const char *body;
     int n, tn, i, col, x, y;
-    const int WX=40, WY=30, WX2=983, WY2=737, TBH=22;   /* 1024x768 window */
-    const int TX0=WX+8, TY0=WY+TBH+6, TXMAX=WX2-8, TYMAX=WY2-14;
+    /* A discrete window centred on the 1024x768 screen — do NOT clear the whole
+     * screen, so it floats as a window over the existing console. */
+    const int WX=160, WY=140, WX2=864, WY2=620, TBH=22;
+    const int TX0=WX+8, TY0=WY+TBH+6, TXMAX=WX2-8, TYMAX=WY2-10;
 
     n = wifi_http(ip, host);                  /* fills wifi_http_buf */
     if (n <= 0) return -1;
@@ -2548,11 +2551,13 @@ int wifi_browse(const uint8_t *ip, const char *host)
     body = body ? body + 4 : wifi_http_buf;
     tn = html_to_text(body, text, sizeof(text));
 
-    /* --- draw the window --- */
-    screenClear(0xFF402000);                          /* desktop: dark blue */
-    fillRect(WX, WY, WX2, WY2, 0xFFFFFFFF, 0);        /* page area: white */
-    drawRect(WX, WY, WX2, WY2, 0xFF000000);
-    fillRect(WX, WY, WX2, WY+TBH, 0xFFC05000, 0);     /* title bar: blue */
+    /* --- draw the window (no full-screen clear: it floats over the console) --- */
+    fillRect(WX+8, WY+8, WX2+8, WY2+8, 0xFF202020, 0); /* drop shadow */
+    fillRect(WX, WY, WX2, WY2, 0xFFFFFFFF, 0);         /* page area: white */
+    fillRect(WX, WY, WX2, WY+TBH, 0xFFC05000, 0);      /* title bar: blue */
+    drawRect(WX,   WY,   WX2,   WY2,   0xFF000000);    /* window border (2px) */
+    drawRect(WX-1, WY-1, WX2+1, WY2+1, 0xFF000000);
+    drawLine(WX, WY+TBH, WX2, WY+TBH, 0xFF000000);     /* title separator */
     { char title[80]; int tl;
       tl = sprintf(title, "Xinu Browser   http://%s/", host);
       for (i = 0; i < tl; i++) drawChar(title[i], WX+8+i*CHAR_WIDTH_, WY+5, 0xFFFFFFFF);
