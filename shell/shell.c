@@ -128,6 +128,9 @@ const struct centry commandtab[] = {
     {"vlanstat", FALSE, xsh_vlanstat},
     {"voip", FALSE, xsh_voip},
     {"webactor", FALSE, xsh_webactor},
+    {"wine", FALSE, xsh_wine},
+    {"wifi", FALSE, xsh_wifi},
+    {"wifi-invest", FALSE, xsh_wifi_invest},
     {"xweb", FALSE, xsh_xweb},
 #endif
     {"?", FALSE, xsh_help}

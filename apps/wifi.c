@@ -45,7 +45,7 @@
  * trace) unambiguously report WHICH kernel is actually running.  The slow
  * SD-swap + power-cycle deploy loop kept leaving a stale kernel resident in
  * RAM; this removes the "is the new code even running?" guesswork. */
-#define WIFI_BUILD_ID "wifi-stage6-b50 (1280x800 + Shell keyboard input via /api/wifi/key)"
+#define WIFI_BUILD_ID "xinu-gwm-b69 (N-Queens push-aggregation: Dispatcher sums partials; /api/loadbal/nqueens-result one-poll total)"
 
 extern int kprintf(const char *, ...);
 extern int _doprnt(const char *fmt, va_list ap, int (*putc)(int, int), int arg);
@@ -1945,6 +1945,14 @@ void wifi_dhcp_diag(uint8_t *ip, uint8_t *gw, int *have) {
     int i; for (i=0;i<4;i++){ ip[i]=wifi_ip[i]; gw[i]=wifi_gw[i]; } *have = wifi_have_ip;
 }
 
+/* Connection state for the on-screen (gwm) WiFi indicator: nonzero once
+ * DHCP has leased an IP, zeroed when a (re)join starts. */
+int wifi_connected(void) { return wifi_have_ip; }
+
+/* SSID of the network we (last) joined — shown under the gwm WiFi mark. */
+static char wifi_cur_ssid[40] = "";
+const char *wifi_ssid(void) { return wifi_cur_ssid; }
+
 /* Build a DHCP packet (DISCOVER if reqip==NULL, else REQUEST) into `out`.
  * Returns total ethernet frame length.  xid identifies our exchange. */
 static int dhcp_build(uint8_t *out, const uint8_t *mac, uint32_t xid,
@@ -2283,6 +2291,84 @@ int wifi_ping(const uint8_t *ip, int count)
     signal(wl_io_sem); wifi_net_pause = 0;
     wifi_log("[wifi] *** ping %d.%d.%d.%d: %d/%d ***\r\n", ip[0],ip[1],ip[2],ip[3], replies, count);
     return replies;
+}
+
+/* Broadcast a few gratuitous ARPs announcing our IP->MAC so the peer /
+ * switch refreshes a stuck "incomplete" ARP entry and can reach us. */
+static void wifi_grat_arp(void)
+{
+    uint8_t tx[42];
+    int i, rep;
+    wifi_net_pause = 1; wifi_delay_us(40000); wait(wl_io_sem);
+    for (rep = 0; rep < 3; rep++) {
+        for (i = 0; i < 6; i++) tx[i]   = 0xFF;            /* dest broadcast */
+        for (i = 0; i < 6; i++) tx[6+i] = wifi_mac[i];     /* src = us       */
+        tx[12] = 0x08; tx[13] = 0x06;                      /* ethertype ARP  */
+        tx[14] = 0x00; tx[15] = 0x01;                      /* htype ethernet */
+        tx[16] = 0x08; tx[17] = 0x00;                      /* ptype IPv4     */
+        tx[18] = 6;    tx[19] = 4;                          /* hlen / plen    */
+        tx[20] = 0x00; tx[21] = 0x02;                      /* op = reply     */
+        for (i = 0; i < 6; i++) tx[22+i] = wifi_mac[i];    /* sender mac     */
+        for (i = 0; i < 4; i++) tx[28+i] = wifi_ip[i];     /* sender ip      */
+        for (i = 0; i < 6; i++) tx[32+i] = 0xFF;           /* target mac     */
+        for (i = 0; i < 4; i++) tx[38+i] = wifi_ip[i];     /* target ip = us */
+        wifi_data_tx(tx, 42);
+        wifi_delay_us(50000);
+    }
+    signal(wl_io_sem); wifi_net_pause = 0;
+}
+
+/* Investigate "connected but ping fails": make sure the responder is up,
+ * refresh the peer's ARP (gratuitous ARP), then probe the gateway from the
+ * Pi3.  Writes a human-readable report (+ remedy / reason) into `out`. */
+int wifi_investigate(char *out, int cap)
+{
+    int len = 0, gw;
+    (void)cap;
+    if (!wifi_have_ip)
+        return sprintf(out, "WiFi not connected -- run 'wifi on' first.\n");
+
+    len += sprintf(out + len,
+        "ip %u.%u.%u.%u  gw %u.%u.%u.%u  mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+        wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3],
+        wifi_gw[0], wifi_gw[1], wifi_gw[2], wifi_gw[3],
+        wifi_mac[0], wifi_mac[1], wifi_mac[2],
+        wifi_mac[3], wifi_mac[4], wifi_mac[5]);
+
+    if (!wifi_net_active()) {
+        wifi_net_service();
+        len += sprintf(out + len, "- responder was down -> started it\n");
+    } else {
+        len += sprintf(out + len, "- ARP/ICMP responder: running\n");
+    }
+
+    /* Keep refreshing the peer's ARP and probing the gateway until the
+     * data path comes up, then stop by ourselves.  Bounded (≈20s max) so
+     * it always terminates even when it cannot be fixed. */
+    {
+        const int MAXATT = 8;
+        int att;
+        for (att = 1; att <= MAXATT; att++) {
+            wifi_grat_arp();
+            gw = wifi_ping(wifi_gw, 2);
+            len += sprintf(out + len, "- try %d/%d: grat-ARP + gw ping = %d/2\n",
+                           att, MAXATT, gw > 0 ? gw : 0);
+            if (gw > 0) break;          /* data path is up -> finished */
+        }
+    }
+
+    if (gw > 0) {
+        len += sprintf(out + len,
+            "RESULT: WiFi data path is UP (gateway reachable); the peer\n"
+            "ARP was refreshed -- ping from your Mac should work now.\n"
+            "(auto-finished on success)\n");
+    } else {
+        len += sprintf(out + len,
+            "RESULT: still no gateway after retries.  Either the BCM43455\n"
+            "data path is stalled ('wifi off' then 'wifi on', or power-\n"
+            "cycle), or the router isolates WiFi clients from the wired Mac.\n");
+    }
+    return len;
 }
 
 /* NTP time client: query an NTP server (UDP/123) through the gateway and
@@ -2752,12 +2838,19 @@ int wifi_desktop(const uint8_t *ip, const char *host,
                  int ax, int ay, int aw, int ah,    /* Actors */
                  int fetch)
 {
-    screenClear(0xFF503820);   /* desktop bg — erases windows' previous positions */
-    if (sw > 40 && sh > 40) draw_shell_win(sx, sy, sx+sw, sy+sh);
-    if (kw > 40 && kh > 40) draw_softkbd(kx, ky, kx+kw, ky+kh);
-    if (pw > 40 && ph > 40) draw_winsys(px, py, px+pw, py+ph);
-    if (aw > 40 && ah > 40) draw_actors(ax, ay, ax+aw, ay+ah);
-    return wifi_browse_xyf(ip, host, bx, by, bw, bh, fetch);   /* browser on top */
+    /* Disabled: the gwm window manager (apps/gwm.c) now owns the HDMI
+     * framebuffer and repaints it every frame.  Hand-drawing a desktop
+     * here would fight gwm, so this is a no-op kept only so the legacy
+     * /api/wifi/desktop endpoint still links.  The interactive Shell now
+     * lives in gwm's "Shell" window, fed via /api/wifi/key. */
+    (void)ip; (void)host;
+    (void)bx; (void)by; (void)bw; (void)bh;
+    (void)kx; (void)ky; (void)kw; (void)kh;
+    (void)sx; (void)sy; (void)sw; (void)sh;
+    (void)px; (void)py; (void)pw; (void)ph;
+    (void)ax; (void)ay; (void)aw; (void)ah;
+    (void)fetch;
+    return 0;
 }
 
 /* Draw the default 3-window layout as the boot-time "initial screen".  The
@@ -2766,17 +2859,8 @@ int wifi_desktop(const uint8_t *ip, const char *host,
  * the /api/wifi/desktop defaults. */
 void wifi_desktop_initial(void)
 {
-    const char *ph = "WiFi not connected yet - use the Py-I design page to load a URL";
-    int i;
-    screenClear(0xFF503820);   /* clean desktop background */
-    /* default 5-window layout for 1280x800 (matches /api/wifi/desktop defaults) */
-    draw_shell_win(720, 20, 720+540, 20+300);
-    draw_actors(720, 340, 720+540, 340+300);
-    draw_winsys(20, 480, 20+680, 480+140);
-    draw_softkbd(20, 640, 20+1240, 640+150);
-    draw_win_frame(20, 20, 20+680, 20+440, "Xinu Browser", 0xFFFFFFFF, 0xFF0050C0);
-    for (i = 0; ph[i] && 28+i*CHAR_WIDTH_ < 692; i++)
-        drawChar(ph[i], 28+i*CHAR_WIDTH_, 50, 0xFF606060);
+    /* Disabled — gwm (apps/gwm.c) owns the HDMI framebuffer now.  Kept as
+     * a no-op so existing references still link. */
 }
 
 /* ================================================================== *
@@ -2821,9 +2905,47 @@ int wifi_scan_json(char *out, int cap)
     return len;
 }
 
+/* Scan and extract up to `max` SSIDs into ssids[][40] (first quoted field
+ * of each "AP N: \"ssid\" ..." trace line).  Returns the count.  Used by
+ * the `wifi on` xsh command to present a numbered pick-list. */
+int wifi_scan_ssids(char ssids[][40], int max)
+{
+    int n = 0, count = 0, i;
+    wifi_tn = 0;
+    if (wifi_bringup() != 0) return 0;
+    wifi_scan(&n);
+    const char *t = wifi_tbuf;
+    for (i = 0; t[i] && count < max; i++) {
+        if (t[i] == 'A' && t[i+1] == 'P' && t[i+2] == ' ') {
+            int j = i;
+            while (t[j] && t[j] != '"' && t[j] != '\n') j++;
+            if (t[j] == '"') {
+                int k = 0; j++;
+                while (t[j] && t[j] != '"' && k < 39) ssids[count][k++] = t[j++];
+                ssids[count][k] = 0;
+                if (k > 0) count++;
+            }
+            while (t[i] && t[i] != '\n') i++;
+        }
+    }
+    return count;
+}
+
+/* Disconnect: bring the BSS down and clear the connected state so the
+ * indicator / `wifi status` show "not connected". */
+void wifi_disconnect(void)
+{
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_have_ip = 0;
+    wifi_cur_ssid[0] = 0;
+}
+
 /* Join (connect to) an access point. */
 int wifi_join(const char *ssid, const char *pass)
 {
+    /* Remember the SSID for the on-screen indicator label. */
+    int i; for (i = 0; i < 38 && ssid[i]; i++) wifi_cur_ssid[i] = ssid[i];
+    wifi_cur_ssid[i] = 0;
     wifi_tn = 0;
     if (wifi_bringup() != 0) return -1;
     return wifi_do_join(ssid, pass);

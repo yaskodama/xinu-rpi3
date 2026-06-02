@@ -901,6 +901,13 @@ static int lb_latency_bucket(long elapsed_ms);
 static lb_task_t lb_tasks[LB_TASKS_MAX];
 static int       lb_tasks_next = 0;     /* round-robin write cursor */
 
+/* N-Queens push-aggregation: workers push `done` to the Dispatcher, which
+ * sums the per-first-column counts here as they arrive — so the Mac reads
+ * one running total instead of polling every task. */
+static volatile int  g_nq_expected = 0;
+static volatile int  g_nq_received = 0;
+static volatile long g_nq_sum      = 0;
+
 static lb_task_t* lb_task_alloc(int task_id, char kind, int param,
                                 int worker_obj) {
   lb_task_t *t = &lb_tasks[lb_tasks_next];
@@ -1051,6 +1058,12 @@ static void Dispatcher_done(int self_id, int sender_id,
     /* Don't overwrite a CANCELLED state — the worker explicitly
      * acknowledged the cancel.  Otherwise mark DONE. */
     if (t->state != LB_STATE_CANCELLED) t->state = LB_STATE_DONE;
+    /* N-Queens push-aggregation: accumulate the partial count here as the
+     * worker reports it (no Mac-side per-task polling needed). */
+    if (t->kind == 'n' && t->state == LB_STATE_DONE) {
+      g_nq_sum += result;
+      g_nq_received++;
+    }
     elapsed = t->done_ms - t->submit_ms;
     if (elapsed < 0) elapsed = 0;
     int worker_obj = dispatcher_worker_obj(self_id, (int)widx);
@@ -1572,6 +1585,21 @@ void abcl_loadbal_submit_nq(int n, int first_col, int task_id) {
   abcl_enqueue(-1, g_loadbal_disp, "submit_nq", 3,
                (value_t[]){ mk_int((long)n), mk_int((long)first_col),
                             mk_int((long)task_id) });
+}
+
+/* N-Queens push-aggregation control (called from the HTTP layer):
+ *  _begin()  reset the accumulator before submitting a job's columns
+ *  _expect() record how many partial results to wait for
+ *  _result() read {expected, received, total}; returns 1 when complete */
+void abcl_loadbal_nq_begin(void) {
+  g_nq_sum = 0; g_nq_received = 0; g_nq_expected = 0;
+}
+void abcl_loadbal_nq_expect(int n) { g_nq_expected = n; }
+int abcl_loadbal_nq_result(int *expected, int *received, long *total) {
+  if (expected) *expected = g_nq_expected;
+  if (received) *received = g_nq_received;
+  if (total)    *total    = g_nq_sum;
+  return (g_nq_expected > 0 && g_nq_received >= g_nq_expected) ? 1 : 0;
 }
 
 /* N-Queens partial counter — counts solutions where the FIRST row's

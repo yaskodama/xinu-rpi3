@@ -13,7 +13,8 @@ Hardware bring-up:
 - **HDMI framebuffer** + console
 - **USB OTG** (DWC2) — keyboard, mouse
 - **USB ethernet** (LAN78xx / LAN7515 onboard NIC) — ping ~3 ms, TCP bidirectional
-- **HDMI window manager** (ported from Pi 5)
+- **WiFi** (BCM43455 over the Arasan SDIO) — scan, WPA2 join, DHCP, ARP/ICMP
+- **HDMI window manager** (ported from Pi 5; interactive `xsh` + WiFi UI)
 - **MMU** — ARMv7-A short-descriptor identity map, RAM vs MMIO region attributes
   enforced (Normal cacheable RAM, Device strongly-ordered MMIO, MMIO no-execute)
 
@@ -51,6 +52,54 @@ Performance work documented in commit history:
   bricks because `tcpSendWindow` overflows to advertising window=0)
 - End-to-end upload: 91 s → 11 s (~8× on 305 KB)
 
+## HDMI desktop, WiFi & GC-backed N-Queens (this branch)
+
+On top of the bring-up above, this branch adds an interactive on-screen
+desktop, a WiFi stack with shell commands, and a GC-backed distributed
+benchmark. Current build tag: `xinu-gwm-b69` (see `WIFI_BUILD_ID` in
+`apps/wifi.c`).
+
+**gwm window manager (HDMI, 1280×800)** — `apps/gwm.c` + `apps/gvideo.c`,
+drawn over the framebuffer that `screenInit` set up. Windows:
+- **Shell** — a *real* `xsh` bound to the `GWINCON0` software console:
+  command output, `ls`, `ps`, `cat`, `wifi`, … all run and print here.
+  stdin is injected over HTTP (`/api/wifi/key`); stdout/stderr render via
+  the window's text ring.
+- **graphics** — a wire-frame 3-D wine glass that tumbles on the X/Y/Z
+  axes; started on demand by the `wine` shell command (30 turns, then
+  idle so it does not steal CPU from the network responder).
+- **AIPL actors / AIPL console / Soft keyboard / Info** — live monitors.
+- **WiFi indicator** (bottom-right): white = not connected, green = up,
+  with the joined SSID printed underneath.
+
+**WiFi (BCM43455 over SDIO)** — scan / WPA2 join / DHCP / ARP+ICMP. Shell
+commands:
+- `wifi status` — connection state (SSID + IP/GW)
+- `wifi on` — scan, list candidate APs, pick one by number, enter the
+  password, connect (join + DHCP)
+- `wifi off` — disconnect
+- `wifi-invest` — when "connected but ping fails", restart the responder,
+  send gratuitous ARP, and retry the gateway probe until it works (then
+  auto-finish), or print the most likely reason
+
+**Distributed N-Queens with actor GC** — the `Dispatcher` + 4 `Worker`
+load balancer solves N-Queens split by first column (one `compute_nq`
+task per column). A `Collector` actor sweeps idle actors periodically
+(`/api/gc-actor/*`). Results are **push-aggregated**: workers push `done`
+to the Dispatcher, which sums the partial counts, so the client reads one
+running total from `/api/loadbal/nqueens-result` instead of polling every
+task. Verified: n=8 → 92, n=9 → 352.
+
+**Mac dashboard** — `src/python-aipl/aipl_dashboard.py` (`--dashboard 8899`)
+serves `/pi3`, a browser mirror of the gwm desktop: the Shell window
+mirrors the real `xsh` ring, keystrokes are proxied to the Pi 3, and the
+WiFi widget scans / connects / shows status. See the Japanese user guide
+in `docs/USERS-GUIDE-JA.md`.
+
+> Note: `webactor` is single-threaded, so heavy on-CPU work (a WiFi scan,
+> a continuous animation, or a big N-Queens run) briefly starves the HTTP
+> control plane. Animations are therefore on-demand and bounded.
+
 ## Quick start
 
 Build:
@@ -58,6 +107,10 @@ Build:
     cd compile
     make PLATFORM=arm-rpi3
     # produces ./xinu.boot (~305 KB)
+
+    # If you changed a shared header (e.g. include/thread.h), libxc is NOT
+    # rebuilt by `make clean` — force it or printf-to-device silently breaks:
+    #   rm -f lib/libxc/*.o lib/libxc.a && make PLATFORM=arm-rpi3
 
 Deploy A — over the network (Pi 3 must already be running a `/kexec`-capable
 build):
@@ -97,11 +150,34 @@ Backup kernels (in case a deploy bricks):
     POST /kexec                            jump to last upload as new kernel
     POST /reboot                           watchdog reset (re-boot from SD)
 
+    WiFi + desktop:
+    GET  /api/wifi/scan                    scan APs (JSON; ~30 s, drops link)
+    GET  /api/wifi/join?ssid=S&pass=P      WPA2 join
+    GET  /api/wifi/dhcp                    DHCP lease
+    GET  /api/wifi/key?c=N                 inject a keystroke into the Shell
+    GET  /api/wifi/shellring               dump the Shell window text ring
+
+    N-Queens + actor GC:
+    GET  /api/loadbal/init                 spawn Dispatcher + 4 Workers
+    GET  /api/gc-actor/init                spawn Collector
+    GET  /api/gc-actor/enable?on=1         enable periodic sweeps
+    GET  /api/gc-actor/stats               GC sweep counters
+    GET  /api/loadbal/nqueens?n=N          submit an N-Queens job (push-agg)
+    GET  /api/loadbal/nqueens-result       one-poll aggregated total
+
 ## Repository layout (fork-specific additions)
 
     apps/cc_mvp.c                            C JIT (Stage 5)
-    apps/abcl_program.c                      AIPL runtime + Dispatcher/Worker classes
+    apps/abcl_program.c                      AIPL runtime + Dispatcher/Worker/Collector
+                                             classes + N-Queens push-aggregation
     apps/webactor.c                          HTTP server with the routes above
+    apps/wifi.c                              BCM43455 WiFi driver + investigate
+    apps/gwm.c / apps/gvideo.c               HDMI window manager + drawing prims
+    device/gwincon/                          windowed-shell console (xsh I/O)
+    shell/xsh_wifi.c / xsh_wifi_invest.c     wifi / wifi-invest commands
+    shell/xsh_wine.c                         wine (3-D wire-frame) command
+    docs/USERS-GUIDE-JA.md                   Japanese user guide
+    docs/nqueens_bench_report.tex/.pdf       N-Queens + GC benchmark report
     apps/sd_block.c                          SD driver stub (doesn't yet work —
                                              needs SDHOST port; see Known limits)
     system/platforms/arm-rpi3/mmu.c          MMU enable/disable

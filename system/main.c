@@ -324,6 +324,26 @@ thread main(void)
     }
 #endif
 
+    /* Windowed xsh shell on the Pi3 HDMI window manager (gwm_main).
+     * GWINCON0 is a SOFTWARE console: stdout/stderr -> gwinconPutc ->
+     * the on-screen "Shell" window text ring; stdin -> gwinconGetc,
+     * fed keystroke-by-keystroke over HTTP (apps/webactor.c
+     * /api/wifi/key -> gwincon_feed()).  Added to the shell pool so the
+     * loop below forks a real shell() bound to it. */
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && defined(GWINCON0) && HAVE_SHELL
+    if (OK == open(GWINCON0))
+    {
+        shelldevs[nshells][0] = GWINCON0;
+        shelldevs[nshells][1] = GWINCON0;
+        shelldevs[nshells][2] = GWINCON0;
+        nshells++;
+    }
+    else
+    {
+        kprintf("WARNING: Can't open GWINCON0\r\n");
+    }
+#endif
+
     /* Start shells  */
 #if HAVE_SHELL
     {

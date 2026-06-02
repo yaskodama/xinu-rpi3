@@ -4,7 +4,7 @@
 COMP = shell
 
 # Source files for this component
-C_FILES = shell.c lexan.c getopt.c
+C_FILES = shell.c lexan.c getopt.c xsh_wine.c xsh_wifi.c xsh_wifi_invest.c
 
 # General shell commands
 C_FILES += xsh_clear.c xsh_date.c xsh_exit.c xsh_halt.c xsh_help.c xsh_reset.c xsh_sleep.c

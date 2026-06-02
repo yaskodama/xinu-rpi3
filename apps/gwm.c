@@ -157,6 +157,166 @@ static void draw_chrome(window_t *w)
 /* Repaint the desktop + every window.  Honours the active clip rectangle,
  * so wm_run() can call it with a tiny clip to refresh just the patch under
  * the cursor without a full-screen (flickery) redraw. */
+/* On-screen WiFi indicator, bottom-right corner of the desktop.  White
+ * fan = not connected; green = connected (DHCP lease held).  When
+ * connected the joined AP's SSID is printed under the mark.  Drawn every
+ * frame in wm_run() in the free band below the windows.  Display only —
+ * AP selection is driven from the Mac /pi3 page. */
+static void draw_wifi_indicator(void)
+{
+    extern int wifi_connected(void);
+    extern const char *wifi_ssid(void);
+    int sw = (int)video_screen_width();
+    int sh = (int)video_screen_height();
+    int conn = wifi_connected();
+    unsigned int col = conn ? 0xFF36D35AU : 0xFFFFFFFFU;   /* green / white */
+    int cx = sw - 24;          /* fan centre x */
+    int by = sh - 32;          /* mark dot baseline (room for SSID below) */
+
+    /* Dark backing box covering the mark + SSID label line. */
+    fill_rect(sw - 152, by - 22, 150, 50, 0xFF182028U);
+    /* Three arcs (approximated by centred bars) + a dot, fanning upward. */
+    fill_rect(cx - 13, by - 18, 26, 2, col);   /* outer */
+    fill_rect(cx - 9,  by - 13, 18, 2, col);   /* middle */
+    fill_rect(cx - 5,  by - 8,  10, 2, col);   /* inner */
+    fill_rect(cx - 2,  by - 3,   4, 4, col);   /* dot */
+    /* SSID under the mark when connected, else a hint. */
+    if (conn && wifi_ssid()[0]) {
+        draw_string_at(sw - 148, by + 8, wifi_ssid(), 0xFFA0E0FFU, 0xFF182028U);
+    } else {
+        draw_string_at(sw - 110, by + 8, "not connected", 0xFF888888U, 0xFF182028U);
+    }
+}
+
+/* ===================================================================
+ * Graphics window: a rotating wire-frame 3-D wine glass.  The `wine`
+ * xsh command calls gwm_start_wine() which spins it 30 full turns.
+ * =================================================================== */
+extern double sin(int);                 /* trig.c — int degrees -> double */
+extern void   draw_line(int, int, int, int, unsigned int);
+
+/* Integer sin/cos (×1024) via a 0..90° table, built once from sin().
+ * Avoids 100s of slow soft-float Taylor calls per frame, which would
+ * otherwise starve the rest of the system during the animation. */
+static int  g_sintab[91];
+static int  g_sininit = 0;
+static int isin(int d)
+{
+    d %= 360; if (d < 0) d += 360;
+    if (d <= 90)  return  g_sintab[d];
+    if (d <= 180) return  g_sintab[180 - d];
+    if (d <= 270) return -g_sintab[d - 180];
+    return -g_sintab[360 - d];
+}
+static int icos(int d) { return isin(d + 90); }
+
+#define WG_NP 8                          /* profile points (bottom..rim)   */
+#define WG_M  10                         /* longitude divisions            */
+/* radius / height ×100 (surface-of-revolution wine-glass profile). */
+static const int wgr[WG_NP] = {42,42, 5, 5,11,34,36,30};
+static const int wgh[WG_NP] = { 0, 4, 4,46,50,62,80,94};
+
+static window_t graphics_win;
+int        g_wine_active = 0;            /* read by xsh `wine` via extern  */
+static int g_wine_ax = 0, g_wine_ay = 0, g_wine_az = 0;  /* X/Y/Z angles   */
+static int g_wine_rot    = 0;            /* completed Y-axis turns          */
+
+void gwm_start_wine(void)
+{
+    g_wine_active = 1;
+    g_wine_ax = g_wine_ay = g_wine_az = 0;
+    g_wine_rot = 0;
+}
+
+static void graphics_draw(window_t *self, unsigned int frame)
+{
+    static int drawn_idle = 0;
+    /* Idle and already painted (and not the clipped cursor repaint): do
+     * nothing.  Normally the glass spins continuously (auto-started at
+     * boot), so this only kicks in if the animation is ever stopped. */
+    if (!g_wine_active && drawn_idle && !g_force_redraw) return;
+    /* Throttle the spin to ~10 fps (every 2nd frame) to keep framebuffer
+     * load low while staying smooth — the cursor repaint still runs. */
+    if (g_wine_active && (frame & 1) && !g_force_redraw) return;
+
+    if (!g_sininit) {
+        for (int k = 0; k <= 90; k++) g_sintab[k] = (int)(sin(k) * 1024.0 + 0.5);
+        g_sininit = 1;
+    }
+
+    int x0 = self->x + 1, y0 = self->y + WM_TITLEBAR_H + 1;
+    int w  = self->width - 2, h = self->height - WM_TITLEBAR_H - 3;
+    int cx = x0 + w / 2, cy = y0 + h / 2;
+    int sc = (h < w ? h : w) * 42 / 100;            /* projection scale */
+    unsigned int col = g_wine_active ? 0xFF80E0FFU : 0xFF5090C0U;
+
+    /* Combined rotation about all three axes (Rx . Ry . Rz). */
+    int cAx = icos(g_wine_ax), sAx = isin(g_wine_ax);
+    int cAy = icos(g_wine_ay), sAy = isin(g_wine_ay);
+    int cAz = icos(g_wine_az), sAz = isin(g_wine_az);
+
+    /* Clear only the glass bounding box (not the whole window) — the
+     * full-window wipe on the uncached framebuffer was the bottleneck.
+     * Box is square-ish since the glass now tumbles on every axis. */
+    fill_rect(cx - 96, cy - 96, 192, 192, 0xFF050810U);
+
+    /* Per-frame scaled radius/height (pixels). */
+    int rsc[WG_NP], hsc[WG_NP], i, j;
+    for (i = 0; i < WG_NP; i++) {
+        rsc[i] = wgr[i] * sc / 100;
+        hsc[i] = (wgh[i] - 50) * sc / 100;
+    }
+    static int px[WG_NP][WG_M], py[WG_NP][WG_M];
+    for (i = 0; i < WG_NP; i++) {
+        for (j = 0; j < WG_M; j++) {
+            int lon = j * (360 / WG_M);
+            int x = rsc[i] * icos(lon) / 1024;       /* glass-local point  */
+            int z = rsc[i] * isin(lon) / 1024;
+            int y = hsc[i];
+            int n1, n2;
+            n1 = (y * cAx - z * sAx) / 1024;          /* Rx */
+            n2 = (y * sAx + z * cAx) / 1024;  y = n1; z = n2;
+            n1 = (x * cAy + z * sAy) / 1024;          /* Ry */
+            n2 = (-x * sAy + z * cAy) / 1024; x = n1; z = n2;
+            n1 = (x * cAz - y * sAz) / 1024;          /* Rz */
+            n2 = (x * sAz + y * cAz) / 1024;  x = n1; y = n2;
+            px[i][j] = cx + x;
+            py[i][j] = cy - y;
+        }
+    }
+    for (j = 0; j < WG_M; j++)                       /* longitude curves */
+        for (i = 0; i < WG_NP - 1; i++)
+            draw_line(px[i][j], py[i][j], px[i+1][j], py[i+1][j], col);
+    for (i = 0; i < WG_NP; i++) {                    /* latitude rings */
+        if (wgr[i] == 0) continue;
+        for (j = 0; j < WG_M; j++) {
+            int j2 = (j + 1) % WG_M;
+            draw_line(px[i][j], py[i][j], px[i][j2], py[i][j2], col);
+        }
+    }
+    /* Title hint / progress (own strip — outside the glass bbox clear). */
+    fill_rect(x0 + 2, y0 + 1, w - 4, 13, 0xFF050810U);
+    if (g_wine_active) {
+        /* "spin N/30" — stops after 30 full Y turns so the WiFi responder
+         * thread gets its CPU back (a never-ending spin starved it). */
+        char b[24]; int n = 0, r = g_wine_rot;
+        const char *p = "spin "; while (*p) b[n++] = *p++;
+        if (r >= 10) b[n++] = '0' + r / 10; b[n++] = '0' + r % 10;
+        b[n++] = '/'; b[n++] = '3'; b[n++] = '0'; b[n] = 0;
+        draw_string_at(x0 + 4, y0 + 2, b, 0xFFFFFF80U, 0xFF050810U);
+        /* Advance each axis a little, at different rates -> tumbling. */
+        g_wine_ax += 6;  if (g_wine_ax >= 360) g_wine_ax -= 360;
+        g_wine_az += 10; if (g_wine_az >= 360) g_wine_az -= 360;
+        g_wine_ay += 16; if (g_wine_ay >= 360) {
+            g_wine_ay -= 360;
+            if (++g_wine_rot >= 30) g_wine_active = 0;   /* done -> idle */
+        }
+    } else {
+        draw_string_at(x0 + 4, y0 + 2, "run 'wine' in xsh", 0xFF607080U, 0xFF050810U);
+    }
+    drawn_idle = !g_wine_active;
+}
+
 static void paint_scene(unsigned int frame)
 {
     int sw = (int)video_screen_width();
@@ -194,6 +354,8 @@ static unsigned char sh_row_dirty[SHW_ROWS];
 static int           sh_cur_row;
 static int           sh_cur_col;
 static int           sh_filled;   /* have we wrapped past the bottom? */
+static int           sh_esc;       /* CSI parser: 0 normal, 1 ESC, 2 ESC[ */
+static int           sh_cr;        /* pending carriage return (\r seen)   */
 
 static window_t sh_win;
 
@@ -209,13 +371,38 @@ static void sh_newline(void)
     for (int r = 0; r < SHW_ROWS; r++) sh_row_dirty[r] = 1;
 }
 
-/* Append one character to the shell text ring (mirrors the Pi5
- * shellwin_record_char): '\n' = newline/scroll, '\r' ignored,
- * '\b'/0x7F = backspace, other control chars dropped, printable
- * appended (wrapping at SHW_COLS). */
+/* Append one character to the shell text ring.  Acts as a tiny VT100:
+ *   - strips CSI escape sequences (ESC '[' ... final) emitted by the
+ *     line editor's redraw (ESC[K clear-to-EOL, ESC[nD cursor-left) so
+ *     they don't show up as literal "[K" / "[3D" garbage;
+ *   - distinguishes a normal line ending "\r\n" (newline) from the line
+ *     editor's "\r"+reprint (carriage return -> rewrite from column 0);
+ *   - '\b'/0x7F backspace, other control chars dropped, printable
+ *     appended (wrapping at SHW_COLS).
+ * The per-char auto-null after each printable means a shorter rewrite
+ * truncates any stale tail, so ESC[K need not be emulated explicitly. */
 void gwin_shell_record(char c)
 {
-    if (c == '\r') return;
+    /* --- CSI escape sequence stripping --- */
+    if (sh_esc == 1) {                       /* saw ESC */
+        sh_esc = (c == '[') ? 2 : 0;
+        return;
+    }
+    if (sh_esc == 2) {                       /* inside ESC[ ... */
+        if (c >= 0x40 && c <= 0x7E) sh_esc = 0;  /* final byte ends CSI */
+        return;                              /* swallow the whole sequence */
+    }
+    if (c == 0x1B) { sh_esc = 1; return; }   /* ESC */
+
+    /* --- carriage return: "\r\n" vs "\r"+rewrite --- */
+    if (sh_cr) {
+        sh_cr = 0;
+        if (c == '\n') { sh_newline(); return; }
+        sh_cur_col = 0;                      /* rewrite this line in place */
+        sh_row_dirty[sh_cur_row] = 1;
+        /* fall through to handle c at column 0 */
+    }
+    if (c == '\r') { sh_cr = 1; return; }
     if (c == '\n') { sh_newline(); return; }
     if (c == 0x08 || c == 0x7F) {            /* BS / DEL */
         if (sh_cur_col > 0) {
@@ -231,6 +418,25 @@ void gwin_shell_record(char c)
     sh_ring[sh_cur_row][sh_cur_col++] = c;
     sh_ring[sh_cur_row][sh_cur_col] = 0;
     sh_row_dirty[sh_cur_row] = 1;
+}
+
+/* Diagnostic: copy the visible shell ring (oldest..newest) into buf as
+ * newline-separated rows.  Returns the number of bytes written.  Used by
+ * the /api/wifi/shellring HTTP endpoint to inspect what the shell has
+ * actually emitted, independent of on-screen rendering. */
+int gwin_shell_dump(char *buf, int max)
+{
+    int n = 0;
+    int have = sh_filled ? SHW_ROWS : sh_cur_row + 1;
+    int start = (sh_cur_row - have + 1 + SHW_ROWS) % SHW_ROWS;
+    for (int i = 0; i < have && n < max - 2; i++) {
+        int r = (start + i) % SHW_ROWS;
+        const char *s = sh_ring[r];
+        for (int k = 0; s[k] && n < max - 2; k++) buf[n++] = s[k];
+        buf[n++] = '\n';
+    }
+    buf[n] = 0;
+    return n;
 }
 
 /* Content callback: repaint only dirty rows (or all rows when
@@ -273,19 +479,17 @@ int gwin_shell_window_open(void)
     static int opened = 0;
     if (opened) return OK;
 
-    /* Reset the ring: all rows empty + dirty so the first frame paints. */
-    for (int r = 0; r < SHW_ROWS; r++) {
-        sh_ring[r][0]  = 0;
-        sh_row_dirty[r] = 1;
-    }
-    sh_cur_row = 0;
-    sh_cur_col = 0;
-    sh_filled  = 0;
+    /* Do NOT clear the ring here: the shell bound to GWINCON0 starts
+     * before gwm_main opens this window and may already have printed its
+     * banner + first prompt into the ring.  The ring is static (zero-
+     * initialised at boot), so just mark every row dirty so the first
+     * frame paints whatever is already there. */
+    for (int r = 0; r < SHW_ROWS; r++) sh_row_dirty[r] = 1;
 
-    sh_win.x = 540;
-    sh_win.y = 40;
-    sh_win.width  = 460;
-    sh_win.height = 680;
+    sh_win.x = 824;
+    sh_win.y = 16;
+    sh_win.width  = 440;
+    sh_win.height = 724;
     {
         const char *t = "Shell";
         int i;
@@ -361,6 +565,8 @@ void wm_run(void)
             chrome_done = newtail;
         }
 
+        draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
+
         /* (b) Erase the cursor at its previously-drawn position by
          * repainting just that 12x12 patch of the scene (desktop + any
          * overlapping window content), then draw the cursor at its new
@@ -400,10 +606,10 @@ static void info_draw(window_t *self, unsigned int frame)
         "BCM2837 Cortex-A53 -- arm-rpi3",
         0xFFCCCCCCU, self->content_bg);
     draw_string_at(self->x + 8, self->y + WM_TITLEBAR_H + 30,
-        "HDMI framebuffer 1024x768 (no USB input yet)",
+        "HDMI framebuffer 1280x800x32",
         0xFF888888U, self->content_bg);
     draw_string_at(self->x + 8, self->y + WM_TITLEBAR_H + 42,
-        "wm thread: cooperative scheduler",
+        "xsh in Shell window -- keys via /api/wifi/key",
         0xFF888888U, self->content_bg);
 }
 
@@ -612,12 +818,12 @@ thread gwm_main(void)
     info_win.draw_content = info_draw;
     wm_add(&info_win);
 
-    /* Soft keyboard window: bottom, below the actor monitor (which ends at
-     * y=456) so the two never overlap. */
+    /* Soft keyboard window: left column, bottom (below the AIPL console,
+     * which ends at y=452) so the two never overlap. */
     softkbd_win.x = 16;
-    softkbd_win.y = 470;
-    softkbd_win.width  = 640;
-    softkbd_win.height = 220;
+    softkbd_win.y = 450;
+    softkbd_win.width  = 420;
+    softkbd_win.height = 290;
     title_set(&softkbd_win, "Soft keyboard");
     softkbd_win.chrome_color = 0xFFFFB060U;
     softkbd_win.title_bg     = 0xFF704020U;
@@ -631,7 +837,7 @@ thread gwm_main(void)
     console_win.x = 16;
     console_win.y = 148;
     console_win.width  = 420;
-    console_win.height = 304;
+    console_win.height = 296;
     title_set(&console_win, "AIPL console (print)");
     console_win.chrome_color = 0xFF80FF80U;
     console_win.title_bg     = 0xFF205020U;
@@ -640,11 +846,11 @@ thread gwm_main(void)
     console_win.draw_content = console_draw;
     wm_add(&console_win);
 
-    /* Actor monitor: right side, tall enough for the whole table. */
+    /* Actor monitor: middle column, top half. */
     actor_win.x = 448;
     actor_win.y = 16;
-    actor_win.width  = 560;
-    actor_win.height = 440;
+    actor_win.width  = 360;
+    actor_win.height = 348;
     title_set(&actor_win, "AIPL actors (live)");
     actor_win.chrome_color = 0xFF60E0A0U;
     actor_win.title_bg     = 0xFF105030U;
@@ -653,8 +859,38 @@ thread gwm_main(void)
     actor_win.draw_content = actor_draw;
     wm_add(&actor_win);
 
+    /* Graphics window: middle column, below the actor monitor.  Shows the
+     * rotating wire-frame 3-D wine glass driven by the `wine` xsh command. */
+    graphics_win.x = 448;
+    graphics_win.y = 372;
+    graphics_win.width  = 360;
+    graphics_win.height = 368;
+    title_set(&graphics_win, "graphics");
+    graphics_win.chrome_color = 0xFFB070E0U;
+    graphics_win.title_bg     = 0xFF402060U;
+    graphics_win.title_fg     = 0xFFFFFFFFU;
+    graphics_win.content_bg   = 0xFF050810U;
+    graphics_win.draw_content = graphics_draw;
+    wm_add(&graphics_win);
+
+    /* Interactive xsh window: right column.  Its text ring is fed by
+     * the shell bound to GWINCON0 (see system/main.c); keystrokes are
+     * injected over HTTP via gwincon_feed().  Opened here so it is part
+     * of the initial full scene paint. */
+    gwin_shell_window_open();
+    /* Diagnostic test line written directly into the ring (bypasses the
+     * shell/GWINCON0 path) to verify the ring -> sh_draw render path. */
+    {
+        const char *t = "[gwm] Shell window ready -- type in the Mac /pi3 page\n";
+        for (int i = 0; t[i]; i++) gwin_shell_record(t[i]);
+    }
+
     /* Start the cursor at the centre of the screen. */
     wm_cursor_set(sw / 2, sh / 2, 1);
+
+    /* The wine glass is drawn statically at boot and only spins when the
+     * `wine` xsh command is run — keeping the WiFi responder thread fed
+     * (a continuous animation starved it).  g_wine_active stays 0 here. */
 
     wm_run();   /* never returns */
     return OK;  /* unreachable — keeps the compiler happy */

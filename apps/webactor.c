@@ -154,9 +154,10 @@ thread webactor_server(void)
     static char reqbuf[WEB_BUFSZ];
     char   msg[256];
     int    n;
-    /* draw the default 3-window layout on the HDMI framebuffer as the initial
-     * screen (Shell + Soft keyboard panels + Browser placeholder). */
-    { extern void wifi_desktop_initial(void); wifi_desktop_initial(); }
+    /* The HDMI framebuffer is owned by the gwm window manager (gwm_main,
+     * system/main.c): it renders the Info / AIPL console / Soft keyboard /
+     * Actors / interactive Shell windows.  We no longer hand-draw a desktop
+     * here — it would fight gwm's per-frame repaint. */
     static const char resp[] =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/plain\r\n"
@@ -1591,17 +1592,91 @@ thread webactor_server(void)
                     "X-Wifi-NtpUnix: %lu\r\nContent-Length: 0\r\n\r\n", t);
                 write(tcpdev, nh, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
             }
-            /* /api/wifi/key?c=N — feed a keystroke (char code) typed in the Mac
-             *   browser into the Shell window and redraw it on the HDMI fb. */
+            /* /api/wifi/key?c=N — inject a keystroke (char code) typed in
+             *   the Mac browser into the windowed xsh shell's stdin
+             *   (GWINCON0 -> gwinconGetc); the shell echoes + runs it, and
+             *   gwm renders the Shell window from the output ring. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/key", 17)) {
-                extern void wifi_shell_key(int);
+                extern void gwincon_feed(int);
                 extern int atoi(const char *);
                 const char *qc = strstr(reqbuf, "c=");
                 static char kh2[80]; int hlen;
-                if (qc) wifi_shell_key(atoi(qc+2));
+                if (qc) gwincon_feed(atoi(qc+2));
                 hlen = sprintf(kh2, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: 0\r\n\r\n");
                 write(tcpdev, kh2, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            /* /api/wifi/shellring — dump the windowed shell's text ring as
+             *   plain text (diagnostic: shows what xsh has actually emitted
+             *   to GWINCON0, independent of on-screen rendering). */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/shellring", 23)) {
+                extern int gwin_shell_dump(char *, int);
+                static char rbuf[3200]; static char rh[128]; int rl, hl;
+                rl = gwin_shell_dump(rbuf, sizeof(rbuf));
+                hl = sprintf(rh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", rl);
+                write(tcpdev, rh, hl); write(tcpdev, rbuf, rl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            /* /api/wifi/putctest — directly exercise the GWINCON0 output
+             *   primitives (putc / fputc) to see which actually reaches the
+             *   shell ring, isolating why printf output is invisible. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/putctest", 22)) {
+                extern devcall putc(int, char);
+                extern int fputc(int, int);
+                const char *p1 = "putc:AB fputc:CD\n";
+                /* putc(GWINCON0, ...) path */
+                putc(GWINCON0, 'p'); putc(GWINCON0, 'u'); putc(GWINCON0, 't');
+                putc(GWINCON0, 'c'); putc(GWINCON0, '=');
+                putc(GWINCON0, 'A'); putc(GWINCON0, 'B'); putc(GWINCON0, '\n');
+                /* fputc(c, GWINCON0) path (what printf uses) */
+                fputc('f', GWINCON0); fputc('p', GWINCON0); fputc('=', GWINCON0);
+                fputc('C', GWINCON0); fputc('D', GWINCON0); fputc('\n', GWINCON0);
+                /* printf path: temporarily point THIS thread's stdout at
+                 * GWINCON0 and printf, exactly like the shell's banner does.
+                 * If this records but the shell's banner does not, the issue
+                 * is shell-context-specific, not the printf/putc machinery. */
+                {
+                    int saved = stdout;
+                    stdout = GWINCON0;
+                    printf("printf=XY z=%d\n", 99);
+                    stdout = saved;
+                }
+                /* fprintf with EXPLICIT device (no stdout macro): isolates
+                 * _doprnt+fputc(device) from the stdout-macro read path. */
+                { extern int fprintf(int, const char *, ...);
+                  fprintf(GWINCON0, "fprintf=GH i=%d\n", 7); }
+                (void)p1;
+                { static char ph[80]; int hl = sprintf(ph,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: 3\r\n\r\nok\n");
+                  write(tcpdev, ph, hl); }
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            /* /api/wifi/shelldiag — report each SHELL thread's stdin/stdout
+             *   device + the GWINCON0 input-ring state, to diagnose whether
+             *   the windowed shell is actually bound to GWINCON0 and whether
+             *   injected keys are being consumed.  (GWINCON0=4, CONSOLE=8.) */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/shelldiag", 23)) {
+                extern void gwincon_input_stat(int*, int*, int*);
+                static char db[1400]; static char dh[128]; int dl = 0, hl, i;
+                int ih = -1, it = -1, ir = -1;
+                gwincon_input_stat(&ih, &it, &ir);
+                dl += sprintf(db+200+dl, "GWINCON0=%d CONSOLE=%d\n", GWINCON0, CONSOLE);
+                dl += sprintf(db+200+dl, "in_ring head=%d tail=%d ready=%d\n", ih, it, ir);
+                for (i = 0; i < NTHREAD; i++) {
+                    if (thrtab[i].state == THRFREE) continue;
+                    if (thrtab[i].name[0] != 'S' || thrtab[i].name[1] != 'H')
+                        continue;   /* SHELL* only */
+                    dl += sprintf(db+200+dl, "tid%d %s %s in=%d out=%d err=%d\n",
+                                  i, thrtab[i].name, state_name(thrtab[i].state),
+                                  thrtab[i].fdesc[0], thrtab[i].fdesc[1],
+                                  thrtab[i].fdesc[2]);
+                }
+                hl = sprintf(dh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", dl);
+                write(tcpdev, dh, hl); write(tcpdev, db+200, dl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
             }
             /* /api/wifi/desktop?... — draw a multi-window desktop (Browser +
              *   Soft keyboard + Shell) at designed geometries on the HDMI fb. */
@@ -1867,6 +1942,27 @@ thread webactor_server(void)
              *   for each to collect partial counts, sums them.
              *   Used by tools/nqueens-bench.py for the Mac+Pi 3
              *   distributed benchmark. */
+            /* /api/loadbal/nqueens-result — the Dispatcher push-aggregates
+             *   each worker's partial count; this returns the running total
+             *   so the Mac polls ONE endpoint instead of every task.
+             *   (Checked BEFORE /nqueens since that prefix also matches.) */
+            if (0 == strncmp(reqbuf, "GET /api/loadbal/nqueens-result",  31) ||
+                0 == strncmp(reqbuf, "POST /api/loadbal/nqueens-result", 32))
+            {
+                extern int abcl_loadbal_nq_result(int *, int *, long *);
+                int exp = 0, rcv = 0, done; long tot = 0;
+                static char nrr[256];
+                done = abcl_loadbal_nq_result(&exp, &rcv, &tot);
+                int bl = sprintf(nrr + 100,
+                    "nqueens-result done=%d received=%d expected=%d total=%ld\r\n",
+                    done, rcv, exp, tot);
+                int hl = sprintf(nrr,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", bl);
+                memcpy(nrr + hl, nrr + 100, bl);
+                write(tcpdev, nrr, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             if (0 == strncmp(reqbuf, "GET /api/loadbal/nqueens",  24) ||
                 0 == strncmp(reqbuf, "POST /api/loadbal/nqueens", 25))
             {
@@ -1913,6 +2009,7 @@ thread webactor_server(void)
                 static int g_nq_next_id = 1;
                 int first_id = g_nq_next_id;
                 int n_submitted = 0;
+                { extern void abcl_loadbal_nq_begin(void); abcl_loadbal_nq_begin(); }
                 if (cols_str[0] == '\0') {
                     /* Default: all columns 0..n-1 */
                     int c;
@@ -1936,10 +2033,11 @@ thread webactor_server(void)
                         if (*p == ',') p++;
                     }
                 }
+                { extern void abcl_loadbal_nq_expect(int); abcl_loadbal_nq_expect(n_submitted); }
                 static char nqresp[300];
                 int blen = sprintf(nqresp + 100,
                     "nqueens n=%d submitted=%d task_id_range=%d..%d\r\n"
-                    "poll /api/loadbal/task?id=K for each, sum result fields\r\n",
+                    "poll /api/loadbal/nqueens-result for the pushed total\r\n",
                     n, n_submitted, first_id, g_nq_next_id - 1);
                 int hlen = sprintf(nqresp,
                                    "HTTP/1.0 200 OK\r\n"

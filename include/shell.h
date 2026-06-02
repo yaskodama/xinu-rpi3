@@ -131,6 +131,9 @@ shellcmd xsh_user(int, char *[]);
 shellcmd xsh_vlanstat(int, char *[]);
 shellcmd xsh_voip(int, char *[]);
 shellcmd xsh_webactor(int, char *[]);
+shellcmd xsh_wine(int, char *[]);
+shellcmd xsh_wifi(int, char *[]);
+shellcmd xsh_wifi_invest(int, char *[]);
 shellcmd xsh_win(int, char *[]);
 shellcmd xsh_xweb(int, char *[]);
 

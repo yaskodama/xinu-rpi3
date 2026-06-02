@@ -25,3 +25,23 @@ devcall gwinconPutc(device *devptr, char ch)
     gwin_shell_record(ch);
     return (uchar)ch;
 }
+
+/**
+ * Write a buffer to the shell window's text ring.  shell_readline()
+ * emits the prompt, character echo and line-redraw via write() (not
+ * putc), so GWINCON0 MUST provide a real write entry — otherwise the
+ * interactive shell produces no visible output.
+ *
+ * @param devptr  device table entry (unused)
+ * @param buf     bytes to record
+ * @param len     number of bytes
+ * @return        number of bytes written
+ */
+devcall gwinconWrite(device *devptr, const void *buf, uint len)
+{
+    const uchar *p = (const uchar *)buf;
+    uint i;
+    (void)devptr;
+    for (i = 0; i < len; i++) gwin_shell_record((char)p[i]);
+    return (devcall)len;
+}

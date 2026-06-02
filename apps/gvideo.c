@@ -198,6 +198,33 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     }
 }
 
+/* Single pixel honouring the viewport-adjusted clip + screen bounds. */
+static void put_px(int sx, int sy, unsigned int color)
+{
+    if (sx < clip_x0 || sx >= clip_x1 || sy < clip_y0 || sy >= clip_y1) return;
+    if (sx < 0 || sy < 0 || sx >= (int)fb_width || sy >= (int)fb_height) return;
+    *(unsigned int *)(fb_base + sy * fb_pitch + sx * 4) = color;
+}
+
+/* Bresenham line in screen coords (viewport + clip applied) — used by the
+ * gwm graphics window's 3-D wireframe. */
+void draw_line(int x0, int y0, int x1, int y1, unsigned int color)
+{
+    if (!fb_ready) return;
+    x0 -= view_x; y0 -= view_y; x1 -= view_x; y1 -= view_y;
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+    int err = adx - ady;
+    for (;;) {
+        put_px(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -ady) { err -= ady; x0 += sx; }
+        if (e2 <  adx) { err += adx; y0 += sy; }
+    }
+}
+
 void draw_rect(int x, int y, int w, int h, unsigned int color)
 {
     /* Express the four edges as 1-px-thick fill_rects — they
