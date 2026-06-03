@@ -518,6 +518,43 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /wifi-adhoc?ssid=NAME&ch=N&n=M — join a MANET ad-hoc (IBSS)
+             * cell on the WiFi as 10.0.0.M.  Control stays on ethernet, so
+             * this returns over the wire even though the WiFi switches to
+             * ad-hoc.  (M12 — 2-node MANET test with the Pi 4.) */
+            if (0 == strncmp(reqbuf, "GET /wifi-adhoc", 15) ||
+                0 == strncmp(reqbuf, "POST /wifi-adhoc", 16))
+            {
+                extern int wifi_adhoc(const char *ssid, int channel, int n);
+                static char assid[40]; int ch = 6, node = 2, rc;
+                const char *url = strchr(reqbuf, ' ');
+                assid[0] = 0;
+                if (NULL != url) {
+                    const char *p = strstr(url, "ssid=");
+                    if (p) { int i = 0; p += 5; while (*p && *p!='&' && *p!=' ' && *p!='\r' && i<39) assid[i++]=*p++; assid[i]=0; }
+                    p = strstr(url, "ch=");
+                    if (p) { p += 3; ch = 0; while (*p>='0'&&*p<='9') ch = ch*10 + (*p++ - '0'); }
+                    p = strstr(url, "n=");
+                    if (p) { p += 2; node = 0; while (*p>='0'&&*p<='9') node = node*10 + (*p++ - '0'); }
+                }
+                if (!assid[0]) { assid[0]='M'; assid[1]='A'; assid[2]='N'; assid[3]='E'; assid[4]='T'; assid[5]=0; }
+                rc = wifi_adhoc(assid, ch, node);
+                {
+                    static char wresp[400];
+                    int blen = sprintf(wresp + 120,
+                                       "adhoc ssid=%s ch=%d ip=10.0.0.%d rc=%d\r\n",
+                                       assid, ch, node, rc);
+                    int hlen = sprintf(wresp,
+                                       "HTTP/1.0 200 OK\r\n"
+                                       "Content-Type: text/plain\r\n"
+                                       "Content-Length: %d\r\n\r\n", blen);
+                    memcpy(wresp + hlen, wresp + 120, blen);
+                    write(tcpdev, wresp, hlen + blen);
+                }
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /upload?dst=NAME — receive a binary file POST body and
              * store in the upload slot.  Pi 4 has nothing equivalent;
              * this is the Pi 3-side groundwork for eventual kernel.img

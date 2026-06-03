@@ -1705,6 +1705,7 @@ static void pbkdf2_sha1(const uint8_t *pass, int plen, const uint8_t *salt, int 
 #define WLC_SET_WSEC_PMK 268
 #define WLC_SET_SSID    26
 #define WLC_GET_BSSID   23
+#define WLC_SET_CHANNEL 30
 
 /* Derive the WPA2 PMK (PBKDF2-SHA1 of passphrase+ssid) and hand it to the
  * firmware's in-dongle supplicant via WLC_SET_WSEC_PMK.
@@ -2190,6 +2191,61 @@ void wifi_net_service(void)
     }
 }
 int wifi_net_active(void) { return wifi_net_running; }
+
+/* ================================================================== *
+ *  M12 — MANET ad-hoc (IBSS): create/join a cell, static IP, respond *
+ * ================================================================== */
+/* Port of the Pi4 wifi_adhoc(): WLC_SET_INFRA 0 (IBSS) + SET_CHANNEL +
+ * SET_SSID (join_params, chanspec_num=0), static IP 10.0.0.<n>/24, then
+ * spawn the ARP/ICMP responder thread so peers can reach this node. */
+int wifi_adhoc(const char *ssid, int channel, int n)
+{
+    uint8_t jp[64], bss[6];
+    int sl = 0, i, t, up = 0;
+    while (ssid[sl] && sl < 32) sl++;
+    wifi_log("[wifi] === ADHOC/IBSS \"%s\" ch=%d ip=10.0.0.%d ===\r\n", ssid, channel, n);
+    if (wifi_bringup() != 0) { wifi_log("[wifi] adhoc: bringup failed\r\n"); return -1; }
+    wifi_radio_up();
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_set_iovar_int("wsec", 0);
+    wifi_set_iovar_int("wpa_auth", 0);
+    wifi_set_iovar_int("auth", 0);
+    wifi_cmd_int(WLC_SET_INFRA, 0);              /* IBSS (ad-hoc) mode */
+    wifi_cmd_int(2, 1);                          /* WLC_UP */
+    wifi_delay_us(100000);
+    wifi_cmd_int(WLC_SET_CHANNEL, (uint32_t)channel);
+    for (i = 0; i < (int)sizeof(jp); i++) jp[i] = 0;
+    jp[0] = sl; for (i = 0; i < sl; i++) jp[4+i] = ssid[i];
+    jp[36]=0x02; jp[37]=0x4d; jp[38]=0x41; jp[39]=0x4e; jp[40]=0x45; jp[41]=0x54;
+    jp[44]=0;                                    /* chanspec_num = 0 */
+    if (wifi_wlcmd(1, WLC_SET_SSID, jp, 48, NULL, 0) != 0) { wifi_log("[wifi] adhoc: SET_SSID failed\r\n"); return -1; }
+    wifi_delay_us(400000);
+    wifi_get_iovar("cur_etheraddr", wifi_mac, 6);
+    wifi_ip[0]=10; wifi_ip[1]=0; wifi_ip[2]=0; wifi_ip[3]=(uint8_t)n;
+    wifi_mask[0]=255; wifi_mask[1]=255; wifi_mask[2]=255; wifi_mask[3]=0;
+    wifi_gw[0]=10; wifi_gw[1]=0; wifi_gw[2]=0; wifi_gw[3]=1;
+    for (i = 0; i < 4; i++) wifi_dns[i] = 0;
+    for (i = 0; i < sl && i < 38; i++) wifi_cur_ssid[i] = ssid[i]; wifi_cur_ssid[i] = 0;
+    wifi_have_ip = 1;
+    for (t = 0; t < 24; t++) {
+        if (wifi_wlcmd(0, WLC_GET_BSSID, NULL, 0, bss, 6) == 0) {
+            int k, nz = 0; for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
+            if (nz) { up = 1;
+                wifi_log("[wifi] adhoc: *** IBSS cell up, BSSID %02x:%02x:%02x:%02x:%02x:%02x ***\r\n",
+                         bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]); break; }
+        }
+        wifi_delay_us(500000);
+    }
+    if (!up) wifi_log("[wifi] adhoc: IBSS not associated yet (no peer / still forming)\r\n");
+    wifi_log("[wifi] mac %02x:%02x:%02x:%02x:%02x:%02x  ip=10.0.0.%d\r\n",
+             wifi_mac[0],wifi_mac[1],wifi_mac[2],wifi_mac[3],wifi_mac[4],wifi_mac[5], n);
+    if (!wifi_net_active()) {                     /* spawn ARP/ICMP responder thread */
+        tid_typ tid = create((void *)wifi_net_service, INITSTK, INITPRIO, "wifi-net", 0);
+        if (tid != SYSERR) { ready(tid, RESCHED_NO); wifi_log("[wifi] adhoc: responder thread up\r\n"); }
+    }
+    wifi_log("[wifi] *** ADHOC up: \"%s\" ch=%d ip=10.0.0.%d (peer-to-peer, no AP) ***\r\n", ssid, channel, n);
+    return 0;
+}
 
 /* Resolve an IP to a MAC via ARP.  PRECONDITION: the net thread is paused
  * (wifi_net_pause=1) so we own the RX FIFO.  Returns 0 + mac on success. */

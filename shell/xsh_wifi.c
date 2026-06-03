@@ -76,6 +76,17 @@ shellcmd xsh_wifi(int nargs, char *args[])
         return 0;
     }
 
+    if (strcmp(args[1], "adhoc") == 0) {        /* MANET ad-hoc (IBSS) node */
+        extern int wifi_adhoc(const char *ssid, int channel, int n);
+        int ch = (nargs >= 4) ? atoi(args[3]) : 6;
+        int node = (nargs >= 5) ? atoi(args[4]) : 2;
+        if (nargs < 3) { printf("Usage: %s adhoc <ssid> [ch] [node]\n", args[0]); return 0; }
+        printf("Joining ad-hoc cell \"%s\" ch=%d as 10.0.0.%d ...\n", args[2], ch, node);
+        if (wifi_adhoc(args[2], ch, node) != 0) { printf("WiFi: adhoc failed\n"); return 0; }
+        printf("WiFi: ad-hoc up, ip 10.0.0.%d (responder running)\n", node);
+        return 0;
+    }
+
     if (strcmp(args[1], "on") == 0) {
         static char ssids[24][40];
         char sel[8], pass[68];
