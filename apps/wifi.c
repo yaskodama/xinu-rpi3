@@ -2112,6 +2112,8 @@ static int wifi_ip_eq(const uint8_t *p) {
 }
 
 /* Process one received 802.3 frame; reply to ARP-who-has-us and ICMP echo. */
+static int aodv_ip_in(uint8_t *e, int elen);   /* M13: AODV control / relay */
+
 static void wifi_handle_frame(uint8_t *fr, int len, int doff)
 {
     int bdc = 4 + (fr[doff + 3] << 2);
@@ -2150,6 +2152,7 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
     } else if (et == 0x0800 && elen >= 14 + 20 + 8) {   /* IPv4 */
         uint8_t *ip = e + 14;
         int ihl = (ip[0] & 0x0F) * 4;
+        if (aodv_ip_in(e, elen)) return;                /* AODV control / relay */
         if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {        /* ICMP to us */
             uint8_t *ic = ip + ihl;
             int iptot = (ip[2] << 8) | ip[3];
@@ -2291,6 +2294,132 @@ static int wifi_nexthop_mac(const uint8_t *dst, uint8_t *mac)
     for (i = 0; i < 4; i++)
         if ((dst[i] & wifi_mask[i]) != (wifi_ip[i] & wifi_mask[i])) onsub = 0;
     return wifi_arp_resolve(onsub ? dst : wifi_gw, mac);
+}
+
+/* ================================================================== *
+ *  M13 — minimal AODV multi-hop routing (port of the Pi4 module)    *
+ * ================================================================== */
+static void wifi_udp_tx(const uint8_t *nh, const uint8_t *dip, int sport, int dport, const uint8_t *p, int plen)
+{
+    static uint8_t tx[1600];
+    int i, udplen = 8 + plen, iptot = 20 + udplen, framelen = 14 + iptot;
+    uint8_t *ip4 = tx + 14, *udp;
+    if (framelen > (int)sizeof(tx)) return;
+    for (i=0;i<6;i++) tx[i]=nh[i];
+    for (i=0;i<6;i++) tx[6+i]=wifi_mac[i];
+    tx[12]=0x08; tx[13]=0x00;
+    for (i=0;i<20;i++) ip4[i]=0;
+    ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=17;
+    for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+    for (i=0;i<4;i++) ip4[16+i]=dip[i];
+    { uint16_t c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF; }
+    udp = ip4+20;
+    udp[0]=sport>>8; udp[1]=sport&0xFF; udp[2]=dport>>8; udp[3]=dport&0xFF;
+    udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;
+    for (i=0;i<plen;i++) udp[8+i]=p[i];
+    wifi_data_tx(tx, framelen);
+}
+#define AODV_PORT  654
+#define AODV_RREQ  1
+#define AODV_RREP  2
+#define AODV_NRT   16
+struct aodv_rt { uint8_t dst[4], nh[4]; uint8_t hops; uint32_t seq; int valid; };
+static struct aodv_rt g_rt[AODV_NRT];
+static uint16_t g_rreqid = 0; static uint32_t g_myseq = 0;
+static uint8_t g_seen_o[8][4]; static uint16_t g_seen_id[8]; static int g_seen_n = 0;
+static int ip4eq(const uint8_t *a, const uint8_t *b){ return a[0]==b[0]&&a[1]==b[1]&&a[2]==b[2]&&a[3]==b[3]; }
+static struct aodv_rt *aodv_find(const uint8_t *d){ int i; for(i=0;i<AODV_NRT;i++) if(g_rt[i].valid&&ip4eq(g_rt[i].dst,d)) return &g_rt[i]; return 0; }
+static void aodv_add(const uint8_t *d, const uint8_t *nh, uint8_t hops, uint32_t seq){
+    struct aodv_rt *r = aodv_find(d); int i;
+    if(!r){ for(i=0;i<AODV_NRT;i++) if(!g_rt[i].valid){ r=&g_rt[i]; break; } }
+    if(!r) r=&g_rt[0];
+    if(r->valid && ip4eq(r->dst,d) && r->hops <= hops) return;
+    for(i=0;i<4;i++){ r->dst[i]=d[i]; r->nh[i]=nh[i]; } r->hops=hops; r->seq=seq; r->valid=1;
+}
+static int aodv_seen(const uint8_t *o, uint16_t id){ int i; for(i=0;i<g_seen_n&&i<8;i++) if(g_seen_id[i]==id&&ip4eq(g_seen_o[i],o)) return 1; return 0; }
+static void aodv_remember(const uint8_t *o, uint16_t id){ int s=g_seen_n%8,i; for(i=0;i<4;i++) g_seen_o[s][i]=o[i]; g_seen_id[s]=id; g_seen_n++; }
+static void aodv_bcast(const uint8_t *p, int n){ uint8_t bc[6]={0xff,0xff,0xff,0xff,0xff,0xff}, bip[4]={255,255,255,255}; wifi_udp_tx(bc, bip, AODV_PORT, AODV_PORT, p, n); }
+static void aodv_send_rreq(const uint8_t *dst){
+    uint8_t p[16]; int i;
+    g_rreqid++; g_myseq++;
+    p[0]=AODV_RREQ; p[1]=g_rreqid; p[2]=g_rreqid>>8;
+    for(i=0;i<4;i++) p[3+i]=wifi_ip[i];
+    for(i=0;i<4;i++) p[7+i]=dst[i];
+    p[11]=g_myseq; p[12]=g_myseq>>8; p[13]=g_myseq>>16; p[14]=g_myseq>>24; p[15]=0;
+    aodv_remember(wifi_ip, g_rreqid);
+    wifi_log("[wifi] aodv: RREQ id=%d for %d.%d.%d.%d\r\n", g_rreqid, dst[0],dst[1],dst[2],dst[3]);
+    aodv_bcast(p, 16);
+}
+static int aodv_ip_in(uint8_t *e, int elen)
+{
+    uint8_t *ip = e+14; int ihl=(ip[0]&0xF)*4, i; uint8_t ipsrc[4], ipdst[4], *l2src = e+6;
+    for(i=0;i<4;i++){ ipsrc[i]=ip[12+i]; ipdst[i]=ip[16+i]; }
+    if (ip[9]==17) {
+        uint8_t *udp = ip+ihl; int dport=(udp[2]<<8)|udp[3];
+        if (dport != AODV_PORT) return 0;
+        { uint8_t *p = udp+8; int type=p[0]; uint8_t orig[4], dst[4], hop=p[15]; uint32_t sq;
+          for(i=0;i<4;i++){ orig[i]=p[3+i]; dst[i]=p[7+i]; }
+          sq = p[11]|(p[12]<<8)|(p[13]<<16)|((uint32_t)p[14]<<24);
+          if (type==AODV_RREQ) {
+              uint16_t rid = p[1]|(p[2]<<8);
+              if (aodv_seen(orig, rid)) return 1;
+              aodv_remember(orig, rid);
+              aodv_add(orig, ipsrc, hop+1, sq);
+              if (ip4eq(dst, wifi_ip)) {
+                  uint8_t r[16]; g_myseq++;
+                  r[0]=AODV_RREP; for(i=0;i<4;i++){ r[3+i]=orig[i]; r[7+i]=wifi_ip[i]; }
+                  r[11]=g_myseq; r[12]=g_myseq>>8; r[13]=g_myseq>>16; r[14]=g_myseq>>24; r[15]=0;
+                  wifi_udp_tx(l2src, ipsrc, AODV_PORT, AODV_PORT, r, 16);
+                  wifi_log("[wifi] aodv: RREQ for me from %d.%d.%d.%d -> RREP\r\n", orig[0],orig[1],orig[2],orig[3]);
+              } else { p[15]=hop+1; aodv_bcast(p, 16); }
+              return 1;
+          } else if (type==AODV_RREP) {
+              aodv_add(dst, ipsrc, hop+1, sq);
+              if (ip4eq(orig, wifi_ip)) {
+                  wifi_log("[wifi] aodv: *** route to %d.%d.%d.%d via %d.%d.%d.%d (%d hop) ***\r\n",
+                           dst[0],dst[1],dst[2],dst[3], ipsrc[0],ipsrc[1],ipsrc[2],ipsrc[3], hop+1);
+              } else {
+                  struct aodv_rt *rr = aodv_find(orig); uint8_t mac[6];
+                  if (rr && wifi_arp_resolve(rr->nh, mac)==0) { p[15]=hop+1; wifi_udp_tx(mac, rr->nh, AODV_PORT, AODV_PORT, p, 16); }
+              }
+              return 1;
+          } }
+        return 1;
+    }
+    if (!ip4eq(ipdst, wifi_ip) && ipdst[0] != 255) {
+        struct aodv_rt *r = aodv_find(ipdst); uint8_t mac[6];
+        if (r && wifi_arp_resolve(r->nh, mac)==0) {
+            for(i=0;i<6;i++) e[i]=mac[i];
+            for(i=0;i<6;i++) e[6+i]=wifi_mac[i];
+            wifi_data_tx(e, elen);
+            wifi_log("[wifi] aodv: relay %d.%d.%d.%d -> nh %d.%d.%d.%d\r\n",
+                     ipdst[0],ipdst[1],ipdst[2],ipdst[3], r->nh[0],r->nh[1],r->nh[2],r->nh[3]);
+        }
+        return 1;
+    }
+    return 0;
+}
+/* Originator: discover a route (RREQ + wait for RREP, reading frames). */
+int wifi_aodv(const uint8_t *dst)
+{
+    static uint8_t fr[2048]; int chan, doff, t, r2;
+    wifi_log("[wifi] === AODV discover %d.%d.%d.%d ===\r\n", dst[0],dst[1],dst[2],dst[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] aodv: no IP (run wifi adhoc first)\r\n"); return -1; }
+    if (aodv_find(dst)) { wifi_log("[wifi] aodv: route already known\r\n"); return 0; }
+    for (r2 = 0; r2 < 4; r2++) {
+        aodv_send_rreq(dst);
+        for (t = 0; t < 80; t++) {
+            int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+            else wifi_delay_us(5000);
+            if (aodv_find(dst)) { struct aodv_rt *r = aodv_find(dst);
+                wifi_log("[wifi] *** AODV route: %d.%d.%d.%d via %d.%d.%d.%d, %d hop ***\r\n",
+                         dst[0],dst[1],dst[2],dst[3], r->nh[0],r->nh[1],r->nh[2],r->nh[3], r->hops);
+                return 0; }
+        }
+    }
+    wifi_log("[wifi] aodv: no route (RREP timeout)\r\n");
+    return -1;
 }
 
 /* ICMP echo client: ping `ip` `count` times.  Returns # replies. */
