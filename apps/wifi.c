@@ -2195,6 +2195,22 @@ void wifi_net_service(void)
 }
 int wifi_net_active(void) { return wifi_net_running; }
 
+/* Spawn the persistent ARP/ICMP responder thread (idempotent) so this node
+ * answers pings on its current wifi_ip.  Same pattern wifi_adhoc() uses; call
+ * it after an AP join+DHCP so an infra-mode WiFi IP becomes reachable too. */
+void wifi_serve_start(void)
+{
+    if (!wifi_net_active()) {
+        tid_typ tid = create((void *)wifi_net_service, INITSTK, INITPRIO,
+                             "wifi-net", 0);
+        if (tid != SYSERR) {
+            ready(tid, RESCHED_NO);
+            wifi_log("[wifi] responder thread up on %d.%d.%d.%d\r\n",
+                     wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
+        }
+    }
+}
+
 /* ================================================================== *
  *  M12 — MANET ad-hoc (IBSS): create/join a cell, static IP, respond *
  * ================================================================== */

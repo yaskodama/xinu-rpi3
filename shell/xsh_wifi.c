@@ -24,6 +24,7 @@ extern int         wifi_scan_ssids(char ssids[][40], int max);
 extern int         wifi_join(const char *ssid, const char *pass);
 extern int         wifi_dhcp(void);
 extern void        wifi_disconnect(void);
+extern void        wifi_serve_start(void);   /* start ARP/ICMP responder -> pingable */
 
 /* Read a line from `fd` into buf (echoing to stdout).  `mask` prints '*'
  * instead of the typed character (for passwords).  Stops on CR/LF. */
@@ -114,6 +115,7 @@ shellcmd xsh_wifi(int nargs, char *args[])
                 printf("WiFi: DHCP failed (no IP).\n");
                 return 0;
             }
+            wifi_serve_start();   /* ARP/ICMP responder -> the AP IP is pingable */
             wifi_show_status();
             return 0;
         }
@@ -143,6 +145,7 @@ shellcmd xsh_wifi(int nargs, char *args[])
             printf("WiFi: DHCP failed (no IP).\n");
             return 0;
         }
+        wifi_serve_start();   /* ARP/ICMP responder -> the AP IP is pingable */
         wifi_show_status();
         return 0;
     }
