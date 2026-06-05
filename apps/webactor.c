@@ -30,6 +30,8 @@
 #include <thread.h>    /* thrtab + NTHREAD for /api/threads route */
 #include <memory.h>    /* memlist for /api/memstat */
 #include "sd_block.h"  /* sd_init / sd_read_block for /sd-test route */
+#include <shell.h>     /* commandtab / lexan for the /shell remote-login route */
+#include <interrupt.h> /* disable()/restore() around ready() in webshell_run    */
 
 /* Latest /upload payload — file-scope so /api/upload-info can read it
  * back.  Single slot (last upload wins).  64 KB is generous enough for
@@ -139,6 +141,107 @@ static void extract_message(const char *req, int reqlen, char *out, int outsz)
             out[j] = *p++;
         out[j] = '\0';
     }
+}
+
+/* ---- remote login: run ONE shell command, capture its console output ----
+ * Mirrors the Pi-4 /shell route.  Reuses the real commandtab + lexan; points
+ * the command's std{out,in,err} at SERIAL0 so everything it printf()s flows
+ * through uartPutc, where the capture tee (uart_capture_begin/end, in
+ * device/uart/uartPutc.c) collects it.  Returns the number of captured bytes
+ * (NUL-terminated).  Login MVP: no pipes / redirection / background, and a
+ * command that reads stdin will block (don't run interactive ones remotely). */
+extern void uart_capture_begin(void);
+extern int  uart_capture_end(char *dst, int max);
+
+static int webshell_run(char *line, char *outbuf, int maxout)
+{
+    char   tokbuf[SHELL_BUFLEN + SHELL_MAXTOK];
+    char  *tok[SHELL_MAXTOK];
+    short  ntok;
+    ushort i;
+    syscall child;
+    irqmask im;
+    int    n;
+
+    if (maxout > 0)
+    {
+        outbuf[0] = '\0';
+    }
+
+    /* Tokenise exactly like the interactive shell.  Pass strlen+1 so the
+     * terminating NUL is inside linelen: lexan treats NUL as end-of-line and
+     * returns cleanly, instead of hitting its "token ran to linelen with no
+     * terminator" SYSERR path (lexan.c) when a command ends flush, e.g. "ps". */
+    ntok = lexan(line, (ushort)(strlen(line) + 1), &tokbuf[0], &tok[0]);
+    if (SYSERR == ntok)
+    {
+        return sprintf(outbuf, "Syntax error.\n");
+    }
+    if (0 == ntok)
+    {
+        return 0;
+    }
+
+    /* Look the first token up in the command table. */
+    for (i = 0; i < ncommand; i++)
+    {
+        if (0 == strcmp(commandtab[i].name, tok[0]))
+        {
+            break;
+        }
+    }
+    if (i >= ncommand)
+    {
+        return sprintf(outbuf, "%s: command not found\n", tok[0]);
+    }
+
+    uart_capture_begin();
+
+    if (commandtab[i].builtin)
+    {
+        /* Run inline, but point this thread's std{out,in,err} at SERIAL0 so
+         * the command's printf() flows through uartPutc and is captured. */
+        int sout = stdout, sin = stdin, serr = stderr;
+        stdin = SERIAL0;
+        stdout = SERIAL0;
+        stderr = SERIAL0;
+        (*commandtab[i].procedure) (ntok, tok);
+        stdin = sin;
+        stdout = sout;
+        stderr = serr;
+    }
+    else
+    {
+        /* Spawn the command as its own thread (like the shell does) and join.
+         * kill() send()s the child's tid to its parent, and we ARE the parent
+         * (create records parent = gettid()), so receive() wakes on finish. */
+        child = create(commandtab[i].procedure, SHELL_CMDSTK, SHELL_CMDPRIO,
+                       commandtab[i].name, 2, ntok, tok);
+        if (SYSERR == child)
+        {
+            n = uart_capture_end(outbuf, maxout - 1);
+            outbuf[n] = '\0';
+            return n + sprintf(outbuf + n, "Cannot create.\n");
+        }
+        thrtab[child].fdesc[0] = SERIAL0;
+        thrtab[child].fdesc[1] = SERIAL0;
+        thrtab[child].fdesc[2] = SERIAL0;
+        while (recvclr() != NOMSG)
+        {
+            ;
+        }
+        im = disable();
+        ready(child, RESCHED_YES);
+        restore(im);
+        while (receive() != child)
+        {
+            ;
+        }
+    }
+
+    n = uart_capture_end(outbuf, maxout - 1);
+    outbuf[n] = '\0';
+    return n;
 }
 
 /* HTTP server thread: accept one connection at a time, deliver the message to
@@ -325,6 +428,70 @@ thread webactor_server(void)
                                    "\r\n", blen);
                 memcpy(cresp + hlen, cresp + 100, blen);
                 write(tcpdev, cresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /shell?cmd=<urlenc> — remote login: run a Xinu shell command
+             * and return its console output (e.g. /shell?cmd=ps).  Mirrors the
+             * Pi-4 /shell route.  Same trust model as /compile (LAN, no auth). */
+            if (0 == strncmp(reqbuf, "GET /shell", 10) ||
+                0 == strncmp(reqbuf, "POST /shell", 11))
+            {
+                static char shcmd[512];
+                static char shresp[8900];
+                int clen;
+                shcmd[0] = '\0';
+                /* Pull cmd= out of the query string, URL-decoding %XX and '+'. */
+                {
+                    const char *url = strchr(reqbuf, ' ');
+                    const char *p = (NULL != url) ? strstr(url, "cmd=") : NULL;
+                    if (NULL != p)
+                    {
+                        int o = 0;
+                        p += 4;
+                        while (*p && *p != ' ' && *p != '&' &&
+                               *p != '\r' && *p != '\n' &&
+                               o < (int)sizeof(shcmd) - 1)
+                        {
+                            char c = *p;
+                            if (c == '+')
+                            {
+                                c = ' ';
+                                p++;
+                            }
+                            else if (c == '%' && p[1] && p[2])
+                            {
+                                int hi = p[1], lo = p[2];
+                                hi = (hi >= '0' && hi <= '9') ? hi - '0'
+                                     : ((hi | 0x20) - 'a' + 10);
+                                lo = (lo >= '0' && lo <= '9') ? lo - '0'
+                                     : ((lo | 0x20) - 'a' + 10);
+                                c = (char)((hi << 4) | lo);
+                                p += 3;
+                            }
+                            else
+                            {
+                                p++;
+                            }
+                            shcmd[o++] = c;
+                        }
+                        shcmd[o] = '\0';
+                    }
+                }
+                if (shcmd[0] == '\0')
+                    clen = sprintf(shresp + 100,
+                                   "usage: /shell?cmd=<command>   e.g. /shell?cmd=ps\n");
+                else
+                    clen = webshell_run(shcmd, shresp + 100,
+                                        (int)sizeof(shresp) - 100 - 1);
+                int hlen = sprintf(shresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", clen);
+                memcpy(shresp + hlen, shresp + 100, clen);
+                write(tcpdev, shresp, hlen + clen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;

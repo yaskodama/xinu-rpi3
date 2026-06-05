@@ -61,7 +61,7 @@ static void wifi_show_status(void)
 shellcmd xsh_wifi(int nargs, char *args[])
 {
     if (nargs < 2) {
-        printf("Usage: %s on|off|status\n", args[0]);
+        printf("Usage: %s on [ssid pass]|off|status\n", args[0]);
         return 0;
     }
 
@@ -97,6 +97,27 @@ shellcmd xsh_wifi(int nargs, char *args[])
             printf("(run 'wifi off' first to switch networks)\n");
             return 0;
         }
+
+        /* Non-interactive form: `wifi on <ssid> [pass]`.  Skips the scan +
+         * number/password prompts so the command can be driven from the
+         * remote-login /shell route (which has no stdin).  Blank/omitted
+         * pass = open network. */
+        if (nargs >= 3) {
+            const char *jssid = args[2];
+            const char *jpass = (nargs >= 4) ? args[3] : "";
+            printf("Connecting to \"%s\"...\n", jssid);
+            if (wifi_join(jssid, jpass) != 0) {
+                printf("WiFi: join failed.\n");
+                return 0;
+            }
+            if (wifi_dhcp() != 0 || !wifi_connected()) {
+                printf("WiFi: DHCP failed (no IP).\n");
+                return 0;
+            }
+            wifi_show_status();
+            return 0;
+        }
+
         printf("Scanning for access points (~30s; the radio drops briefly)...\n");
         n = wifi_scan_ssids(ssids, 24);
         if (n <= 0) { printf("No access points found.\n"); return 0; }
@@ -126,7 +147,7 @@ shellcmd xsh_wifi(int nargs, char *args[])
         return 0;
     }
 
-    printf("Usage: %s on|off|status\n", args[0]);
+    printf("Usage: %s on [ssid pass]|off|status\n", args[0]);
     return 0;
 }
 
