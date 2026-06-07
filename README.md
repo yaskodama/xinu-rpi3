@@ -7,6 +7,12 @@ on real hardware.  Branch: `arm-rpi3-port`.
 > Japanese-language developer log: see [`NEXT_SESSION.md`](NEXT_SESSION.md).
 > The upstream Embedded Xinu README starts at section "Embedded Xinu" below.
 
+![Xinu Pi3 window system running on a Raspberry Pi 3 B+](docs/boot-screen.jpg)
+
+*Embedded Xinu booted on a real Raspberry Pi 3 B+: HDMI window system with live
+actor table, AIPL console, shell (`xsh`), soft keyboard, and a rotating 3D
+wine-glass wireframe in the graphics window.*
+
 ## What works on this fork
 
 Hardware bring-up:
