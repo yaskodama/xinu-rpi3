@@ -78,6 +78,16 @@ void nulluser(void)
         measured_boot_print();
     }
 
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    /* Bring up the HDMI framebuffer via the VideoCore mailbox.  Done here
+     * (rather than in start.S like the Pi1 path) so the serial console is
+     * already usable and a mailbox stall would be visible on UART. */
+    {
+        extern void screenInit(void);
+        screenInit();
+    }
+#endif
+
     /* General initialization  */
     sysinit();
 

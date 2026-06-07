@@ -37,6 +37,13 @@ void screenInit() {
 	screenClear(background);
     initlinemap();
     screen_initialized = TRUE;
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    /* Draw a banner so the HDMI output is obviously alive on the Pi3. */
+    fbprintf("\n  Embedded XINU  --  Raspberry Pi 3 (arm-rpi3)\n"
+             "  HDMI framebuffer %dx%d %d-bit is alive!\n"
+             "  serial console: xsh on UART0 @ 115200\n",
+             DEFAULT_WIDTH, DEFAULT_HEIGHT, BIT_DEPTH);
+#endif
 }
 
 /* Initializes the framebuffer used by the GPU. Returns OK on success; SYSERR on failure. */
@@ -55,7 +62,15 @@ int framebufferInit() {
 	frame.address = 0; //always initializes to 0x48006000
 	frame.size = 0;
 
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    /* Pass the struct's UNCACHED bus alias (0xC0000000 | phys).  Xinu runs
+     * with the D-cache off, so CPU writes are already in RAM; giving the GPU
+     * the uncached alias makes it read RAM directly instead of a stale GPU-L2
+     * view (the 0x0 cached alias), which left address/size = 0. */
+    mailboxWrite(physToBus(&frame));
+#else
     mailboxWrite((ulong)&frame);
+#endif
 
 	ulong result = mailboxRead();
 
@@ -68,7 +83,13 @@ int framebufferInit() {
 	}
 
     /* Initialize global variables */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    /* The GPU returns a VideoCore bus address; mask to the ARM physical
+     * address (the 0xC0000000 uncached bus alias maps to phys & 0x3FFFFFFF). */
+    framebufferAddress = frame.address & 0x3FFFFFFF;
+#else
     framebufferAddress = frame.address;
+#endif
     rows = frame.height_p / CHAR_HEIGHT;
     cols = frame.width_p / CHAR_WIDTH;
     pitch = frame.pitch;
@@ -78,6 +99,19 @@ int framebufferInit() {
     foreground = WHITE;
     minishell = FALSE;
 	return OK;
+}
+
+/* Clear the framebuffer console and move the cursor home.  Called by the
+ * keyboard shell before each command runs, so every command's output starts
+ * on a fresh screen and is fully visible (smooth scrolling is impractical
+ * here because the GPU framebuffer cannot be read back with the D-cache
+ * off). */
+void fbConsoleClear(void) {
+    if (screen_initialized) {
+        screenClear(background);
+        cursor_row = 0;
+        cursor_col = 0;
+    }
 }
 
 /* Very heavy handed clearing of the screen to a single color. */

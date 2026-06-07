@@ -14,6 +14,32 @@
 
 static void print_os_info(void);
 
+#if NETHER
+/* Open all ethernet devices.  Runs in its own thread (spawned from main())
+ * because etherOpen() -> smsc9512_wait_device_attached() waits with NO timeout
+ * for the USB ethernet to enumerate; doing it inline in main() blocks the rest
+ * of boot (including the CONSOLE serial shell) whenever USB enumeration is slow,
+ * which looks like a hang partway through the banner.  Needs a large stack:
+ * lan78xx_open()'s bring-up chain (USB control transfers + MII polling) is deep
+ * and overflowed an 8 KB stack. */
+static void eth_open_all(void)
+{
+    uint i;
+
+    for (i = 0; i < NETHER; i++)
+    {
+        if (SYSERR == open(ethertab[i].dev->num))
+        {
+            kprintf("WARNING: Failed to open %s\r\n", ethertab[i].dev->name);
+        }
+        else
+        {
+            kprintf("[eth] %s opened\r\n", ethertab[i].dev->name);
+        }
+    }
+}
+#endif /* NETHER */
+
 /**
  * Main thread.  You can modify this routine to customize what Embedded Xinu
  * does when it starts up.  The default is designed to do something reasonable
@@ -150,19 +176,22 @@ thread main(void)
         }
     }
 
-    /* Open all ethernet devices */
+    /* Open all ethernet devices.  On Pi3 B+, ETH0 is the onboard LAN78xx
+     * (LAN7515): the link comes up, RX receives frames, and the system stays
+     * responsive (an earlier "hang" was actually the host reading the wrong
+     * serial device).  Opening ETH0 here brings up link + RX/TX so `netup
+     * ETH0` can run DHCP. */
 #if NETHER
+    /* Bring ethernet up in a background thread (64 KB stack) so a slow USB
+     * enumeration can't block boot, notably the CONSOLE shell created below. */
+    ready(create((void *)eth_open_all, 65536, INITPRIO, "ethopen", 0),
+          RESCHED_NO);
+    /* Auto-start: wait for ETH0, bring up the static IP, and launch the
+     * web->AIPL-actor bridge (apps/webactor.c) — no manual netup/webactor. */
     {
-        uint i;
-
-        for (i = 0; i < NETHER; i++)
-        {
-            if (SYSERR == open(ethertab[i].dev->num))
-            {
-                kprintf("WARNING: Failed to open %s\r\n",
-                        ethertab[i].dev->name);
-            }
-        }
+        extern thread webactor_autostart(void);
+        ready(create((void *)webactor_autostart, 8192, INITPRIO, "webauto", 0),
+              RESCHED_NO);
     }
 #endif /* NETHER */
 
@@ -185,8 +214,11 @@ thread main(void)
   #warning "No TTY for SERIAL0"
 #endif
 
-    /* Set up the second TTY (TTY1) if possible  */
-#if defined(TTY1)
+    /* Set up the second TTY (TTY1) if possible.  Skipped on Pi3: the window
+     * manager (gwm_main) now owns the HDMI framebuffer and repaints it every
+     * frame, so a TTY1/KBDMON0 shell writing to the same framebuffer would
+     * just fight it.  The USB keyboard is routed into the WM instead. */
+#if defined(TTY1) && !defined(_XINU_PLATFORM_ARM_RPI3_)
   #if defined(KBDMON0)
     /* Associate TTY1 with keyboard and use framebuffer output  */
     if (OK == open(TTY1, KBDMON0))
@@ -292,6 +324,26 @@ thread main(void)
     }
 #endif
 
+    /* Windowed xsh shell on the Pi3 HDMI window manager (gwm_main).
+     * GWINCON0 is a SOFTWARE console: stdout/stderr -> gwinconPutc ->
+     * the on-screen "Shell" window text ring; stdin -> gwinconGetc,
+     * fed keystroke-by-keystroke over HTTP (apps/webactor.c
+     * /api/wifi/key -> gwincon_feed()).  Added to the shell pool so the
+     * loop below forks a real shell() bound to it. */
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && defined(GWINCON0) && HAVE_SHELL
+    if (OK == open(GWINCON0))
+    {
+        shelldevs[nshells][0] = GWINCON0;
+        shelldevs[nshells][1] = GWINCON0;
+        shelldevs[nshells][2] = GWINCON0;
+        nshells++;
+    }
+    else
+    {
+        kprintf("WARNING: Can't open GWINCON0\r\n");
+    }
+#endif
+
     /* Start shells  */
 #if HAVE_SHELL
     {
@@ -311,6 +363,18 @@ thread main(void)
                 kprintf("WARNING: Failed to create %s", name);
             }
         }
+    }
+#endif
+
+    /* Auto-launch the ported Pi5 window manager on arm-rpi3.  Renders
+     * the desktop + windows + soft keyboard on the HDMI framebuffer
+     * (already brought up by screenInit() at boot).  Generous stack:
+     * the framebuffer render chain is deep on Cortex-A53. */
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+    {
+        extern thread gwm_main(void);
+        ready(create((void *)gwm_main, 65536, INITPRIO, "GWM", 0),
+              RESCHED_NO);
     }
 #endif
 

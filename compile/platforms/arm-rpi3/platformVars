@@ -1,0 +1,48 @@
+#
+# Platform-specific Makefile definitions for the Raspberry Pi port of Embedded
+# Xinu.
+#
+
+
+# Include default ARM definitions
+include arch/arm/platformVars
+
+PLATFORM_NAME := Raspberry Pi
+
+# Target the Cortex-A53 used on the BCM2837 (Raspberry Pi 3), running in
+# 32-bit AArch32 mode.  -marm forces ARM (not Thumb) like the Pi1 build.
+# -mno-unaligned-access: with the MMU off, ARMv8-AArch32 treats all memory as
+# Strongly-Ordered, where unaligned accesses ALWAYS fault (independent of
+# SCTLR.A).  Xinu/gcc otherwise emit unaligned 16/32-bit loads (e.g. USB
+# descriptor fields at odd offsets), which data-aborted during enumeration on
+# the Pi3 (Pi1's ARMv6 tolerated them).  This forces byte-wise access instead.
+CFLAGS   += -mcpu=cortex-a53 -marm -mno-unaligned-access
+ASFLAGS  += -mcpu=cortex-a53
+
+# Keep _ARM_RPI_ so existing Pi source paths compile, and add an
+# _ARM_RPI3_ define for any Pi3-specific code.
+DEFS     += -D_XINU_PLATFORM_ARM_RPI_ -D_XINU_PLATFORM_ARM_RPI3_
+
+# Embedded Xinu components to build into the kernel image
+APPCOMPS := apps      \
+            mailbox   \
+            network   \
+            shell     \
+            test
+
+# Embedded Xinu device drivers to build into the kernel image
+DEVICES  := ethloop         \
+            raw             \
+            smsc9512        \
+            tcp             \
+            telnet          \
+            uart-pl011      \
+            framebuffer_rpi \
+            udp             \
+            usb             \
+            usbkbd          \
+            usbmouse        \
+            gwincon         \
+            loopback        \
+            ramdisk         \
+            tty

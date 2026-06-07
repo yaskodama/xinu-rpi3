@@ -13,7 +13,11 @@
 /* Size contstants */
 #define SHELL_BUFLEN  160       /**< length of general buffer           */
 #define SHELL_MAXTOK  32        /**< maximum tokens per line            */
-#define SHELL_CMDSTK  8192      /**< size of command proc. stack        */
+#define SHELL_CMDSTK  65536     /**< size of command proc. stack.  Pi3
+                                     (Cortex-A53) frames are large and the
+                                     framebuffer render chain is deep, so the
+                                     old 8 KB overflowed when a command wrote
+                                     to the HDMI console (ps truncated). */
 #define SHELL_CMDPRIO 20        /**< command process priority           */
 
 /* Message constants */
@@ -126,6 +130,11 @@ shellcmd xsh_usbinfo(int, char *[]);
 shellcmd xsh_user(int, char *[]);
 shellcmd xsh_vlanstat(int, char *[]);
 shellcmd xsh_voip(int, char *[]);
+shellcmd xsh_webactor(int, char *[]);
+shellcmd xsh_wine(int, char *[]);
+shellcmd xsh_wifi(int, char *[]);
+shellcmd xsh_wifi_invest(int, char *[]);
+shellcmd xsh_win(int, char *[]);
 shellcmd xsh_xweb(int, char *[]);
 
 /* Filesystem commands */

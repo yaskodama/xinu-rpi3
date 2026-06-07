@@ -1,0 +1,254 @@
+// nqueens_distributed_xinu.abcl — Pi 3 (Embedded Xinu) 用 N-Queens 分散版
+//
+// 規約 (全て遵守):
+//   - global は actor 識別子のみ (var x = new Class();)
+//   - 全ての関数・変数は class 内に閉じる
+//   - 型推論フリー: フィールド・引数・戻り値すべてに型注釈
+//   - メッセージ送信は `send actor.method(...)` のみ
+//     (Xinu の AIPL runtime は now / future 未サポートのため
+//      返値は send による callback パターンで返す)
+//
+// 構造:
+//   class Worker      — 一つの first_col 部分木を計算
+//   class Dispatcher  — 4 Worker への round-robin 振分け + done 集約
+//   class Collector   — 周期 GC sweep + 期限切れタスクの cancel
+//   class Orchestrator — 4 Worker + Dispatcher + Collector の bootstrap
+//                       (アクター起動とワイヤリングを一手に)
+//
+// Mac から /actor/send 経由で Orchestrator.nqueens_run(N) を投げ、
+// Orchestrator.get(k) を polling して結果を取り出す想定。
+// (現状の Pi 3 ビルドは abcl_program.c 内で同等の C を直接持つので
+//  本ファイルは canonical な仕様書として機能する。)
+
+class Worker {
+  var my_idx        : int = 0;
+  var dispatcher    : any = 0;
+  var done_count    : int = 0;
+  var busy_ms_total : int = 0;
+  var last_n        : int = 0;
+  var last_result   : int = 0;
+
+  /* O(N!) の解数カウンタ。フィールドは持たず純関数として呼ぶ。 */
+  function safe(cols: any, row: int, c: int) -> int {
+    var i : int = 0;
+    while (i < row) do {
+      var p : int = array_get(cols, i);
+      if (p == c)            { return 0; }
+      if (p - c == row - i)  { return 0; }
+      if (c - p == row - i)  { return 0; }
+      i = i + 1;
+    }
+    return 1;
+  }
+
+  function nq_recurse(cols: any, n: int, row: int) -> int {
+    if (row == n) { return 1; }
+    var count : int = 0;
+    var c     : int = 0;
+    while (c < n) do {
+      if (safe(cols, row, c)) {
+        var cols2 : any = array_set(cols, row, c);
+        count = count + nq_recurse(cols2, n, row + 1);
+      }
+      c = c + 1;
+    }
+    return count;
+  }
+
+  function nq_partial(n: int, first_col: int) -> int {
+    var cols[16];
+    var cols2 : any = array_set(cols, 0, first_col);
+    return nq_recurse(cols2, n, 1);
+  }
+
+  /* 起動直後に Dispatcher から呼ばれる: 自分のスロット番号 + 振分け元 */
+  method bind(idx: int, disp: any) {
+    my_idx     = idx;
+    dispatcher = disp;
+  }
+
+  /* Dispatcher から振り分けられた N-Queens 部分タスク。
+     計算結果を `send dispatcher.done(...)` で非同期返却する
+     (Xinu AIPL は now/future 無いので callback 一択)。*/
+  method compute_nq(n: int, first_col: int, task_id: int) {
+    var t0     : int = now_ms();
+    var result : int = nq_partial(n, first_col);
+    var dt     : int = now_ms() - t0;
+    last_n        = n;
+    last_result   = result;
+    done_count    = done_count + 1;
+    busy_ms_total = busy_ms_total + dt;
+    send dispatcher.done(my_idx, task_id, result);
+  }
+}
+
+class Dispatcher {
+  var n_workers    : int = 0;
+  /* worker のアクター識別子。`any` は actor handle 用の型 escape */
+  var w0 : any = 0;  var w1 : any = 0;
+  var w2 : any = 0;  var w3 : any = 0;
+  /* 各 worker の現在 in-flight 数 */
+  var load0 : int = 0;  var load1 : int = 0;
+  var load2 : int = 0;  var load3 : int = 0;
+  /* 各 worker の有効/無効 (bit i) — Mac から pause/resume 可能 */
+  var enabled_mask : int = 15;       /* 0xF = 全 enabled */
+  /* カウンタと round-robin カーソル */
+  var submitted    : int = 0;
+  var completed    : int = 0;
+  var rr_cursor    : int = 0;
+  var dropped_paused : int = 0;
+
+  /* Worker は同じスロット番号で enabled かを判定する純関数 */
+  function is_enabled(slot: int) -> int {
+    /* (enabled_mask >> slot) & 1 を if-cascade で展開 */
+    if (slot == 0) { if ((enabled_mask & 1)  != 0) { return 1; } return 0; }
+    if (slot == 1) { if ((enabled_mask & 2)  != 0) { return 1; } return 0; }
+    if (slot == 2) { if ((enabled_mask & 4)  != 0) { return 1; } return 0; }
+    if (slot == 3) { if ((enabled_mask & 8)  != 0) { return 1; } return 0; }
+    return 0;
+  }
+
+  /* enabled な worker を round-robin で 1 つ返す。
+     見つからなければ -1 (= 全 paused) */
+  function pick_slot() -> int {
+    var tries : int = 0;
+    while (tries < n_workers) do {
+      var s : int = rr_cursor % n_workers;
+      rr_cursor = rr_cursor + 1;
+      if (is_enabled(s)) { return s; }
+      tries = tries + 1;
+    }
+    return -1;
+  }
+
+  method register_workers(a: any, b: any, c: any, d: any) {
+    w0 = a;  w1 = b;  w2 = c;  w3 = d;
+    n_workers = 4;
+  }
+
+  method set_enabled(slot: int, on: int) {
+    if (on != 0) {
+      if (slot == 0) { enabled_mask = enabled_mask | 1; }
+      if (slot == 1) { enabled_mask = enabled_mask | 2; }
+      if (slot == 2) { enabled_mask = enabled_mask | 4; }
+      if (slot == 3) { enabled_mask = enabled_mask | 8; }
+    } else {
+      if (slot == 0) { enabled_mask = enabled_mask - (enabled_mask & 1); }
+      if (slot == 1) { enabled_mask = enabled_mask - (enabled_mask & 2); }
+      if (slot == 2) { enabled_mask = enabled_mask - (enabled_mask & 4); }
+      if (slot == 3) { enabled_mask = enabled_mask - (enabled_mask & 8); }
+    }
+  }
+
+  method submit_nq(n: int, first_col: int, task_id: int) {
+    var slot : int = pick_slot();
+    if (slot < 0) {
+      dropped_paused = dropped_paused + 1;
+      return;
+    }
+    submitted = submitted + 1;
+    if (slot == 0) { load0 = load0 + 1;
+                     send w0.compute_nq(n, first_col, task_id); }
+    if (slot == 1) { load1 = load1 + 1;
+                     send w1.compute_nq(n, first_col, task_id); }
+    if (slot == 2) { load2 = load2 + 1;
+                     send w2.compute_nq(n, first_col, task_id); }
+    if (slot == 3) { load3 = load3 + 1;
+                     send w3.compute_nq(n, first_col, task_id); }
+  }
+
+  method done(widx: int, task_id: int, result: int) {
+    completed = completed + 1;
+    if (widx == 0) { load0 = load0 - 1; }
+    if (widx == 1) { load1 = load1 - 1; }
+    if (widx == 2) { load2 = load2 - 1; }
+    if (widx == 3) { load3 = load3 - 1; }
+  }
+
+  method get(k: int) -> int {
+    if (k == 0) { return submitted; }
+    if (k == 1) { return completed; }
+    if (k == 2) { return enabled_mask; }
+    if (k == 3) { return load0; }
+    if (k == 4) { return load1; }
+    if (k == 5) { return load2; }
+    if (k == 6) { return load3; }
+    if (k == 7) { return dropped_paused; }
+    return 0;
+  }
+}
+
+class Collector {
+  var period_ms        : int = 5000;
+  var threshold_ms     : int = 30000;
+  var enabled          : int = 1;
+  var last_sweep_ticks : int = 0;
+  var sweep_count      : int = 0;
+  var swept_total      : int = 0;
+
+  method tick() {
+    if (enabled == 0) { return; }
+    var t_now : int = now_ms();
+    if (t_now - last_sweep_ticks < period_ms) { return; }
+    var killed : int = gc_sweep(threshold_ms, 0);
+    swept_total      = swept_total + killed;
+    sweep_count      = sweep_count + 1;
+    last_sweep_ticks = t_now;
+  }
+
+  method configure(per: int, th: int) {
+    if (per > 0) { period_ms    = per; }
+    if (th  > 0) { threshold_ms = th;  }
+  }
+
+  method set_enabled(on: int) {
+    enabled = on;
+  }
+
+  method get(k: int) -> int {
+    if (k == 0) { return enabled; }
+    if (k == 1) { return sweep_count; }
+    if (k == 2) { return swept_total; }
+    if (k == 3) { return period_ms; }
+    if (k == 4) { return threshold_ms; }
+    return 0;
+  }
+}
+
+class Orchestrator {
+  var disp : any = 0;
+  var gc   : any = 0;
+  var w0   : any = 0;  var w1 : any = 0;
+  var w2   : any = 0;  var w3 : any = 0;
+
+  /* boot 時に 1 度だけ呼ぶ: 6 アクターを spawn + 配線 + protect */
+  method start() {
+    gc   = new Collector();
+    disp = new Dispatcher();
+    w0   = new Worker();  w1 = new Worker();
+    w2   = new Worker();  w3 = new Worker();
+    /* GC の sweep から自身と infrastructure を守る */
+    actor_protect(self, 1);
+    actor_protect(gc,   1);
+    actor_protect(disp, 1);
+    actor_protect(w0,   1);  actor_protect(w1, 1);
+    actor_protect(w2,   1);  actor_protect(w3, 1);
+    /* worker を自スロットと dispatcher で bind */
+    send w0.bind(0, disp);  send w1.bind(1, disp);
+    send w2.bind(2, disp);  send w3.bind(3, disp);
+    send disp.register_workers(w0, w1, w2, w3);
+  }
+
+  /* Mac から呼ぶエントリ。N 個の first_col を 1..N の task_id で投入 */
+  method nqueens_run(n: int) {
+    var c : int = 0;
+    while (c < n) do {
+      send disp.submit_nq(n, c, c + 1);
+      c = c + 1;
+    }
+  }
+}
+
+/* 唯一の global = actor 識別子. 関数・変数は全て class 内に閉じている */
+var orch = new Orchestrator();
+send orch.start();

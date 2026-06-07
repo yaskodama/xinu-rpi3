@@ -79,12 +79,23 @@ int tcpSetup(struct tcb *tcbptr)
  */
 static uint tcpIss(void)
 {
-    static int nextseq = 0;
+    static uint base = 0;
+    static uint counter = 0;
 
-    if (0 == nextseq)
+    /* RFC 793: the initial send sequence number should track a fast clock so
+     * successive connections use widely separated sequence space.  The old
+     * version seeded from clktime (whole seconds) and only added TCP_SEQINCR
+     * (904) per connection, producing tiny, nearly-adjacent ISS values; a
+     * reconnect within the TIME_WAIT window then landed in the peer's recent
+     * sequence space and got reset (observed on real hardware: SYN-ACK seq
+     * ~2820 incrementing, peer RSTs, telnet connections failed to recycle).
+     * Mix a one-time pseudo-random base (cycle counter) with a fast time
+     * component (clkticks is in ms; <<10 advances ~1 M/s) and a per-connection
+     * bump so even two connections in the same millisecond stay separated. */
+    if (0 == base)
     {
-        nextseq = clktime;
+        base = (uint)clkcount() | 1;
     }
-    nextseq += TCP_SEQINCR;
-    return nextseq;
+    counter++;
+    return base + ((uint)clkticks << 10) + counter * TCP_SEQINCR;
 }

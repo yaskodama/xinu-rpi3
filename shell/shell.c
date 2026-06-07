@@ -103,6 +103,7 @@ const struct centry commandtab[] = {
     {"test", FALSE, xsh_test},
     {"touch", FALSE, xsh_touch},
     {"umount", FALSE, xsh_umount},
+    {"win", FALSE, xsh_win},
     {"write", FALSE, xsh_write},
 #if HAVE_TESTSUITE
     {"testsuite", TRUE, xsh_testsuite},
@@ -126,6 +127,10 @@ const struct centry commandtab[] = {
     {"udpstat", FALSE, xsh_udpstat},
     {"vlanstat", FALSE, xsh_vlanstat},
     {"voip", FALSE, xsh_voip},
+    {"webactor", FALSE, xsh_webactor},
+    {"wine", FALSE, xsh_wine},
+    {"wifi", FALSE, xsh_wifi},
+    {"wifi-invest", FALSE, xsh_wifi_invest},
     {"xweb", FALSE, xsh_xweb},
 #endif
     {"?", FALSE, xsh_help}
@@ -355,6 +360,18 @@ thread shell(int indescrp, int outdescrp, int errdescrp)
             fprintf(stderr, "%s: command not found\n", tok[0]);
             continue;
         }
+
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+        /* Keyboard/HDMI shell (TTY1): wipe the framebuffer before each
+         * command so its output starts at the top of a fresh screen and is
+         * fully visible.  Smooth scrolling is impractical here because the
+         * GPU framebuffer can't be read back with the D-cache off. */
+        if (outdescrp == TTY1)
+        {
+            extern void fbConsoleClear(void);
+            fbConsoleClear();
+        }
+#endif
 
         /* Handle command if it is built-in */
         if (commandtab[i].builtin)

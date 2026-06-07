@@ -28,11 +28,13 @@ devcall telnetFlush(device *devptr)
 
     if (NULL == phw)
     {
+        restore(im);            /* must not return with interrupts disabled */
         return SYSERR;
     }
 
     if (TELNET_STATE_OPEN != tntptr->state)
     {
+        restore(im);            /* must not return with interrupts disabled */
         return SYSERR;
     }
 

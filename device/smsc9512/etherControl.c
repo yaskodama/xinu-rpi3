@@ -7,6 +7,7 @@
 #include <network.h>
 #include <string.h>
 #include "smsc9512.h"
+#include "lan78xx.h"
 
 /* Implementation of etherControl() for the smsc9512; see the documentation for
  * this function in ether.h.  */
@@ -30,12 +31,18 @@ devcall etherControl(device *devptr, int req, long arg1, long arg2)
     {
     /* Program MAC address into device. */
     case ETH_CTRL_SET_MAC:
-        status = smsc9512_set_mac_address(udev, (const uchar*)arg1);
+        if (ethptr->chiptype == ETH_CHIP_LAN78XX)
+            status = lan78xx_set_mac_address(udev, (const uchar*)arg1);
+        else
+            status = smsc9512_set_mac_address(udev, (const uchar*)arg1);
         break;
 
     /* Get MAC address from device. */
     case ETH_CTRL_GET_MAC:
-        status = smsc9512_get_mac_address(udev, (uchar*)arg1);
+        if (ethptr->chiptype == ETH_CHIP_LAN78XX)
+            status = lan78xx_get_mac_address(udev, (uchar*)arg1);
+        else
+            status = smsc9512_get_mac_address(udev, (uchar*)arg1);
         break;
 
     /* Enable or disable loopback mode.  */

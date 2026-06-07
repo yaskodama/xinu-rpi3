@@ -14,6 +14,7 @@ C_FILES =                \
         etherRead.c      \
         etherStat.c      \
         etherWrite.c     \
+        lan78xx.c        \
         smsc9512.c       \
         vlanStat.c
 

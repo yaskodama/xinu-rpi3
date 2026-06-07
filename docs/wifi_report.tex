@@ -1,0 +1,301 @@
+\documentclass[a4paper,11pt]{ltjsarticle}
+\usepackage[margin=22mm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{black!4},
+  frame=single,
+  framerule=0pt,
+  breaklines=true,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  xleftmargin=12pt,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  language=C
+}
+
+\title{\textbf{Embedded Xinu 上での Raspberry Pi 3 オンボード WiFi\\(BCM43455)ドライバのゼロからの実装}\\[4pt]
+\large ---- スキャンから WPA2 接続・DHCP・ping 疎通まで ----}
+\author{実機検証レポート（arm-rpi3 platform）}
+\date{2026年6月2日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本レポートは、教育用 OS である Embedded Xinu を Raspberry Pi 3 B+（BCM2837）へ移植した
+\texttt{arm-rpi3} プラットフォーム上に、オンボード WiFi チップ Broadcom/Cypress BCM43455 の
+ドライバを\textbf{ゼロから実装}し、アクセスポイントのスキャン・一覧表示から WPA2-PSK 接続、
+DHCP による IP 取得、そして ping 疎通までを実機で達成した記録である。Linux の \texttt{brcmfmac}
+ドライバおよび plan9/circle の \texttt{ether4330} ドライバをリファレンスとしつつ、Xinu の限られた
+環境（MMU 有効・D-cache 無効・標準 C ライブラリ僅少）に合わせて SDIO バスの bring-up、ファーム
+ウェアのロード、SDPCM/BDC フレーミング、ファームウェア内蔵サプリカント(FWSUP)による 4-way
+ハンドシェイク、最小限の IP スタック(ARP/ICMP)を実装した。本実装で突破した\textbf{6 つの技術的な壁}
+と、その診断・解決の過程を詳述する。最終的に \texttt{ping 192.168.3.52} は定常状態で
+\textbf{パケットロス 0\%・平均 RTT 15\,ms} を達成した。
+\end{abstract}
+
+\section{背景と目標}
+Embedded Xinu は小規模で読みやすい教育用 OS であり、本プロジェクトではこれを Raspberry Pi 3 B+
+の実機（BCM2837、Cortex-A53、32-bit）へ移植している。Pi 3 B+ のオンボード WiFi は BCM43455 で、
+SoC とは SDIO バス（Arasan SDHCI/EMMC コントローラ、物理アドレス \texttt{0x3F300000}）で接続されている。
+
+目標は単純である：\textbf{「WiFi アクセスポイントの一覧を表示し、その中から選んで接続する」}。
+ただし Xinu には WiFi スタックが一切存在しないため、SDIO の最下層からファームウェアのロード、
+無線制御プロトコル、暗号化(WPA2)、上位の IP 疎通までを自前で実装する必要があった。
+
+\section{システム構成}
+実装は単一の自己完結したファイル \texttt{apps/wifi.c}（約 2{,}000 行）に集約した。
+HTTP 経由の操作・診断インタフェースは \texttt{apps/webactor.c} が提供する。レイヤ構成を表
+\ref{tab:layers} に示す。
+
+\begin{table}[h]
+\centering
+\caption{WiFi ドライバのレイヤ構成}
+\label{tab:layers}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+レイヤ & 内容 & 主な関数 \\
+\midrule
+SDIO host & Arasan SDHCI 初期化, CMD52/53 & \texttt{emmc\_*}, \texttt{sdio\_cmd52/53} \\
+バックプレーン & EROM コアスキャン, ARM CR4 制御 & \texttt{wifi\_sbmem}, \texttt{wifi\_corescan} \\
+firmware ロード & fw/nvram/clm を RAM へ転送 & \texttt{wifi\_fwload}, \texttt{wifi\_clmload} \\
+SDPCM/BDC & 制御(ioctl)・データのフレーミング & \texttt{wifi\_wlcmd}, \texttt{wifi\_data\_tx} \\
+無線制御 & scan, join, 暗号設定 & \texttt{wifi\_scan}, \texttt{wifi\_do\_join} \\
+IP 応答 & DHCP クライアント, ARP/ICMP 応答 & \texttt{wifi\_dhcp}, \texttt{wifi\_net\_service} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ファームウェア（\texttt{cyfmac43455-sdio-minimal.bin}, 約 548\,KB）、NVRAM、CLM(規制)ブロブは
+\texttt{.incbin} でカーネルイメージに直接埋め込み、SDIO 経由でチップ RAM(\texttt{0x198000})へ
+ストリーム転送する。MMU は有効化しているが D-cache は USB-ethernet/フレームバッファの DMA を
+壊すため意図的に無効、命令キャッシュ(I-cache)のみ有効化している。
+
+\section{実装の道のり：6 つの壁}
+スキャン（AP 一覧の取得）までは比較的順調に到達したが、\textbf{WPA2 接続から先}には
+段階的に 6 つの壁が立ちはだかった。各々を実機ログによる診断で特定し、解決した（表 \ref{tab:walls}）。
+
+\begin{table}[h]
+\centering
+\caption{突破した 6 つの技術的な壁}
+\label{tab:walls}
+\small
+\begin{tabular}{@{}clp{8.4cm}@{}}
+\toprule
+\# & 症状 & 原因と解決 \\
+\midrule
+1 & \texttt{sup\_wpa} が \texttt{-23} & 使用中の \emph{standard} ファームウェアに在荷サプリカント(FWSUP)が無い。
+   \texttt{idsup} を持つ \emph{minimal} ファームウェア(7.45.241)へ差し替え。\\
+2 & \texttt{WSEC\_PMK} が \texttt{-2} & PMK 構造体 \texttt{brcmf\_wsec\_pmk\_le} は \texttt{key[128]} を含む
+   \textbf{132 バイト固定}。36 バイトで送っていたため拒否されていた。\\
+3 & 接続しても assoc せず & \texttt{wsec}/\texttt{wpa\_auth}/\texttt{auth} をコマンド(WLC\_SET\_*)で設定していたが、
+   join/FWSUP が読むのは \textbf{bsscfg iovar}。全て iovar 設定に変更。\\
+4 & join が無反応(scan のみ) & ext\_join 構造体 \texttt{brcmf\_ext\_join\_params\_le} は \texttt{\_\_packed} ではなく
+   \textbf{自然アラインメントで 70 バイト}。packed の 65 バイトは \texttt{-14}(BUFTOOSHORT)、
+   114 バイトはフィールドがズレて誤読されていた。\\
+5 & ping 不通(0\% 応答) & SDPCM の\textbf{送信クレジット window/フロー制御を無視}。fw は各フレームに
+   \texttt{max\_seq}(byte 9)と \texttt{fcmask}(byte 8)を載せ、window 超過の送信は黙って破棄する。
+   RX から追従し、開くまで待って送信。\\
+6 & 接続が不安定 & association が AUTH で停滞し再スキャンに戻ることがある。join を最大 4 回リトライ。\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{壁 1・2：FWSUP ファームウェアと PMK 構造体}
+WPA2-PSK の 4-way ハンドシェイクは、ホスト側サプリカントを書く代わりに、ファームウェア内蔵
+サプリカント(FWSUP)に任せる方針とした。\texttt{brcmfmac} は \texttt{sup\_wpa} iovar の GET が
+\texttt{-23}(UNSUPPORTED)を返さないことで FWSUP を判定する（\texttt{feature.c:349}）。RPi 配布の
+\emph{standard} ファームウェアはこれを返した。capability 文字列を比較すると、\emph{minimal}
+ファームウェアのみ \texttt{idsup-idauth}(在荷サプリカント)を持ち、\emph{standard} は代わりに
+external-SAE(\texttt{extsae-dpp-sr-okc})を採用していた。\emph{minimal} へ差し替えると
+\texttt{sup\_wpa=1} が \texttt{rc=0} で通り、PMK 構造体を 132 バイトに直すと \texttt{WSEC\_PMK} も
+\texttt{rc=0} となった。
+
+\subsection{壁 4：ext\_join 構造体のアラインメント（最大の難所）}
+最も解決に時間を要したのがこの壁である。\texttt{join} iovar に渡す構造体について、当初は
+\texttt{brcmf\_scan\_params\_le}(入れ子の SSID を含む大きな構造体)を仮定して 114 バイトで送って
+いたが、ファームウェアは長さは受理するものの scan/assoc フィールドを誤読し、probe だけして
+association に進まなかった。新しい \texttt{brcmfmac} の \texttt{brcmf\_join\_scan\_params\_le} を
+仮定して 65 バイトに縮めると今度は \texttt{-14}(BUFTOOSHORT)。
+
+決め手は構造体の\textbf{パッキングの再確認}であった。\texttt{fwil\_types.h} 全体で \texttt{\_\_packed}
+は 1 箇所のみで、join 関連の構造体には付いていない。すなわち\textbf{自然アラインメント}であり、
+実サイズは
+\[
+  \underbrace{\mathtt{offsetof(assoc\_le)}}_{56}
+  + \underbrace{\mathtt{offsetof(chanspec\_list)}}_{12}
+  + \underbrace{\mathtt{sizeof(u16)}}_{2}
+  = 70\ \text{バイト}
+\]
+である。これは plan9 の \texttt{ether4330} が使う \texttt{wl\_extjoin\_params\_t} とバイト単位で一致した
+（\texttt{scan\_type@36}, \texttt{bssid@56}, \texttt{chanspec@68}）。70 バイトの正しいレイアウトに直すと、
+スキャンで得た実 chanspec を指定した directed join で初めて association が成立した。
+
+\begin{lstlisting}[caption={壁 4 を解いた 70 バイト join 構造体（抜粋）}]
+/* wl_extjoin_params_t (自然アラインメントで 70B):
+ *   [0..3] SSID_len  [4..35] SSID[32]
+ *   [36] scan_type(+3pad)  [40] nprobes  [44] active  [48] passive  [52] home
+ *   [56..61] assoc bssid  [62..63] pad  [64..67] chanspec_num  [68..69] chanspec */
+jp[0] = sl;                                  /* SSID_len */
+for (i = 0; i < sl; i++) jp[4 + i] = ssid[i];
+jp[36] = 0xFF;                               /* scan_type */
+jp[40] = 2;                                  /* nprobes = 2 */
+jp[44] = 120;                                /* active_time = 120 ms */
+jp[48] = 0x86; jp[49] = 0x01;                /* passive_time = 390 ms */
+jp[52]=jp[53]=jp[54]=jp[55]=0xFF;            /* home_time = -1 */
+for (i = 0; i < 6; i++) jp[56 + i] = bssid[i];   /* assoc bssid */
+jp[64] = 1;                                  /* chanspec_num = 1 */
+jp[68] = chanspec & 0xFF; jp[69] = chanspec >> 8;
+jsz = 70;
+\end{lstlisting}
+
+\subsection{壁 5：SDPCM 送信クレジットとフロー制御（ping 不通の真因）}
+association・DHCP まで成功した後、\texttt{ping} が 100\% ロスした。受信フレームのログを追加して
+診断したところ、Pi は\textbf{ARP 要求も ICMP echo 要求も正しく受信し、応答を生成・送出していた}
+にもかかわらず、ホストに届いていなかった。原因は SDPCM の送信フロー制御を無視していたことに
+あった。ファームウェアは送出する全フレームの SDPCM ヘッダに送信クレジット窓
+\texttt{max\_seq}(byte 9)とチャネル別フロー制御マスク \texttt{fcmask}(byte 8)を載せており、
+\texttt{txseq == txwindow} の状態やデータチャネルの FC が立った状態で送信したフレームは
+\textbf{黙って破棄}される。早期に送った ARP 応答はたまたま窓内で届いたが、後続の ICMP 応答は
+窓を超過して破棄されていた。受信フレームから窓とマスクを常時追従し、窓が開くまで待ってから
+送信するように修正して解決した。
+
+\section{接続シーケンスと実機検証}
+最終的な接続シーケンスを以下に示す。
+\begin{enumerate}
+  \item \texttt{/api/wifi/scan} ---- escan により AP を列挙し JSON で返す
+  \item \texttt{/api/wifi/join?ssid=...\&pass=...} ---- DOWN/INFRA/UP $\to$ scan で対象の BSSID/chanspec を特定
+        $\to$ \texttt{wpa\_auth/auth/wsec} を iovar 設定 $\to$ \texttt{sup\_wpa=1} $\to$ \texttt{WSEC\_PMK}(PMK)
+        $\to$ 70B \texttt{join} iovar $\to$ ファームウェアが 4-way を実行 $\to$ \texttt{E\_LINK} up
+  \item \texttt{/api/wifi/dhcp} ---- DISCOVER/OFFER/REQUEST/ACK で IP を取得し、ARP/ICMP 応答スレッドを起動
+\end{enumerate}
+
+実機での join イベント列（\texttt{X-Wifi-EvSeq} ヘッダ）は
+\texttt{124(scan), 46(PSK\_SUP, status 6=KEYED), 1(JOIN), 0(SET\_SSID)} となり、ファームウェア
+サプリカントによる 4-way ハンドシェイク完了が確認できた。\texttt{GET\_BSSID} は AP の BSSID
+\texttt{0c:73:29:8e:f8:2c} を返し association を裏付けた。DHCP は
+\texttt{IP=192.168.3.52, mask=255.255.255.0, gw=192.168.3.1, dns=192.168.3.1} を取得した。
+
+\subsection{2.4\,GHz / 5\,GHz 両バンドでの検証}
+同一ルータの 2.4\,GHz(\texttt{0C73298EF82D-2G})と 5\,GHz(\texttt{0C73298EF82D-5G}、パスフレーズ共通)
+の双方で、接続・DHCP・ping を確認した（表 \ref{tab:ping}）。5\,GHz 側の AP はチャネル 106
+（\texttt{chanspec=0xe06a}）という\textbf{DFS チャネル}に在ったが、スキャンで得たファームウェアの
+chanspec をそのまま directed join に渡す方式のため、chanspec を手で組み立てることなく 5\,GHz DFS
+チャネルへもそのまま接続できた。なお本ドライバの join は毎回 \texttt{WLC\_DOWN} で張り直すため、
+バンドの切り替えに明示的な切断操作は不要である（2.4\,GHz から 5\,GHz へは join するだけで切り替わる）。
+以前 5\,GHz が接続できなかったのは第 4・5 の壁（構造体・フロー制御）が原因であり、5\,GHz 固有の
+問題ではなかったことも確認された。
+
+\begin{table}[h]
+\centering
+\caption{実機 ping 結果（WiFi 経由、両バンド、定常状態）}
+\label{tab:ping}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+バンド & チャネル(chanspec) & 受信/送信(ロス) & RTT 平均(最小/最大) \\
+\midrule
+2.4\,GHz & ch6 (\texttt{0x1006})  & 10/10 (0.0\,\%)  & 15.3 (11.5/28.0)\,ms \\
+5\,GHz   & ch106 DFS (\texttt{0xe06a}) & 7/8 (12.5\,\%)$^{\dagger}$ & 18.4 (15.6/22.2)\,ms \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize $^{\dagger}$ 5\,GHz の欠損 1 パケットは ARP 解決中の settling（\texttt{Host is down}）によるもので、
+解決後は連続応答（7/7）。2.4\,GHz も初回試行では同様に最初の数発が settling で欠ける。}
+\end{table}
+
+\begin{lstlisting}[numbers=none,caption={実機 ping 出力（2.4\,GHz、定常 10 パケット）}]
+64 bytes from 192.168.3.52: icmp_seq=1 ttl=64 time=11.533 ms
+ ... (10/10) ...
+10 packets transmitted, 10 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 11.533/15.338/27.991/4.674 ms
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={実機 ping 出力（5\,GHz DFS ch106、抜粋）}]
+Request timeout for icmp_seq 0          # ARP 解決中の settling
+64 bytes from 192.168.3.52: icmp_seq=1 ttl=64 time=15.583 ms
+ ... (icmp_seq 1..7 すべて応答) ...
+8 packets transmitted, 7 packets received, 12.5% packet loss
+round-trip min/avg/max/stddev = 15.583/18.399/22.173/2.008 ms
+\end{lstlisting}
+
+初回試行では最初の数パケットが \texttt{Host is down}（ARP 解決中の settling）で落ちるが、
+解決後は 0\% ロスで安定する。
+
+\section{クライアント側ネットワーク：ping と NTP 時刻取得}
+応答（responder）だけでなく、能動的なクライアント機能も実装した。\texttt{wifi\_arp\_resolve()}
+で次ホップの MAC を解決し（宛先が同一サブネットならそのホストを、サブネット外ならデフォルト
+ゲートウェイを ARP）、その上に ICMP echo クライアント \texttt{wifi\_ping()} と NTP クライアント
+\texttt{wifi\_ntp()}（UDP/123）を載せた。サブネット外宛はゲートウェイ経由でルーティングするため、
+家庭用ルータや iPhone テザリングの NAT を越えて\textbf{インターネットへ到達}できる。
+
+実機（自宅ルータ 5\,GHz 接続）での結果を表 \ref{tab:client} に示す。NTP は Cloudflare の
+公開サーバ（\texttt{162.159.200.123}）へ問い合わせ、応答の送信タイムスタンプ（NTP 1900 年起点）を
+Unix 時刻（1970 年起点）へ変換し、JST（UTC+9）の暦日時へ整形した。
+
+\begin{table}[h]
+\centering
+\caption{クライアント側ネットワーク（自宅ルータ 5\,GHz 経由）}
+\label{tab:client}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+操作 & 結果 \\
+\midrule
+ping 192.168.3.1（ゲートウェイ） & 3/3 応答 \\
+ping 8.8.8.8（インターネット） & 4/4 応答（NAT 越えでインターネット到達） \\
+NTP 162.159.200.123 & unix=1780366848 \\
+\quad $\to$ JST 整形 & \textbf{2026-06-02 11:20:48} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{lstlisting}[numbers=none,caption={NTP 時刻取得（実機トレース）}]
+[wifi] === NTP 162.159.200.123 ===
+[wifi] *** NTP unix=1780366848  JST=2026-06-02 11:20:48 ***
+\end{lstlisting}
+
+iPhone テザリング経由でも ping 8.8.8.8 は 3/4 応答でインターネット到達を確認したが、NTP（UDP/123）は
+携帯キャリアでフィルタされる可能性があり、自宅ルータ経由が確実であった。なお NTP の初回問い合わせは
+ゲートウェイの ARP 解決が間に合わず取りこぼすことがあるため、ARP がキャッシュされた後に成功する。
+本ドライバの WLAN データ経路は UDP/ICMP/ARP までで TCP は未実装のため、TLS を要する HTTPS
+（例：一般的なポータルサイト）の取得は範囲外である。
+
+\section{診断手法上の工夫}
+長時間(約 150 秒)の join 処理の後では Xinu の TCP が大きな応答ボディを配送できず(write がブロック)、
+従来の「全ログを HTTP ボディで返す」方式が機能しなかった。そこで、(1)主要な診断値を
+\texttt{X-Wifi-*} レスポンス\textbf{ヘッダ}に載せる（小さなヘッダは確実に届く）、(2)即時応答する独立
+エンドポイント \texttt{/api/wifi/trace} で完全ログを別取得する、という二段構えで診断を進めた。
+イベント列を \texttt{X-Wifi-EvSeq} に CSV で載せたことが、壁 4・5 の特定に決定的に寄与した。
+
+\section{結論と残課題}
+Embedded Xinu 上に BCM43455 ドライバをゼロから実装し、\textbf{スキャン $\to$ AP 選択 $\to$
+WPA2-PSK 接続 $\to$ DHCP $\to$ ping 疎通 $\to$ インターネット到達 $\to$ NTP による現在時刻取得}
+までを実機で達成した。鍵となったのは、(i)在荷サプリカント付きファームウェアの選択、(ii)ワイヤ
+構造体のサイズ・アラインメントの厳密な一致、(iii)SDPCM 送信クレジット制御の遵守、の 3 点であり、
+いずれも実機ログによる地道な診断で特定した。最終的に、自作ドライバは家庭用ルータ／iPhone テザリングの
+NAT を越えてインターネットに到達し、NTP サーバから \textbf{JST 2026-06-02 11:20:48} を取得した。
+
+残課題として、TCP を含む上位プロトコル（および TLS／HTTPS）、再接続・ローミング、複数 AP の
+永続設定、スキャン一覧からブラウザで選択・接続する UI などが挙げられる。
+
+\vspace{4mm}
+\noindent\footnotesize
+リファレンス：Linux \texttt{brcmfmac}（\texttt{drivers/net/wireless/broadcom/brcm80211}）、
+plan9/circle \texttt{ether4330}。ビルド：\texttt{arm-rpi3-port} ブランチ、コミット \texttt{2c4f783}。
+デプロイは SD カードの差し替えと完全電源断による。
+
+\end{document}

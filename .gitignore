@@ -32,3 +32,23 @@ compile/version
 compile/vn
 include/conf.h
 system/conf.c
+wifi-fw/
+
+# Generated build version header (PHONY target, rebuilt every build)
+include/version.h
+
+# Kernel image build output
+compile/*.img
+
+# LaTeX intermediates (keep the .tex sources and .pdf outputs)
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz
+
+# Benchmark run logs / generated result dumps
+docs/*-log.txt
+docs/dining_results_clean.json

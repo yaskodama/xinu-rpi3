@@ -1,0 +1,53 @@
+{
+  "host": "http://192.168.3.50:8080",
+  "meals": 50,
+  "repeat": 3,
+  "platform": "Raspberry Pi 3 B+ / Embedded Xinu (arm-rpi3) / MAX_OBJECTS=128",
+  "measurement_notes": [
+    "mode 0 (parallel) は busy-retry livelock が CPU を占有し Pi 全体 (network/HTTP) をウェッジさせるため安全にライブ計測できない。観測された到達は 3/5。report builder が documented entry として注入する。",
+    "mode 1 (staggered) は repeat 3 全てで livelock。到達した完食人数は 1/5, 1/5, 2/5。max_phil_ms は 0/2370/2140 と進まず。",
+    "mode 2 (sequential) / mode 3 (chandy-misra) は 5/5 完走を複数回確認。ただし単一スレッド webactor が 0.2s ポーリング + アクター負荷の repeat 自動化中に accept ループで wedge するため、安定した makespan は残留スピンの無いクリーンブート上の代表 run から採取した。",
+    "kernel の elapsed_ms (= t_end - t_start) は条件により 0 を返すバグがあり、makespan は elapsed_ms が正しく出たクリーン run の値を採用 (mode 2 = 7950 ms, mode 3 = 7380 ms)。max_phil_ms (各哲学者の launch->done) は安定して取得できる補助指標。"
+  ],
+  "results": [
+    {
+      "mode": 1,
+      "label": "staggered(3+2)",
+      "meals": 50,
+      "samples_ms": [],
+      "median_ms": 0,
+      "max_phil_samples_ms": [0, 2370, 2140],
+      "median_max_phil_ms": 2140,
+      "n_done_samples": [1, 1, 2],
+      "median_n_done": 1,
+      "finished_runs": 0,
+      "all_finished": false
+    },
+    {
+      "mode": 2,
+      "label": "sequential",
+      "meals": 50,
+      "samples_ms": [7950],
+      "median_ms": 7950,
+      "max_phil_samples_ms": [880],
+      "median_max_phil_ms": 880,
+      "n_done_samples": [5, 5, 5],
+      "median_n_done": 5,
+      "finished_runs": 3,
+      "all_finished": true
+    },
+    {
+      "mode": 3,
+      "label": "chandy-misra",
+      "meals": 50,
+      "samples_ms": [7380],
+      "median_ms": 7380,
+      "max_phil_samples_ms": [7330],
+      "median_max_phil_ms": 7330,
+      "n_done_samples": [5, 5, 5],
+      "median_n_done": 5,
+      "finished_runs": 3,
+      "all_finished": true
+    }
+  ]
+}

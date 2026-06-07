@@ -1,0 +1,21 @@
+{
+  "host": "http://192.168.3.50:8080",
+  "repeat": 3,
+  "results": [
+    {"mode": "mac",   "n": 8,  "count": 92,
+     "samples_ms": [4, 3, 3],        "median_ms": 3},
+    {"mode": "pi3",   "n": 8,  "count": 92,
+     "samples_ms": [20044, 10135, 10138], "median_ms": 10138},
+    {"mode": "split", "n": 8,  "count": 92,
+     "samples_ms": [9961, 10238, 9969],   "median_ms": 9969},
+    {"mode": "mac",   "n": 9,  "count": 352,
+     "samples_ms": [9, 9, 9],        "median_ms": 9},
+    {"mode": "pi3",   "n": 9,  "count": 352,
+     "samples_ms": [10210, 20246, 15221], "median_ms": 15221},
+    {"mode": "split", "n": 9,  "count": 352,
+     "samples_ms": [10336, 10076, 10468], "median_ms": 10336},
+    {"mode": "mac",   "n": 10, "count": 724,
+     "samples_ms": [88, 48, 49],     "median_ms": 49}
+  ],
+  "_note": "pi3/split for N=10..11 incomplete — Pi 3 task table is 64 slots and IDs scrolled past the buffer mid-run; bumping LB_TASKS_MAX is deferred to a future commit."
+}

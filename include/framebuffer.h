@@ -13,7 +13,11 @@
 /* Framebuffer specific constants and definitions. */
 #define MAILBOX_FULL 0x80000000 // set bit in status register if no space in mailbox
 #define MAILBOX_EMPTY 0x40000000 // set bit in status register if nothing to read from mailbox
-#define MMIO_BASE 0x20000000 // base address for peripherals
+#ifdef _XINU_PLATFORM_ARM_RPI3_
+#define MMIO_BASE 0x3F000000 // BCM2837 (Pi3) peripheral base (mailbox at +0xB880)
+#else
+#define MMIO_BASE 0x20000000 // BCM2835 (Pi1) peripheral base
+#endif
 #define MAILBOX_CHANNEL 1 // framebuffer uses channel 1; no reason to mess around with anything else
 #define MAILBOX_BASE 0xB880 // base address for mailbox registers
 #define MAILBOX_READ 0x00 // the register we read from
@@ -23,8 +27,8 @@
 #define CHAR_HEIGHT 12
 extern unsigned char FONT[];
 
-#define DEFAULT_HEIGHT 768
-#define DEFAULT_WIDTH 1024
+#define DEFAULT_HEIGHT 800
+#define DEFAULT_WIDTH 1280
 #define BIT_DEPTH 32
 
 #define MAXRETRIES 3 //if screen fails to initialize after three tries, halt
@@ -132,6 +136,7 @@ ulong physToBus(void *);
 void writeMMIO(ulong, ulong, ulong);
 ulong readMMIO(ulong, ulong);
 void screenClear(ulong);
+void fbConsoleClear(void);
 void minishellClear(ulong);
 void viewlinemap(void); 
 void drawPixel(int, int, ulong);

@@ -1,0 +1,192 @@
+// dining5_bench.abcl — 5 哲学者問題の分散戦略ベンチマーク (AIPL)
+//
+// 規約:
+//   - global は actor 識別子のみ
+//   - 全ての関数・変数は class 内
+//   - 型推論クリーン: 全 field / 引数 / 戻り値に型注釈
+//   - メッセージ送信は `send` のみ (Xinu AIPL は now/future 未サポート)
+//
+// 問題設定:
+//   - 5 人の哲学者 (P0..P4) と 5 本のフォーク (F0..F4) が円卓に座る
+//   - 哲学者 Pi はフォーク F(i) と F(i+1 mod 5) を使う
+//   - デッドロック回避: P4 は F0 から先に取る (= 低 ID 優先取得)
+//   - 各 哲学者が 50 食終わったら suicide、Orchestrator に通知
+//
+// 3 つの分散戦略を 1 ビルドで比較:
+//   mode=0  全 5 並列 (古典)             — 期待: 最速 (フォーク争奪以外は並列)
+//   mode=1  3+2 段階 (P0..P2 終わってから P3,P4)
+//   mode=2  順次 1人ずつ (P0→P1→P2→P3→P4)  — 期待: 最遅 (並列性ゼロ)
+
+class Fork {
+  var holder : int = 0;     // 0 = free、それ以外は所持者の Philosopher id
+
+  method acquire(p_pid: int) {
+    if (holder == 0) {
+      holder = p_pid;
+      send sender.fork_granted(p_pid);
+    } else {
+      send sender.fork_denied(p_pid);
+    }
+  }
+
+  method release(p_pid: int) {
+    if (holder == p_pid) { holder = 0; }
+  }
+}
+
+class Philosopher {
+  var my_id    : int = 0;
+  var f_low    : any = 0;
+  var f_high   : any = 0;
+  var meals    : int = 50;
+  var meal_idx : int = 0;
+  var state    : int = 0;   // 0 = 思考中、1 = 低フォーク保持、2 = 両手
+  var done_to  : any = 0;
+  var t_start  : int = 0;
+
+  method init_phil(id: int, lo: any, hi: any, meal_n: int, orch: any) {
+    my_id    = id;
+    f_low    = lo;
+    f_high   = hi;
+    meals    = meal_n;
+    meal_idx = 0;
+    state    = 0;
+    done_to  = orch;
+    t_start  = now_ms();
+    send self.try_eat();
+  }
+
+  method try_eat() {
+    if (meals == 0) {
+      var elapsed : int = now_ms() - t_start;
+      send done_to.phil_done(my_id, elapsed);
+      suicide();
+      return;
+    }
+    /* "考えている" 時間をシミュレート — 完全実時間でフォーク争奪を観察 */
+    send f_low.acquire(my_id);
+  }
+
+  method fork_granted(p_pid: int) {
+    if (state == 0) {
+      /* 低 ID 側を取得済み → 高 ID 側へ */
+      state = 1;
+      send f_high.acquire(my_id);
+    } else {
+      /* 両手揃った → 食事 → リリース */
+      meal_idx = meal_idx + 1;
+      meals    = meals - 1;
+      send f_high.release(my_id);
+      send f_low.release(my_id);
+      state = 0;
+      send self.try_eat();
+    }
+  }
+
+  method fork_denied(p_pid: int) {
+    /* 低フォーク取って高フォークを拒否された場合のみ低を返す */
+    if (state == 1) {
+      send f_low.release(my_id);
+      state = 0;
+    }
+    send self.try_eat();
+  }
+}
+
+class DiningBench {
+  /* 5 本のフォークと 5 人の哲学者 (アクター識別子) */
+  var f0 : any = 0;  var f1 : any = 0;  var f2 : any = 0;
+  var f3 : any = 0;  var f4 : any = 0;
+  var p0 : any = 0;  var p1 : any = 0;  var p2 : any = 0;
+  var p3 : any = 0;  var p4 : any = 0;
+
+  /* 計測 */
+  var mode    : int = 0;
+  var meals   : int = 50;
+  var t_start : int = 0;
+  var t_end   : int = 0;
+  var n_done  : int = 0;
+  var max_phil_elapsed : int = 0;
+
+  /* mode 進行管理 */
+  var cursor  : int = 0;    // 順次/段階 mode の現在位置
+
+  /* 1 度だけ作成: 5 フォーク + 5 哲学者を spawn (init はまだ送らない) */
+  function create_actors() -> int {
+    f0 = new Fork();  f1 = new Fork();  f2 = new Fork();
+    f3 = new Fork();  f4 = new Fork();
+    p0 = new Philosopher();  p1 = new Philosopher();
+    p2 = new Philosopher();  p3 = new Philosopher();
+    p4 = new Philosopher();
+    return 0;
+  }
+
+  /* 哲学者 Pi に init を送る。フォーク対は (F_lo, F_hi) で
+     デッドロック回避のため常に低 ID を先に取る規約。
+     P4 は F0/F4 を使うが、低 = F0 = id 0、高 = F4 = id 4。 */
+  function start_phil(i: int) -> int {
+    if (i == 0) { send p0.init_phil(0, f0, f1, meals, self); return 0; }
+    if (i == 1) { send p1.init_phil(1, f1, f2, meals, self); return 0; }
+    if (i == 2) { send p2.init_phil(2, f2, f3, meals, self); return 0; }
+    if (i == 3) { send p3.init_phil(3, f3, f4, meals, self); return 0; }
+    if (i == 4) { send p4.init_phil(4, f0, f4, meals, self); return 0; }
+    return 0;
+  }
+
+  method run_bench(mode_id: int, meals_n: int) {
+    mode    = mode_id;
+    meals   = meals_n;
+    n_done  = 0;
+    cursor  = 0;
+    max_phil_elapsed = 0;
+    t_start = now_ms();
+    create_actors();
+
+    if (mode == 0) {
+      /* 全 5 並列 */
+      start_phil(0); start_phil(1); start_phil(2);
+      start_phil(3); start_phil(4);
+    } else if (mode == 1) {
+      /* 3+2 段階: 最初に P0..P2 を起動。残りは phil_done で起動 */
+      cursor = 3;
+      start_phil(0); start_phil(1); start_phil(2);
+    } else {
+      /* mode == 2: 順次 1 人ずつ */
+      cursor = 1;
+      start_phil(0);
+    }
+  }
+
+  method phil_done(phil_id: int, elapsed_ms: int) {
+    n_done = n_done + 1;
+    if (elapsed_ms > max_phil_elapsed) { max_phil_elapsed = elapsed_ms; }
+
+    if (mode == 1) {
+      /* 段階 mode: 3 人終わったら 残り 2 人を起動 */
+      if (n_done == 3) {
+        start_phil(3); start_phil(4);
+      }
+    } else if (mode == 2) {
+      /* 順次 mode: 終わったら 次を起動 */
+      if (cursor < 5) {
+        start_phil(cursor);
+        cursor = cursor + 1;
+      }
+    }
+    if (n_done == 5) {
+      t_end = now_ms();
+    }
+  }
+
+  method get(k: int) -> int {
+    if (k == 0) { return n_done; }            // 0..5
+    if (k == 1) { return t_end - t_start; }   // 全 5 人 完了までの ms (n_done==5 後のみ有効)
+    if (k == 2) { return max_phil_elapsed; }  // 最遅 philosopher の完了時間
+    if (k == 3) { return mode; }
+    if (k == 4) { return meals; }
+    return 0;
+  }
+}
+
+/* 唯一の global = actor 識別子 */
+var bench = new DiningBench();
