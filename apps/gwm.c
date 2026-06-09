@@ -13,7 +13,12 @@
 #include <gsoftkbd.h>
 
 #define DESKTOP_BG     0xFF003366U   /* dark navy "desktop"          */
-#define DEFAULT_FPS    20            /* 1 frame every 50 ms          */
+#define DEFAULT_FPS    20            /* content repaint: 1 frame / 50 ms */
+/* The USB mouse updates cursor_x/y asynchronously (USB IRQ) far faster than
+ * the 20 fps content pass.  Within each content frame we poll the cursor every
+ * WM_CURSOR_STEP_MS and move just the 12x12 sprite, so the pointer tracks the
+ * mouse at ~1000/WM_CURSOR_STEP_MS Hz instead of jumping once per content frame. */
+#define WM_CURSOR_STEP_MS 6          /* ~165 Hz cursor follow            */
 
 static window_t *wm_head;
 static void    (*wm_tick)(void);
@@ -581,9 +586,28 @@ void wm_run(void)
         dcx = cursor_x;
         dcy = cursor_y;
         draw_cursor();
-
-        delay_ms(1000 / DEFAULT_FPS);
         frame++;
+
+        /* Fast cursor sub-loop.  USB mouse reports have already moved
+         * cursor_x/y asynchronously; the heavy content pass above only runs
+         * at 20 fps.  Spend the rest of the frame period polling the cursor
+         * and, whenever it moved, restoring just the 12x12 patch under its
+         * old position and redrawing the sprite at the new one — a tiny clip,
+         * so it's cheap on the uncached framebuffer.  This makes the pointer
+         * track the mouse smoothly (~165 Hz) without raising the flickery,
+         * expensive full-content repaint rate. */
+        for (int t = 0; t < 1000 / DEFAULT_FPS; t += WM_CURSOR_STEP_MS) {
+            delay_ms(WM_CURSOR_STEP_MS);
+            if (cursor_x == dcx && cursor_y == dcy) continue;
+            g_force_redraw = 1;
+            video_set_clip(dcx, dcy, 12, 12);
+            paint_scene(frame);
+            video_clear_clip();
+            g_force_redraw = 0;
+            dcx = cursor_x;
+            dcy = cursor_y;
+            draw_cursor();
+        }
     }
 }
 
