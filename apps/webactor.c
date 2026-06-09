@@ -1688,6 +1688,44 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/wm/reset — restore the gwm desktop to its initial layout
+             *   (undo any window drag/resize). */
+            if (0 == strncmp(reqbuf, "GET /api/wm/reset",  17) ||
+                0 == strncmp(reqbuf, "POST /api/wm/reset", 18))
+            {
+                extern void wm_reset_layout(void);
+                static char rhdr[160];
+                const char *body = "wm: layout reset to initial\r\n";
+                int blen = 0; while (body[blen]) blen++;
+                int hlen = sprintf(rhdr,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", blen);
+                wm_reset_layout();
+                write(tcpdev, rhdr, hlen);
+                write(tcpdev, (void *)body, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/wm/dump — snapshot the LIVE window geometry as ready-to-
+             *   paste C source (so an on-screen arrangement can be baked back
+             *   into wm_reset_layout()/gwm_main as the new initial screen). */
+            if (0 == strncmp(reqbuf, "GET /api/wm/dump",  16) ||
+                0 == strncmp(reqbuf, "POST /api/wm/dump", 17))
+            {
+                extern int wm_dump_layout(char *, int);
+                static char dbuf[1024];
+                static char dhdr[160];
+                int blen = wm_dump_layout(dbuf, sizeof(dbuf));
+                int hlen = sprintf(dhdr,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", blen);
+                write(tcpdev, dhdr, hlen);
+                write(tcpdev, dbuf, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/wifi/probe — Stage 1+2 WiFi (BCM43455) SDIO bring-up:
              *   power the chip, enumerate SDIO, read back the silicon
              *   chip-id.  All detail is on the serial console ([wifi] ...);

@@ -139,21 +139,42 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
         for (i = 2; i < 8; i++)
         {
             uchar usage_id = data[i];
-            uchar c = keymap[usage_id][mod_idx];
+            char  seq[3];
+            int   slen, k;
 
-            if (0 != c &&
-                NULL == memchr(kbd->recent_usage_ids, usage_id, 6))
+            if (0 == usage_id)
+                continue;
+            if (NULL != memchr(kbd->recent_usage_ids, usage_id, 6))
+                continue;                       /* key held from last report   */
+
+            /* Arrow keys -> ANSI escape ESC [ A/B/C/D so the line editor
+             * (shell_readline) sees them for history recall / cursor move.
+             * HID usage: 0x4F right, 0x50 left, 0x51 down, 0x52 up. */
+            if (usage_id >= 0x4F && usage_id <= 0x52)
+            {
+                char dir = (usage_id == 0x52) ? 'A'    /* up    -> prev hist  */
+                         : (usage_id == 0x51) ? 'B'    /* down  -> next hist  */
+                         : (usage_id == 0x4F) ? 'C'    /* right               */
+                         :                      'D';   /* left  (0x50)        */
+                seq[0] = 0x1b; seq[1] = '['; seq[2] = dir; slen = 3;
+            }
+            else
+            {
+                uchar c = keymap[usage_id][mod_idx];
+                if (0 == c)
+                    continue;
+                seq[0] = (char)c; slen = 1;
+            }
+
+            for (k = 0; k < slen; k++)
             {
                 if (kbd->icount < USBKBD_IBLEN)
                 {
-                    kbd->in[(kbd->istart + kbd->icount) % USBKBD_IBLEN] = c;
+                    kbd->in[(kbd->istart + kbd->icount) % USBKBD_IBLEN] = seq[k];
                     kbd->icount++;
                     count++;
                 }
-                else
-                {
-                    /* XXX:  Overrun  */
-                }
+                /* else: input ring overrun — drop */
             }
         }
         USBKBD_TRACE("Reported %u new characters", count);

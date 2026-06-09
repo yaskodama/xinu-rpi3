@@ -46,6 +46,7 @@ const struct centry commandtab[] = {
     {"gpiostat", FALSE, xsh_gpiostat},
 #endif
     {"help", FALSE, xsh_help},
+    {"history", FALSE, xsh_history},
     {"ls", FALSE, xsh_ls},
     {"make", TRUE, xsh_make},
 #if defined(ETH0) || defined(_XINU_PLATFORM_ARM_RPI_)
@@ -139,6 +140,10 @@ const struct centry commandtab[] = {
 ulong ncommand = sizeof(commandtab) / sizeof(struct centry);
 extern ulong foreground;
 
+/* The active shell's command history, exposed so the `history` command
+ * (xsh_history) can print it.  Set when shell() initialises its history. */
+struct shell_history *g_shell_hist = NULL;
+
 /**
  * @ingroup shell
  *
@@ -216,7 +221,7 @@ thread shell(int indescrp, int outdescrp, int errdescrp)
     static struct shell_history hist;
     static int hist_ready = 0;
     char promptbuf[NET_HOSTNM_MAXLEN + 8];
-    if (!hist_ready) { shell_history_init(&hist); hist_ready = 1; }
+    if (!hist_ready) { shell_history_init(&hist); g_shell_hist = &hist; hist_ready = 1; }
     if (NULL != hostptr) {
         int n = strlen(SHELL_PROMPT);
         memcpy(promptbuf, SHELL_PROMPT, n);

@@ -4,7 +4,7 @@
 COMP = apps
 
 # Source files for this component
-C_FILES = date.c rdate.c timeserver.c wm.c abcl_program.c abcl_xinu_gui.c abcl_xinu_net.c abcl_xinu_str.c abcl_xinu_ceidr.c abcl_xinu_rpc.c abcl_xinu_http.c abcl_xinu_wait.c gvideo.c gwm.c gsoftkbd.c gfont8x8.c webactor.c sd_block.c cc_mvp.c wifi.c wifi_fw.c
+C_FILES = date.c rdate.c timeserver.c wm.c abcl_program.c abcl_xinu_gui.c abcl_xinu_net.c abcl_xinu_str.c abcl_xinu_ceidr.c abcl_xinu_rpc.c abcl_xinu_http.c abcl_xinu_wait.c gvideo.c gwm.c gsoftkbd.c gfont8x8.c webactor.c sd_block.c cc_mvp.c wifi.c wifi_fw.c basic.c
 
 S_FILES =
 

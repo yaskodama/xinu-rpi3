@@ -40,6 +40,24 @@ static void eth_open_all(void)
 }
 #endif /* NETHER */
 
+/*
+ * Bridge a physical USB keyboard to the on-screen "Shell" window: read keys
+ * from USBKBD0 and feed them to the GWINCON0 shell input — the same seam the
+ * Mac /pi3 page drives over HTTP via gwincon_feed().  Spawned from main() on
+ * the Pi 3 so commands can be typed at the windowed shell with a real keyboard.
+ */
+static thread gwin_kbd_bridge(void)
+{
+    extern void gwm_feed_key(int c);     /* routes to the active window         */
+    open(USBKBD0);                       /* harmless if it has no open routine */
+    for (;;) {
+        int c = getc(USBKBD0);           /* blocks on the HID-report semaphore */
+        if (c == SYSERR) { sleep(50); continue; }   /* keyboard not bound yet  */
+        gwm_feed_key(c);
+    }
+    return OK;
+}
+
 /**
  * Main thread.  You can modify this routine to customize what Embedded Xinu
  * does when it starts up.  The default is designed to do something reasonable
@@ -373,7 +391,14 @@ thread main(void)
 #ifdef _XINU_PLATFORM_ARM_RPI3_
     {
         extern thread gwm_main(void);
+        extern thread basic_main(void);
         ready(create((void *)gwm_main, 65536, INITPRIO, "GWM", 0),
+              RESCHED_NO);
+        /* BASIC interpreter window (its own REPL thread) */
+        ready(create((void *)basic_main, 32768, INITPRIO, "BASIC", 0),
+              RESCHED_NO);
+        /* physical USB keyboard -> active window (shell or BASIC) */
+        ready(create((void *)gwin_kbd_bridge, 8192, INITPRIO, "kbdbridge", 0),
               RESCHED_NO);
     }
 #endif

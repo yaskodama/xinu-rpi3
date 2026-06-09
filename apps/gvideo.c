@@ -198,6 +198,40 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     }
 }
 
+/* Raw screen-space 32bpp save/restore for the mouse-cursor backing store.
+ * (x,y) are ABSOLUTE framebuffer pixels — no viewport, no clip.  The gwm
+ * cursor uses these to stash the pixels under the pointer and put them back
+ * when it moves, so a cursor move is a tiny pixel blit instead of repainting
+ * the scene (which would re-run every window's draw + the soft-float 3-D
+ * wine recompute on this uncached, D-cache-off framebuffer). */
+void video_save_rect(int x, int y, int w, int h, unsigned int *buf)
+{
+    if (!fb_ready) return;
+    for (int dy = 0; dy < h; dy++) {
+        int py = y + dy;
+        unsigned int *row = (unsigned int *)(fb_base + py * fb_pitch);
+        for (int dx = 0; dx < w; dx++) {
+            int px = x + dx;
+            buf[dy * w + dx] =
+                (px >= 0 && px < (int)fb_width && py >= 0 && py < (int)fb_height)
+                ? row[px] : 0;
+        }
+    }
+}
+void video_restore_rect(int x, int y, int w, int h, const unsigned int *buf)
+{
+    if (!fb_ready) return;
+    for (int dy = 0; dy < h; dy++) {
+        int py = y + dy;
+        if (py < 0 || py >= (int)fb_height) continue;
+        unsigned int *row = (unsigned int *)(fb_base + py * fb_pitch);
+        for (int dx = 0; dx < w; dx++) {
+            int px = x + dx;
+            if (px >= 0 && px < (int)fb_width) row[px] = buf[dy * w + dx];
+        }
+    }
+}
+
 /* Single pixel honouring the viewport-adjusted clip + screen bounds. */
 static void put_px(int sx, int sy, unsigned int color)
 {
