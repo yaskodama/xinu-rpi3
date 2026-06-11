@@ -1,0 +1,520 @@
+% USERS_MANUAL_JA.tex — Xinu (RAZ 拡張版) ユーザズマニュアル (日本語版)
+% Build: lualatex USERS_MANUAL_JA.tex   (目次のため 2 回実行)
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage{luatexja-fontspec}
+\setmonofont{Menlo}[Scale=0.85]
+\usepackage[a4paper,margin=2.0cm]{geometry}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{newunicodechar}
+\usepackage[hidelinks]{hyperref}
+
+\newunicodechar{→}{\textrightarrow}
+\newunicodechar{←}{\textleftarrow}
+\newunicodechar{↑}{\textuparrow}
+\newunicodechar{↓}{\textdownarrow}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{…}{\dots}
+\newunicodechar{≤}{\ensuremath{\leq}}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≈}{\ensuremath{\approx}}
+\newunicodechar{≒}{\ensuremath{\fallingdotseq}}
+\newunicodechar{°}{\textdegree}
+
+\DefineVerbatimEnvironment{code}{Verbatim}%
+  {fontsize=\small,frame=single,framerule=0.3pt,rulecolor=\color{gray!60},%
+   framesep=5pt,xleftmargin=2pt,xrightmargin=2pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\textbf{Xinu (RAZ 拡張版) ユーザズマニュアル}\\[3pt]
+  \large XFS ファイルシステム・\texttt{cc} C コンパイラ・%
+  \texttt{abclc} アクタ言語・\texttt{wm} ウィンドウマネージャ}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.0em}
+\begin{center}\rule{0.9\textwidth}{0.4pt}\end{center}
+
+本マニュアルは、Embedded Xinu をベースに、階層型ファイルシステム \textbf{XFS}
+(RAM ディスク上)、組込みのちっちゃな C コンパイラ \textbf{cc} とバイトコード VM
+\textbf{a.out}、アクタ指向小型言語 \textbf{ABCL/c+} とその C トランスレータ
+\textbf{abclc}、ウィンドウマネージャ \textbf{wm} (ARM/QEMU 上のフレームバッファ
+GUI)、Unix 風シェル拡張 (\texttt{ls}/\texttt{cd}/\texttt{cat}/\texttt{make}/%
+\texttt{edit} など) を組み込んだ拡張版 Xinu の使い方をまとめたものです。本家
+Embedded Xinu の機能 (スレッド・セマフォ・ネットワーク等) はそのまま使えます。
+
+{\small\tableofcontents}
+\bigskip
+
+%======================================================================
+\section{はじめに}
+Xinu は Douglas Comer が教育用に開発した小型 UNIX 風 OS です。本拡張版はこれに
+「OS 上で C/ABCL ソースを編集・コンパイル・実行できる自己完結したワークベンチ」を
+載せたもので、ホスト側のクロスコンパイラに頼らずとも、QEMU の中だけでプログラム
+開発のループを完結できます。
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{6.6cm}@{}}
+\toprule
+\textbf{プラットフォーム名} & \textbf{用途} & \textbf{特徴}\\
+\midrule
+\verb|arm-qemu| & QEMU \verb|-M versatilepb| & UART シェル + フレームバッファ + WM 自動起動\\
+\verb|arm-rpi|  & Raspberry Pi 実機 & UART / HDMI / USB キーボード\\
+\bottomrule
+\end{tabular}
+\end{center}
+XFS / cc / abclc / make / edit はどのプラットフォームでも同じように使えます。
+WM 関連 (\verb|rotlines|, \verb|wm_line| など) は arm-qemu でのみ有効です。
+
+%======================================================================
+\section{起動方法}
+\subsection{ビルド}
+\begin{code}
+cd compile
+make PLATFORM=arm-qemu        # 既定。arm-rpi も可
+\end{code}
+成功すると \verb|compile/xinu.boot| が生成されます。
+
+\subsection{QEMU で実行}
+ホストが macOS/Linux で \verb|qemu-system-arm| がインストール済みであれば、用意
+してあるラッパスクリプトが便利です。
+
+\textbf{コンソール専用モード (フレームバッファなし):}
+\begin{code}
+./compile/run-console.sh
+\end{code}
+UART シェル (\verb|xsh$|) が端末に多重化されます。終了は \textbf{Ctrl-A
+\textrightarrow{} x}。環境変数: \verb|XINU_MEM| (既定 \verb|128M|)、
+\verb|XINU_PLATFORM| (既定 \verb|arm-qemu|)。
+
+\textbf{ウィンドウモード (WM デモ込み):}
+\begin{code}
+./compile/run-window.sh
+\end{code}
+LCD フレームバッファが macOS の Cocoa ウィンドウに表示されます。UART シェルは
+起動した端末で動きます (\verb|-serial mon:stdio| で QEMU モニタも同居)。終了は
+ウィンドウを閉じるか端末で \textbf{Ctrl-A \textrightarrow{} x}。ウィンドウは角を
+ドラッグで最大 4 倍まで滑らかに拡大可能 (zoom-to-fit)。
+
+\subsection{起動シーケンス}
+\verb|system/main.c| の \verb|main()| スレッドが以下を順に行います。
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item OS バージョン・メモリレイアウトを表示
+\item \verb|xfsBootstrap()| で RAMDISK0 を XFS でフォーマット \& \verb|/| にマウント
+\item \verb|/home/hello.c|, \verb|sum.c|, \verb|PingPong.abcl|,
+  \verb|RotLines.abcl| をシード書き込み
+\item ネットワークデバイスを open (\verb|NETHER| 有効時)
+\item CONSOLE/TTY1 を open
+\item arm-qemu のときだけ \verb|wm_main| スレッドを \verb|create()|
+\item シェルスレッドを CONSOLE/TTY1 ごとに起動
+\end{enumerate}
+ブート完了後、シェルプロンプトに \verb|xsh$| と表示されればコマンド入力可能です。
+
+%======================================================================
+\section{シェルの使い方}
+\subsection{基本}
+\begin{code}
+コマンド名 [引数...]    [< 入力リダイレクト] [> 出力リダイレクト] [&]
+\end{code}
+\verb|&| でバックグラウンド起動、\verb|<| \verb|>| で入出力デバイスへリダイレクト。
+補完・履歴はありません。
+
+\subsection{コマンド一覧 (本拡張版で追加・拡張されたもの)}
+\begin{center}\footnotesize
+\begin{longtable}{@{}l l p{7.2cm}@{}}
+\toprule
+\textbf{コマンド} & \textbf{使い方} & \textbf{説明}\\
+\midrule \endhead
+\verb|pwd|   & \verb|pwd|              & カレントディレクトリ表示\\
+\verb|cd|    & \verb|cd [PATH]|        & ディレクトリ変更 (省略時は \verb|/|)\\
+\verb|ls|    & \verb|ls [-l] [PATH]|   & 一覧。\verb|-l| で type/size 表示\\
+\verb|cat|   & \verb|cat FILE...|      & ファイル内容表示\\
+\verb|mkdir| & \verb|mkdir DIR...|     & ディレクトリ作成\\
+\verb|rmdir| & \verb|rmdir DIR...|     & 空ディレクトリ削除\\
+\verb|touch| & \verb|touch FILE...|    & 空ファイル作成 / mtime 更新\\
+\verb|rm|    & \verb|rm FILE...|       & ファイル削除\\
+\verb|cp|    & \verb|cp SRC DST|       & コピー (DST は truncate)\\
+\verb|mv|    & \verb|mv SRC DST|       & リネーム/移動\\
+\verb|write| & \verb|write FILE TEXT...| & 引数を空白区切りで連結し改行付きで書き込み\\
+\verb|edit|  & \verb|edit FILE|        & 組込み Emacs 風エディタ\\
+\verb|mkfs|  & \verb|mkfs DEVICE [VOL]| & ブロックデバイスを XFS でフォーマット\\
+\verb|mount| & \verb|mount DEV MNT|    & XFS をマウント\\
+\verb|umount|& \verb|umount MNT|       & XFS をアンマウント\\
+\verb|cc|    & \verb|cc SRC [-o OUT]|  & C ソースを a.out にコンパイル\\
+\verb|abclc| & \verb|abclc SRC.abcl [-o OUT]| & ABCL \textrightarrow{} C \textrightarrow{} a.out 一気通貫\\
+\verb|make|  & \verb|make [TARGET...]| & カレントの Makefile を実行\\
+\verb|run|   & \verb|run PATH|         & a.out を実行\\
+\verb|rotlines| & \verb|rotlines [F] [DEG/F]| & WM 上に回転線を描く\\
+\verb|clear| & \verb|clear|            & 画面クリア\\
+\verb|sleep| & \verb|sleep N|          & N ms スリープ\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\textbf{暗黙の \texttt{run}。} シェルが知らないコマンド名を打つと、最後に
+\verb|aoutRun(<その名前>)| を試します (\verb|shell/shell.c:332| 付近)。つまり
+\verb|cc hello.c -o hello| のあとは \verb|xsh$ hello| でファイルパス相当の名前から
+直接プログラムを起動できます。
+
+%======================================================================
+\section{XFS --- ファイルシステム}
+\verb|include/xfs.h| で定義される 4 KB ブロックの階層型 FS で、起動時に 16 MB の
+RAM ディスク (\verb|RAMDISK0|) 上に作られ \verb|/| にマウントされます。
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l@{}}
+\toprule \textbf{項目} & \textbf{値}\\ \midrule
+ブロックサイズ & 4096 B\\
+最大ファイル名長 & 56 B\\
+inode サイズ & 128 B\\
+直接ブロック & 12 (= 48 KB)\\
+一段間接 & 1024 ブロック (≒ 4 MB)\\
+二段間接 & あり\\
+マジック & \verb|XFS!| (0x58465321)\\
+\bottomrule
+\end{tabular}
+\end{center}
+ディレクトリは inode の中身が \verb|struct xdirent[]| (1 エントリ 64 B) で表現
+され、\verb|xfsReaddir()| で順次読み出します。\verb|xfsChdir()|/\verb|xfsGetcwd()|
+は\textbf{スレッドごと}の絶対パス CWD を保持します (シェル A で \verb|cd /home|
+してもシェル B には影響しません)。\verb|xfsBootstrap()| は \verb|RAMDISK0| 先頭
+64 KB に XFS マジックがあるか調べ、なければ \verb|xfsMkfs| で初期化し \verb|/| に
+マウントします。
+\begin{code}
+int fd = xfsOpen("/home/foo", XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+xfsWrite(fd, buf, n);  xfsRead(fd, buf, n);
+xfsSeek(fd, 0, XFS_SEEK_SET);  xfsClose(fd);
+xfsMkdir("/home/sub");  xfsRename("/home/old", "/home/new");  xfsUnlink("/home/foo");
+\end{code}
+RAMDISK0 は名前のとおり RAM です。\textbf{QEMU を終了するとファイルは消えます。}
+永続的に残したいソースはホストでバックアップしてください。
+
+%======================================================================
+\section{cc / run --- C コンパイラとランチャ}
+\subsection{サポートする C のサブセット}
+\verb|system/cc.c| 冒頭に明記: 1 ソースファイル、\verb|int main(void)| 1 個 + 引数
+なし補助関数。宣言は \verb|int x;| / \verb|int x = expr;| のみ。文は
+\verb|if/else|, \verb|while|, \verb|for|, \verb|return|, ブロック, 式文。式は
+整数・文字列・識別子・\verb|+ - * / %|・比較・\verb|! && |||・単項 \verb|-|・括弧。
+組込み関数のみ呼出可。\verb|#include| は受理して無視。\textbf{未サポート:}
+構造体・ポインタ・配列・浮動小数・複数ファイル。
+
+\subsection{組込み関数 (Built-in)}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{6.6cm}@{}}
+\toprule \textbf{BI} & \textbf{関数} & \textbf{用途}\\ \midrule
+0 & \verb|printf(fmt, ...)| & 文字列・整数フォーマット\\
+1 & \verb|puts(s)| & 文字列+改行\\
+2 & \verb|putchar(c)| & 1 文字出力\\
+3 & \verb|getchar()| & 1 文字入力\\
+4 & \verb|exit(code)| & 終了\\
+5 & \verb|rgb(r,g,b)| & BGR565 16bit カラー値\\
+6 & \verb|wm_line(idx,x1,y1,x2,y2,color)| & WM のユーザ線スロット (0..7) に登録\\
+7 & \verb|wm_render(on)| & ユーザ線レンダの有効/無効\\
+8 & \verb|wm_clear()| & ユーザ線クリア\\
+9 & \verb|sleep_ms(ms)| & スリープ\\
+10/11 & \verb|isin(deg)|/\verb|icos(deg)| & Q12 固定小数 (4096 = 1.0)\\
+12/13 & \verb|screen_w()|/\verb|screen_h()| & 画面サイズ取得\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{a.out 形式とシェルでの使い方}
+\verb|include/aout.h| の \verb|struct aout_header|:
+\begin{code}
++--------------------------+
+| magic = "XAOU"           |
+| version = 1              |
+| code_size / const_size   |
+| entry / nlocals          |
++--------------------------+
+| バイトコード本体           |
+| 文字列定数プール (零終端)  |
++--------------------------+
+\end{code}
+VM はスタック型 (256 entries) で、\verb|OP_PUSH_I32| \verb|OP_LOAD_LOC|
+\verb|OP_ADD| \verb|OP_JZ| \verb|OP_CALL_BI| などの 1 バイトオペコードを持ちます
+(\verb|system/aout.c| の \verb|aoutRun()|)。
+\begin{code}
+xsh$ cc /home/hello.c -o /home/hello
+xsh$ run /home/hello
+hello...
+xsh$ /home/hello              # 暗黙 run でも OK
+\end{code}
+
+%======================================================================
+\section{abclc --- ABCL/c+ アクタ言語}
+ABCL/c+ は「クラス + メッセージ送信」によるアクタ指向の小型言語で、本実装では
+\textbf{abclc が C へ変換し、その C を cc がバイトコード化}する 2 段階構成です。
+\begin{code}
+class ClassName {
+    var field1;
+    method methodName(p1, p2) {
+        field1 = p1 + 1;
+        send other.methodName(arg1, arg2);
+    }
+}
+main {
+    new ClassName a;  new ClassName b;
+    send a.methodName(b, 10);
+}
+\end{code}
+暗黙の識別子 \verb|self| (現在のアクタ ID)・\verb|sender| (送信元 ID)。1 メソッド
+あたり \verb|send| は最大 1 回 (末尾呼び出し型) なので、1 アクタは 1 メッセージずつ
+逐次処理されます。値はすべて \verb|int| 相当。制限: 4 クラス、1 クラス 16 メソッド、
+8 フィールド、8 引数。
+\begin{code}
+xsh$ cd /home/abclcp/abclc
+xsh$ abclc PingPong.abcl
+abclc: translated PingPong.abcl -> PingPong.c
+abclc: compiled PingPong.c -> PingPong
+xsh$ run PingPong
+\end{code}
+\verb|-o NAME| を付けると \verb|NAME.c| (中間 C) と \verb|NAME| (a.out) の両方が
+作られます。abclc が出力する C は cc のビルトインと少数のスケジューリング用ヘルパ
+だけを使い、1 メッセージ = 1 タイムスライスで実行され、\verb|send| 後はキューに
+ぶら下がります。
+
+%======================================================================
+\section{make --- 簡易ビルドシステム}
+\verb|shell/xsh_make.c|: CWD に \verb|Makefile| がなければ \verb|*.c| と
+\verb|*.abcl| を走査して自動生成し、\verb|TARGETS = ...| で指定された (または
+ルール宣言順の) 各ターゲットをビルド。\verb|.c|\,\textrightarrow{}\,%
+\verb|cc SRC -o TARGET|、\verb|.abcl|\,\textrightarrow{}\,\verb|abclc SRC -o TARGET|。
+\begin{code}
+# コメント
+TARGETS = hello sum PingPong RotLines
+hello:    hello.c
+sum:      sum.c
+PingPong: PingPong.abcl
+RotLines: RotLines.abcl
+\end{code}
+明示ルールが無いターゲットは \verb|TARGET.c| \textrightarrow{} \verb|TARGET.abcl|
+の順に存在チェックして自動推論します。
+\begin{code}
+xsh$ cd /home
+xsh$ make
+make: generated Makefile (2 .c, 0 .abcl)
+    cc hello.c -o hello
+    cc sum.c -o sum
+make: built 2 target(s)
+xsh$ ./hello
+hello...
+\end{code}
+
+%======================================================================
+\section{edit --- 組込みエディタ}
+\verb|shell/xsh_edit.c| の Emacs 風モードレスエディタ (最大 400 行 × 256 文字)。
+\verb|edit /home/hello.c|。存在しないパスは新規バッファで開きます。
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l@{}}
+\toprule \textbf{キー} & \textbf{動作}\\ \midrule
+\verb|C-f| / \verb|C-b| & 1 文字 進む / 戻る\\
+\verb|C-n| / \verb|C-p| & 1 行 下 / 上\\
+\verb|C-a| / \verb|C-e| & 行頭 / 行末\\
+←↑→↓ & 矢印 (ESC[ シーケンス)\\
+\verb|C-d| & カーソル位置を削除\\
+\verb|Backspace| & 1 文字戻して削除\\
+\verb|Enter| & 改行挿入\\
+\verb|Tab| & 空白 2 個\\
+\verb|C-k| & 行末まで kill\\
+\verb|C-l| & 再描画\\
+\verb|C-x C-s| & 保存\\
+\verb|C-x C-c| & 保存して終了\\
+\verb|C-g| & 保存せず終了\\
+\bottomrule
+\end{tabular}
+\end{center}
+ステータス行に \verb|L行:C列  status| が表示されます。
+
+%======================================================================
+\section{wm --- ウィンドウマネージャ}
+\verb|apps/wm.c| は arm-qemu の VersatilePB 上で PL110 LCD コントローラ
+(\verb|0x10120000|, 16bpp BGR565) と PL050 PS/2 マウス (\verb|0x10007000|) を直接
+叩いて、1024×1024 仮想画面 (実画面 640×480) のデスクトップ風 GUI を表示します。
+\verb|run-window.sh| で起動するとブート時に自動で \verb|wm_main| が立ち上がります。
+提供するもの: ステータスバー、ドラッグ可能なデモウィンドウ 3 枚、マウスカーソル、
+ユーザ用描画フック \verb|wm_set_user_render(...)|、直接描画 API
+(\verb|put_pixel_pub| / \verb|fill_rect_pub| / \verb|rect_outline_pub| /
+\verb|draw_string_pub| / \verb|wm_draw_line|)。
+
+C プログラム / ABCL からは a.out のビルトイン経由で \verb|rgb(r,g,b)|・
+\verb|wm_render(1)|・\verb|wm_line(idx,...)|・\verb|wm_clear()|・
+\verb|screen_w()|/\verb|screen_h()| を使うのが基本です (RotLines.abcl 参照)。
+シェルコマンド \verb|rotlines| はもう少し低レベルで、\verb|wm_set_user_render|
+で毎フレームの描画関数を直接 WM に登録します。
+
+%======================================================================
+\section{サンプルプログラム詳説}
+ブート時に \verb|system/main.c| が以下 4 本を XFS にシードします。
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule \textbf{パス} & \textbf{種類} & \textbf{主役}\\ \midrule
+\verb|/home/hello.c| & C & \verb|printf|\\
+\verb|/home/sum.c|   & C & \verb|for| ループ\\
+\verb|.../PingPong.abcl| & ABCL & アクタ間メッセージ\\
+\verb|.../RotLines.abcl| & ABCL + WM & アニメーション\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{hello.c / sum.c}
+\begin{code}
+int main(void) { printf("hello...\n"); return 0; }
+\end{code}
+\verb|#include| は受理して無視、\verb|printf| はビルトイン 0、戻り値は
+\verb|aoutRun()| の戻り値になります。簡略バイトコード:
+\begin{code}
+ENTER 0                         ; main は局所なし
+PUSH_STR offset_of("hello...\n")
+CALL_BI 0, 1                    ; printf, 引数 1
+PUSH_I32 0
+RET
+\end{code}
+\verb|sum.c| は \verb|for| ループの例 (cc は \verb|for(init;cond;step)| を
+\verb|init; while(cond){body; step;}| に展開。\verb|+= ++ --| は未サポート):
+\begin{code}
+xsh$ cc /home/sum.c -o /home/sum
+xsh$ run /home/sum
+sum 1..10 = 55
+\end{code}
+
+\subsection{PingPong.abcl --- アクタ間メッセージング}
+\begin{code}
+class Player {
+    var hits;
+    method bounce(other, n) {
+        if (n > 0) {
+            printf("Player %d: tick (n=%d) hits=%d\n", self, n, hits);
+            hits = hits + 1;
+            send other.bounce(self, n - 1);
+        }
+    }
+}
+main { new Player p1; new Player p2; send p1.bounce(p2, 6); }
+\end{code}
+\verb|self| はメソッド内の現在アクタ ID (生成順 0,1,\dots)、\verb|send| は
+\textbf{非同期}、\verb|n-1| が 0 で \verb|if| を抜けると \verb|send| が出ず連鎖は
+自然停止します。
+\begin{code}
+Player 0: tick (n=6) hits=0
+Player 1: tick (n=5) hits=0
+Player 0: tick (n=4) hits=1
+...
+Player 1: tick (n=1) hits=2
+\end{code}
+
+\subsection{RotLines.abcl --- ABCL + WM のアニメーション}
+\begin{code}
+class Rotator {
+    var angle;
+    method spin(n) {
+        if (n > 0) {
+            wm_line(0, 512, 384,
+                    512 + icos(angle) * 320 / 4096,
+                    384 + isin(angle) * 320 / 4096, rgb(255, 80, 80));
+            // スロット 1..3 を +90/+180/+270 度で同様に
+            sleep_ms(16);
+            angle = angle + 3;
+            send self.spin(n - 1);
+        } else { wm_render(0); }
+    }
+    method start(n) { wm_render(1); send self.spin(n); }
+}
+main { new Rotator r; send r.start(360); }
+\end{code}
+\verb|icos|/\verb|isin| は Q12 固定小数を返すので半径を掛けたら 4096 で割る。
+\verb|sleep_ms(16)| でだいたい 60 fps。\verb|self| への再帰送信でアニメーション
+ループを作り、終了条件 (\verb|n == 0|) で \verb|wm_render(0)| を呼んで線レイヤを
+消します。
+
+\subsection{rotlines (シェルコマンド) と apps/abcl\_program.c}
+\verb|shell/xsh_rotlines.c| は \verb|rot_render()| を \verb|wm_set_user_render()|
+で WM に渡し、メインスレッドは角度を進めながら \verb|sleep(16)| を繰り返すだけ。
+描画は (スロット型の \verb|wm_line| ではなく) 毎フレーム関数の \verb|wm_draw_line|。
+\verb|apps/abcl_program.c| は「abclc が ABCL から\textbf{生成する側}の C」の見本で、
+有限バッファ問題 (\verb|Buffer|/\verb|Producer|/\verb|Consumer|/\verb|Controller|
+クラス、アクタ毎にメールボックス + スレッド、\verb|dispatch_*| メガディスパッチ)
+を実装しています。ABCL の \verb|class| が C の \verb|dispatch_<Class>| に、
+\verb|field| が \verb|enum| インデックスに、\verb|send| が \verb|enqueue| に対応
+する様子を読み取れます。
+
+%======================================================================
+\section{開発ワークフロー}
+\begin{code}
+$ ./compile/run-window.sh
+xsh$ cd /home && make && ./hello && ./sum
+xsh$ edit /home/myprog.c          # C-x C-s 保存、C-x C-c 終了
+xsh$ cc myprog.c -o myprog && ./myprog
+xsh$ cd /home/abclcp/abclc
+xsh$ edit MyActor.abcl && abclc MyActor.abcl && ./MyActor
+xsh$ rotlines
+\end{code}
+ヒント: 1 ターゲットだけなら \verb|make MyActor|、全部作り直すなら
+\verb|rm Makefile && make|。XFS の inode は 32768 までなので大量作成は注意。
+
+%======================================================================
+\section{トラブルシューティング}
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{5.0cm} p{8.4cm}@{}}
+\toprule \textbf{症状} & \textbf{原因 / 対処}\\ \midrule \endhead
+\verb|qemu-system-arm not found| & \verb|brew install qemu| / \verb|apt install qemu-system-arm|\\
+ビルドが古いまま起動する & \verb|compile/| で \verb|make clean && make PLATFORM=arm-qemu|\\
+シェルプロンプトが出ない & \verb|Ctrl-A| \textrightarrow{} \verb|c| で QEMU モニタ、\verb|info registers|\\
+\verb|cc: line N: ...| エラー & サポート外構文 (構造体・ポインタ・配列・浮動小数 等)\\
+\verb|abclc: translation failed| & 1 メソッドに \verb|send| 2 個、\verb|var|/メソッド数オーバ 等\\
+\verb|command not found| だが実体あり & 暗黙 \verb|run| はパス 1 トークンのみ。引数は \verb|run PATH ARGS...|\\
+WM ウィンドウが出ない & \verb|arm-qemu| ビルドか? \verb|run-window.sh| を使ったか?\\
+ファイルが消えた & RAMDISK は揮発性。ホスト側にバックアップを\\
+パスが長すぎる & \verb|XFS_PATH_MAX = 256|。長すぎるパスは切り詰め\\
+画面が崩れた & エディタ中なら \verb|C-l|、シェルなら \verb|clear|\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+%======================================================================
+\section*{付録 A. ファイルマップ}
+\addcontentsline{toc}{section}{付録 A. ファイルマップ}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{9.0cm}@{}}
+\toprule \textbf{領域} & \textbf{主要ファイル}\\ \midrule
+起動 & \verb|system/main.c|, \verb|system/initialize.c|, \verb|compile/run-*.sh|\\
+XFS  & \verb|include/xfs.h|, \verb|system/xfs.c|, \verb|device/ramdisk/|\\
+cc   & \verb|include/aout.h|, \verb|system/cc.c|, \verb|system/aout.c|, \verb|shell/xsh_cc.c|\\
+abclc& \verb|include/abclc.h|, \verb|system/abclc.c|, \verb|shell/xsh_abclc.c|\\
+make/edit & \verb|shell/xsh_make.c|, \verb|shell/xsh_edit.c|\\
+WM   & \verb|apps/wm.c|, \verb|apps/abcl_xinu_gui.c|, \verb|shell/xsh_rotlines.c|\\
+プラットフォーム & \verb|compile/platforms/arm-qemu/|, \verb|compile/platforms/arm-rpi/|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{付録 B. 既存サンプル一覧 (FS シード後)}
+\addcontentsline{toc}{section}{付録 B. 既存サンプル一覧}
+\begin{code}
+/home/
+├── hello.c
+├── sum.c
+└── abclcp/
+    └── abclc/
+        ├── PingPong.abcl
+        └── RotLines.abcl
+\end{code}
+\verb|cd /home && make| で \verb|hello|, \verb|sum| が、
+\verb|cd /home/abclcp/abclc && make| で \verb|PingPong|, \verb|RotLines| が
+それぞれ a.out として生成されます。さらに深く知るには \verb|system/cc.c| と
+\verb|system/aout.c| (バイトコード VM)、\verb|system/abclc.c| (ABCL 翻訳) を
+読むのが近道です。
+
+\end{document}

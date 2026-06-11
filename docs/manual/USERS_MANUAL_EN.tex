@@ -1,0 +1,529 @@
+% USERS_MANUAL_EN.tex — Xinu (RAZ Extended Edition) User's Manual (English)
+% Build: lualatex USERS_MANUAL_EN.tex   (run twice for the ToC)
+\documentclass[a4paper,11pt]{article}
+
+\usepackage{fontspec}
+\setmonofont{Menlo}[Scale=0.86]
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{newunicodechar}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+
+\newunicodechar{→}{\textrightarrow}
+\newunicodechar{←}{\textleftarrow}
+\newunicodechar{↑}{\textuparrow}
+\newunicodechar{↓}{\textdownarrow}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{…}{\dots}
+\newunicodechar{≤}{\ensuremath{\leq}}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≈}{\ensuremath{\approx}}
+\newunicodechar{≒}{\ensuremath{\fallingdotseq}}
+\newunicodechar{°}{\textdegree}
+\newunicodechar{—}{\textemdash}
+
+\definecolor{codebg}{gray}{0.96}
+\DefineVerbatimEnvironment{code}{Verbatim}%
+  {fontsize=\small,frame=single,framerule=0.3pt,rulecolor=\color{gray!60},%
+   framesep=5pt,xleftmargin=2pt,xrightmargin=2pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\textbf{Xinu (RAZ Extended Edition)\\User's Manual}\\[3pt]
+  \large XFS filesystem, \texttt{cc} C compiler, \texttt{abclc} actor language,
+  \texttt{wm} window manager}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.0em}
+\begin{center}\rule{0.9\textwidth}{0.4pt}\end{center}
+
+This manual describes an extended Embedded Xinu that adds a hierarchical
+filesystem \textbf{XFS} (on a RAM disk), a tiny built-in C compiler
+\textbf{cc} and bytecode VM \textbf{a.out}, an actor-oriented small language
+\textbf{ABCL/c+} with its C translator \textbf{abclc}, a window manager
+\textbf{wm} (a framebuffer GUI on ARM/QEMU), and Unix-like shell extensions
+(\texttt{ls} / \texttt{cd} / \texttt{cat} / \texttt{make} / \texttt{edit}, \dots).
+All stock Embedded Xinu facilities (threads, semaphores, networking) remain
+available.
+
+{\small\tableofcontents}
+\bigskip
+
+%======================================================================
+\section{Introduction}
+Xinu is a small UNIX-like OS originally written by Douglas Comer for teaching.
+This extended edition adds a self-contained workbench that can edit, compile,
+and run C / ABCL source on the OS itself --- so the whole develop-build-run
+loop closes inside QEMU (or on real hardware) without a host cross-compiler.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{6.4cm}@{}}
+\toprule
+\textbf{Platform} & \textbf{Use} & \textbf{Notes}\\
+\midrule
+\verb|arm-qemu| & QEMU \verb|-M versatilepb| & UART shell + framebuffer + WM auto-start\\
+\verb|arm-rpi|  & Raspberry Pi hardware     & UART / HDMI / USB keyboard\\
+\bottomrule
+\end{tabular}
+\end{center}
+XFS / cc / abclc / make / edit behave identically on every platform; the
+WM-related pieces (\verb|rotlines|, \verb|wm_line|, \dots) are active on
+\verb|arm-qemu| only.
+
+%======================================================================
+\section{Booting}
+\subsection{Build}
+\begin{code}
+cd compile
+make PLATFORM=arm-qemu        # default; arm-rpi also works
+\end{code}
+On success this produces \verb|compile/xinu.boot|.
+
+\subsection{Run under QEMU}
+With \verb|qemu-system-arm| installed, the bundled wrapper scripts are easiest.
+
+\textbf{Console-only mode (no framebuffer):}
+\begin{code}
+./compile/run-console.sh
+\end{code}
+The UART shell (\verb|xsh$|) is multiplexed onto the terminal; quit with
+\textbf{Ctrl-A \textrightarrow{} x}. Env vars: \verb|XINU_MEM| (default
+\verb|128M|), \verb|XINU_PLATFORM| (default \verb|arm-qemu|).
+
+\textbf{Window mode (with the WM demo):}
+\begin{code}
+./compile/run-window.sh
+\end{code}
+The LCD framebuffer appears in a macOS Cocoa window; the UART shell runs in the
+launching terminal (\verb|-serial mon:stdio| keeps the QEMU monitor alongside).
+Quit by closing the window or \textbf{Ctrl-A \textrightarrow{} x}. The window
+scales smoothly up to 4× by dragging a corner (zoom-to-fit).
+
+\subsection{Boot sequence}
+The \verb|main()| thread in \verb|system/main.c| does, in order:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item print the OS version and memory layout;
+\item \verb|xfsBootstrap()| --- format \verb|RAMDISK0| as XFS and mount it at \verb|/|;
+\item seed \verb|/home/hello.c|, \verb|/home/sum.c|,
+  \verb|.../PingPong.abcl|, \verb|.../RotLines.abcl|;
+\item open the network device (when \verb|NETHER| is enabled);
+\item open CONSOLE / TTY1;
+\item on \verb|arm-qemu| only, \verb|create()| the \verb|wm_main| thread;
+\item start a shell thread per CONSOLE / TTY1.
+\end{enumerate}
+When boot finishes, the prompt \verb|xsh$| means you can type commands.
+
+%======================================================================
+\section{Using the shell}
+\subsection{Basics}
+\begin{code}
+command [args...]    [< input-redirect] [> output-redirect] [&]
+\end{code}
+\verb|&| runs in the background; \verb|<| \verb|>| redirect to/from I/O devices;
+there is no completion or history.
+
+\subsection{Command list (added/extended by this edition)}
+\begin{center}\footnotesize
+\begin{longtable}{@{}l l p{7.4cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Usage} & \textbf{Description}\\
+\midrule \endhead
+\verb|pwd|   & \verb|pwd|              & Print the current directory\\
+\verb|cd|    & \verb|cd [PATH]|        & Change directory (default \verb|/|)\\
+\verb|ls|    & \verb|ls [-l] [PATH]|   & Directory listing; \verb|-l| shows type/size\\
+\verb|cat|   & \verb|cat FILE...|      & Print file contents\\
+\verb|mkdir| & \verb|mkdir DIR...|     & Create directories\\
+\verb|rmdir| & \verb|rmdir DIR...|     & Remove empty directories\\
+\verb|touch| & \verb|touch FILE...|    & Create empty file / update mtime\\
+\verb|rm|    & \verb|rm FILE...|       & Remove files\\
+\verb|cp|    & \verb|cp SRC DST|       & Copy (DST truncated)\\
+\verb|mv|    & \verb|mv SRC DST|       & Rename / move\\
+\verb|write| & \verb|write FILE TEXT...| & Join args with spaces + newline into FILE\\
+\verb|edit|  & \verb|edit FILE|        & Built-in Emacs-like editor\\
+\verb|mkfs|  & \verb|mkfs DEVICE [VOL]| & Format a block device as XFS\\
+\verb|mount| & \verb|mount DEV MNT|    & Mount an XFS\\
+\verb|umount|& \verb|umount MNT|       & Unmount an XFS\\
+\verb|cc|    & \verb|cc SRC [-o OUT]|  & Compile C source to a.out\\
+\verb|abclc| & \verb|abclc SRC.abcl [-o OUT]| & ABCL \textrightarrow{} C \textrightarrow{} a.out in one step\\
+\verb|make|  & \verb|make [TARGET...]| & Run the Makefile in the current directory\\
+\verb|run|   & \verb|run PATH|         & Execute an a.out\\
+\verb|rotlines| & \verb|rotlines [FRAMES] [DEG/F]| & Draw rotating lines on the WM\\
+\verb|clear| & \verb|clear|            & Clear the screen\\
+\verb|sleep| & \verb|sleep N|          & Sleep N ms\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\textbf{Implicit \texttt{run}.} If you type a command the shell does not
+recognise, it tries \verb|aoutRun(<that name>)| as a last resort (around
+\verb|shell/shell.c:332|). So after \verb|cc hello.c -o hello| you can launch the
+program directly by its path-like name (\verb|xsh$ hello| \textrightarrow{}
+\verb|hello...|).
+
+%======================================================================
+\section{XFS --- the filesystem}
+A 4 KB-block hierarchical filesystem (\verb|include/xfs.h|), created on a 16 MB
+RAM disk (\verb|RAMDISK0|) at boot and mounted at \verb|/|.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l@{}}
+\toprule \textbf{Item} & \textbf{Value}\\ \midrule
+Block size & 4096 B\\
+Max filename length & 56 B\\
+inode size & 128 B\\
+Direct blocks & 12 (= 48 KB)\\
+Single indirect & 1024 blocks (≈ 4 MB)\\
+Double indirect & yes\\
+Magic & \verb|XFS!| (0x58465321)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Directories store \verb|struct xdirent[]| (64 B/entry) inside the inode, read
+with \verb|xfsReaddir()|. \verb|xfsChdir()| / \verb|xfsGetcwd()| keep a
+\textbf{per-thread} absolute-path CWD (\verb|cd /home| in shell A does not affect
+shell B). \verb|xfsBootstrap()| checks the first 64 KB of \verb|RAMDISK0| for the
+XFS magic, runs \verb|xfsMkfs| if absent, and mounts at \verb|/|.
+
+Main API from C:
+\begin{code}
+int fd = xfsOpen("/home/foo", XFS_O_RDWR | XFS_O_CREAT | XFS_O_TRUNC);
+xfsWrite(fd, buf, n);  xfsRead(fd, buf, n);
+xfsSeek(fd, 0, XFS_SEEK_SET);  xfsClose(fd);
+xfsMkdir("/home/sub");  xfsRename("/home/old", "/home/new");  xfsUnlink("/home/foo");
+\end{code}
+\textbf{RAMDISK0 is RAM: files disappear when QEMU exits.} Back up anything you
+want to keep on the host.
+
+%======================================================================
+\section{cc / run --- the C compiler and launcher}
+\subsection{Supported C subset}
+Documented at the top of \verb|system/cc.c|: one source file, one
+\verb|int main(void)| plus argument-less helpers; declarations \verb|int x;| /
+\verb|int x = expr;| only; statements \verb|if/else|, \verb|while|, \verb|for|,
+\verb|return|, blocks, expression statements; expressions over integers,
+strings, identifiers, \verb|+ - * / %|, the comparisons,
+\verb|! && ||| (logical), unary \verb|-|, parentheses; only built-in calls;
+\verb|#include| accepted and ignored. \textbf{Unsupported:} structs, pointers,
+arrays, floating point, multiple files.
+
+\subsection{Built-in functions}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{6.8cm}@{}}
+\toprule \textbf{BI} & \textbf{Function} & \textbf{Use}\\ \midrule
+0 & \verb|printf(fmt, ...)| & string / integer formatting\\
+1 & \verb|puts(s)| & string + newline\\
+2 & \verb|putchar(c)| & one character\\
+3 & \verb|getchar()| & one character of input\\
+4 & \verb|exit(code)| & terminate\\
+5 & \verb|rgb(r,g,b)| & BGR565 16-bit colour\\
+6 & \verb|wm_line(idx,x1,y1,x2,y2,color)| & set WM user-line slot (0..7)\\
+7 & \verb|wm_render(on)| & enable/disable user-line rendering\\
+8 & \verb|wm_clear()| & clear user lines\\
+9 & \verb|sleep_ms(ms)| & sleep\\
+10/11 & \verb|isin(deg)| / \verb|icos(deg)| & Q12 fixed point (4096 = 1.0)\\
+12/13 & \verb|screen_w()| / \verb|screen_h()| & screen size\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{a.out format and shell usage}
+\verb|struct aout_header| in \verb|include/aout.h|:
+\begin{code}
++--------------------------+
+| magic = "XAOU"           |
+| version = 1              |
+| code_size / const_size   |
+| entry / nlocals          |
++--------------------------+
+| bytecode body            |
+| string constant pool     |
++--------------------------+
+\end{code}
+The VM is stack-based (256 entries) with one-byte opcodes (\verb|OP_PUSH_I32|,
+\verb|OP_LOAD_LOC|, \verb|OP_ADD|, \verb|OP_JZ|, \verb|OP_CALL_BI|); see
+\verb|aoutRun()| in \verb|system/aout.c|.
+\begin{code}
+xsh$ cc /home/hello.c -o /home/hello
+xsh$ run /home/hello
+hello...
+xsh$ /home/hello              # implicit run also works
+\end{code}
+
+%======================================================================
+\section{abclc --- the ABCL/c+ actor language}
+ABCL/c+ is a small actor-oriented language ("classes + message sends"). Here it
+is two-stage: \textbf{abclc translates to C, and cc compiles that C to bytecode}.
+\begin{code}
+class ClassName {
+    var field1;
+    method methodName(p1, p2) {
+        field1 = p1 + 1;
+        send other.methodName(arg1, arg2);
+    }
+}
+main {
+    new ClassName a;  new ClassName b;
+    send a.methodName(b, 10);
+}
+\end{code}
+Implicit identifiers \verb|self| (current actor id) and \verb|sender|; at most
+one \verb|send| per method (tail-call style), so each actor processes one message
+at a time; all values are \verb|int|-equivalent; limits: 4 classes, 16
+methods/class, 8 fields, 8 args.
+\begin{code}
+xsh$ cd /home/abclcp/abclc
+xsh$ abclc PingPong.abcl
+abclc: translated PingPong.abcl -> PingPong.c
+abclc: compiled PingPong.c -> PingPong
+xsh$ run PingPong
+\end{code}
+With \verb|-o NAME|, both \verb|NAME.c| (intermediate C) and \verb|NAME| (a.out)
+are written. The emitted C uses only cc's built-ins plus a few scheduling
+helpers; one message runs per time-slice, and after a \verb|send| the message is
+queued.
+
+%======================================================================
+\section{make --- the minimal build system}
+\verb|shell/xsh_make.c|: if the CWD has no \verb|Makefile|, scan \verb|*.c| and
+\verb|*.abcl| and auto-generate one; read it and build each target in
+\verb|TARGETS = ...| (or declaration order); \verb|.c|\,\textrightarrow{}\,
+\verb|cc SRC -o TARGET|, \verb|.abcl|\,\textrightarrow{}\,\verb|abclc SRC -o TARGET|.
+\begin{code}
+# comment
+TARGETS = hello sum PingPong RotLines
+hello:    hello.c
+sum:      sum.c
+PingPong: PingPong.abcl
+RotLines: RotLines.abcl
+\end{code}
+Targets with no explicit rule are inferred by checking \verb|TARGET.c| then
+\verb|TARGET.abcl|.
+\begin{code}
+xsh$ cd /home
+xsh$ make
+make: generated Makefile (2 .c, 0 .abcl)
+    cc hello.c -o hello
+    cc sum.c -o sum
+make: built 2 target(s)
+xsh$ ./hello
+hello...
+\end{code}
+
+%======================================================================
+\section{edit --- the built-in editor}
+\verb|shell/xsh_edit.c| is an Emacs-like modeless editor (up to 400 lines × 256
+chars). \verb|edit /home/hello.c|; a non-existent path opens a new buffer.
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l@{}}
+\toprule \textbf{Key} & \textbf{Action}\\ \midrule
+\verb|C-f| / \verb|C-b| & forward / back one character\\
+\verb|C-n| / \verb|C-p| & down / up one line\\
+\verb|C-a| / \verb|C-e| & start / end of line\\
+←↑→↓ & arrows (ESC[ sequences)\\
+\verb|C-d| & delete at cursor\\
+\verb|Backspace| & delete previous character\\
+\verb|Enter| & insert newline\\
+\verb|Tab| & two spaces\\
+\verb|C-k| & kill to end of line\\
+\verb|C-l| & redraw\\
+\verb|C-x C-s| & save\\
+\verb|C-x C-c| & save and exit\\
+\verb|C-g| & exit without saving\\
+\bottomrule
+\end{tabular}
+\end{center}
+The status line shows \verb|Lrow:Ccol  status|.
+
+%======================================================================
+\section{wm --- the window manager}
+\verb|apps/wm.c| drives, on QEMU's VersatilePB, the PL110 LCD controller
+(\verb|0x10120000|, 16bpp BGR565) and the PL050 PS/2 mouse (\verb|0x10007000|)
+directly, showing a desktop-like GUI on a 1024×1024 virtual screen (640×480
+physical). With \verb|run-window.sh|, \verb|wm_main| starts at boot. It provides
+a status bar, three draggable demo windows, a mouse cursor, a user draw hook
+\verb|wm_set_user_render(...)|, and direct drawing APIs (\verb|put_pixel_pub|,
+\verb|fill_rect_pub|, \verb|rect_outline_pub|, \verb|draw_string_pub|,
+\verb|wm_draw_line|).
+
+From C / ABCL the basic pattern is \verb|rgb(r,g,b)|, \verb|wm_render(1)|,
+\verb|wm_line(idx,...)|, \verb|wm_clear()|, \verb|screen_w()|/\verb|screen_h()|
+(see RotLines.abcl). The shell command \verb|rotlines| is lower-level: it
+registers a per-frame draw function via \verb|wm_set_user_render(rot_render)|.
+
+%======================================================================
+\section{Sample programs in detail}
+At boot, \verb|system/main.c| seeds four files into XFS:
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule \textbf{Path} & \textbf{Kind} & \textbf{Focus}\\ \midrule
+\verb|/home/hello.c| & C & \verb|printf|\\
+\verb|/home/sum.c|   & C & \verb|for| loop\\
+\verb|.../PingPong.abcl| & ABCL & inter-actor messaging\\
+\verb|.../RotLines.abcl| & ABCL + WM & animation\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{hello.c and sum.c}
+\begin{code}
+int main(void) { printf("hello...\n"); return 0; }
+\end{code}
+\verb|#include| is accepted/ignored; \verb|printf| is built-in 0; the return
+value becomes \verb|aoutRun()|'s result. The simplified bytecode:
+\begin{code}
+ENTER 0                         ; main has no locals
+PUSH_STR offset_of("hello...\n")
+CALL_BI 0, 1                    ; printf, 1 arg
+PUSH_I32 0
+RET
+\end{code}
+\verb|sum.c| uses a \verb|for| loop (cc expands \verb|for(init;cond;step)| to
+\verb|init; while(cond){body; step;}|; note \verb|+= ++ --| are unsupported):
+\begin{code}
+xsh$ cc /home/sum.c -o /home/sum
+xsh$ run /home/sum
+sum 1..10 = 55
+\end{code}
+
+\subsection{PingPong.abcl --- inter-actor messaging}
+\begin{code}
+class Player {
+    var hits;
+    method bounce(other, n) {
+        if (n > 0) {
+            printf("Player %d: tick (n=%d) hits=%d\n", self, n, hits);
+            hits = hits + 1;
+            send other.bounce(self, n - 1);
+        }
+    }
+}
+main { new Player p1; new Player p2; send p1.bounce(p2, 6); }
+\end{code}
+\verb|self| is the current actor id (creation order 0,1,\dots); \verb|send| is
+asynchronous; when \verb|n-1| reaches 0 no \verb|send| is emitted and the chain
+stops:
+\begin{code}
+Player 0: tick (n=6) hits=0
+Player 1: tick (n=5) hits=0
+Player 0: tick (n=4) hits=1
+...
+Player 1: tick (n=1) hits=2
+\end{code}
+
+\subsection{RotLines.abcl --- ABCL + WM animation}
+\begin{code}
+class Rotator {
+    var angle;
+    method spin(n) {
+        if (n > 0) {
+            wm_line(0, 512, 384,
+                    512 + icos(angle) * 320 / 4096,
+                    384 + isin(angle) * 320 / 4096, rgb(255, 80, 80));
+            // slots 1..3 at +90/+180/+270 deg likewise
+            sleep_ms(16);
+            angle = angle + 3;
+            send self.spin(n - 1);
+        } else { wm_render(0); }
+    }
+    method start(n) { wm_render(1); send self.spin(n); }
+}
+main { new Rotator r; send r.start(360); }
+\end{code}
+\verb|icos|/\verb|isin| return Q12 fixed point (divide by 4096 after scaling by
+the radius); \verb|sleep_ms(16)| ≈ 60 fps; sending to \verb|self| forms the
+animation loop, and \verb|wm_render(0)| removes the line layer at the end.
+
+\subsection{rotlines (shell command) and apps/abcl\_program.c}
+\verb|shell/xsh_rotlines.c| registers \verb|rot_render()| with the WM via
+\verb|wm_set_user_render()| and loops advancing the angle with \verb|sleep(16)|;
+it draws with \verb|wm_draw_line| (per-frame) rather than the slot-based
+\verb|wm_line|. \verb|apps/abcl_program.c| is a sample of the C that abclc
+\emph{generates} (a bounded-buffer with \verb|Buffer|/\verb|Producer|/%
+\verb|Consumer|/\verb|Controller| classes, mailbox + thread per actor,
+\verb|dispatch_*| mega-switch); it shows the correspondence ABCL \verb|class|
+\textrightarrow{} C \verb|dispatch_<Class>|, \verb|field| \textrightarrow{}
+\verb|enum| index, \verb|send| \textrightarrow{} \verb|enqueue|.
+
+%======================================================================
+\section{Development workflow}
+\begin{code}
+$ ./compile/run-window.sh
+xsh$ cd /home && make && ./hello && ./sum
+xsh$ edit /home/myprog.c          # C-x C-s save, C-x C-c exit
+xsh$ cc myprog.c -o myprog && ./myprog
+xsh$ cd /home/abclcp/abclc
+xsh$ edit MyActor.abcl && abclc MyActor.abcl && ./MyActor
+xsh$ rotlines
+\end{code}
+Tips: build one target with \verb|make MyActor|; rebuild all with
+\verb|rm Makefile && make|; XFS has up to 32768 inodes, so avoid creating many
+files.
+
+%======================================================================
+\section{Troubleshooting}
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{5.0cm} p{8.4cm}@{}}
+\toprule \textbf{Symptom} & \textbf{Cause / fix}\\ \midrule \endhead
+\verb|qemu-system-arm not found| & \verb|brew install qemu| / \verb|apt install qemu-system-arm|\\
+stale build boots & \verb|make clean && make PLATFORM=arm-qemu| in \verb|compile/|\\
+no shell prompt & \verb|Ctrl-A| \textrightarrow{} \verb|c| for the QEMU monitor, then \verb|info registers|\\
+\verb|cc: line N: ...| error & unsupported syntax (structs, pointers, arrays, float, \dots)\\
+\verb|abclc: translation failed| & two \verb|send|s in one method, too many \verb|var|s / methods\\
+\verb|command not found| but file exists & implicit \verb|run| takes a single path token; use \verb|run PATH ARGS...|\\
+no WM window & is it an \verb|arm-qemu| build? did you use \verb|run-window.sh|?\\
+files vanished & the RAM disk is volatile --- back up on the host\\
+overlong path & \verb|XFS_PATH_MAX = 256|; longer paths are truncated\\
+garbled screen & \verb|C-l| in the editor; \verb|clear| in the shell\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+%======================================================================
+\section*{Appendix A. File map}
+\addcontentsline{toc}{section}{Appendix A. File map}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{9.2cm}@{}}
+\toprule \textbf{Area} & \textbf{Key files}\\ \midrule
+Boot & \verb|system/main.c|, \verb|system/initialize.c|, \verb|compile/run-*.sh|\\
+XFS  & \verb|include/xfs.h|, \verb|system/xfs.c|, \verb|device/ramdisk/|\\
+cc   & \verb|include/aout.h|, \verb|system/cc.c|, \verb|system/aout.c|, \verb|shell/xsh_cc.c|\\
+abclc& \verb|include/abclc.h|, \verb|system/abclc.c|, \verb|shell/xsh_abclc.c|\\
+make/edit & \verb|shell/xsh_make.c|, \verb|shell/xsh_edit.c|\\
+WM   & \verb|apps/wm.c|, \verb|apps/abcl_xinu_gui.c|, \verb|shell/xsh_rotlines.c|\\
+platform & \verb|compile/platforms/arm-qemu/|, \verb|compile/platforms/arm-rpi/|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{Appendix B. Existing samples (after FS seeding)}
+\addcontentsline{toc}{section}{Appendix B. Existing samples}
+\begin{code}
+/home/
+├── hello.c
+├── sum.c
+└── abclcp/
+    └── abclc/
+        ├── PingPong.abcl
+        └── RotLines.abcl
+\end{code}
+\verb|cd /home && make| builds \verb|hello|, \verb|sum|;
+\verb|cd /home/abclcp/abclc && make| builds \verb|PingPong|, \verb|RotLines|.
+To go deeper, read \verb|system/cc.c|, \verb|system/aout.c| (the bytecode VM),
+and \verb|system/abclc.c| (the ABCL translator).
+
+\end{document}
