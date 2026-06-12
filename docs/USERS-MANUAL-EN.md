@@ -109,6 +109,188 @@ xsh$
 
 means you can type commands.
 
+### 2.4 Running on real hardware (Raspberry Pi 3 B+)
+
+You can run this workbench on a real Raspberry Pi 3 B+ (BCM2837), not just under
+QEMU. Build for the dedicated `arm-rpi3` platform and boot from a microSD card.
+
+#### 2.4.1 Build for the board
+
+```sh
+cd compile
+make PLATFORM=arm-rpi3        # → compile/xinu.boot (~305 KB)
+```
+
+> If you changed a shared header (e.g. `include/thread.h`), `make clean` does not
+> rebuild `libxc`. If `printf`-to-device breaks, force it:
+> `rm -f lib/libxc/*.o lib/libxc.a && make PLATFORM=arm-rpi3`
+
+#### 2.4.2 What the SD card needs
+
+The Pi 3 firmware boots from a FAT32 partition. Put on it:
+
+| File | Source |
+| --- | --- |
+| `bootcode.bin` / `start.elf` / `fixup.dat` | copied from any Raspberry Pi OS boot partition (not in this repo) |
+| `kernel.img` | your built `xinu.boot`, renamed |
+| `config.txt` | `compile/sdcard-rpi3/config.txt` |
+
+Key `config.txt` lines:
+
+| Line | Meaning |
+| --- | --- |
+| `arm_64bit=0` | boot 32-bit (AArch32) |
+| `kernel=kernel.img` | kernel file name |
+| `kernel_address=0x8000` | load address (0x8000) |
+| `enable_uart=1` | enable the UART |
+| `dtoverlay=disable-bt` | route PL011 (UART0) to GPIO14/15 (disable Bluetooth) |
+| `init_uart_clock=48000000` | PL011 reference clock 48 MHz (for 115200 8N1) |
+| `hdmi_force_hotplug=1` | force HDMI output even if no monitor is detected |
+
+#### 2.4.3 Making the card
+
+**Option A — fresh FAT32 card (cleanest):**
+
+```sh
+diskutil list                                         # find the microSD diskN (NOT internal disk0!)
+diskutil eraseDisk FAT32 XINU MBRFormat /dev/diskN    # erases the card
+cp /Volumes/bootfs/{bootcode.bin,start.elf,fixup.dat} /Volumes/XINU/   # firmware from a Pi OS boot part.
+cp compile/sdcard-rpi3/config.txt /Volumes/XINU/
+cp compile/xinu.boot /Volumes/XINU/kernel.img
+diskutil eject /Volumes/XINU
+```
+
+**Option B — reuse a Raspberry Pi OS card (no format):**
+
+```sh
+# On the Pi OS boot partition (firmware already present):
+cp compile/xinu.boot /Volumes/XINU/kernel.img
+cp compile/sdcard-rpi3/config.txt /Volumes/XINU/config.txt   # back up the original config.txt first
+diskutil eject /Volumes/XINU
+```
+
+#### 2.4.4 Serial-console wiring
+
+Use a 3.3 V USB-TTL adapter (**do NOT connect its 5 V**):
+
+| Adapter | Pi 3 header |
+| --- | --- |
+| GND | pin 6 (GND) |
+| RX | pin 8 (GPIO14 / TXD) |
+| TX | pin 10 (GPIO15 / RXD) |
+
+```sh
+screen /dev/tty.usbserial-XXXX 115200      # 115200 8N1
+```
+
+#### 2.4.5 Boot
+
+Insert the SD into the Pi 3 and power on. After ~10–40 s the `xsh$` prompt
+appears on the serial line (and, on the gwm build, the HDMI desktop). All the
+workbench commands (`cc`, `abclc`, `make`, `run`, …) work just as under QEMU.
+
+> For the Pi 3 B+ desktop (gwm) / WiFi / HTTP-server features see `README.md` and
+> `docs/USERS-GUIDE-JA.md`.
+
+#### 2.4.6 Updating the kernel without swapping the SD (/kexec)
+
+If a `/kexec`-capable build is already running, replace the kernel over the
+network without touching the SD card:
+
+```sh
+curl --data-binary @compile/xinu.boot "http://192.168.3.50:8080/upload?dst=xinu.boot"
+curl -X POST http://192.168.3.50:8080/kexec
+sleep 25
+curl http://192.168.3.50:8080/api/mmu     # responds if the new kernel booted cleanly
+```
+
+This is volatile — a power cycle reboots from the SD again. It just speeds up the
+dev loop.
+
+#### 2.4.7 Connecting to WiFi
+
+The arm-rpi3 build has a BCM43455 WiFi driver (over the Arasan SDIO). It is
+**not** auto-connected at boot — run `wifi on` each time. From the `xsh$` shell:
+
+| Command | Description |
+| --- | --- |
+| `wifi status` | show the current connection (SSID + IP/GW) |
+| `wifi on` | interactive: scan (~30 s; the radio drops briefly) → list APs → pick by number → enter password (blank = open) → join + DHCP. Then it starts the ARP/ICMP responder so the WiFi IP is pingable |
+| `wifi on <ssid> [pass]` | non-interactive (no scan/prompt); for the `/shell?cmd=` remote-login route (no stdin). Omitted/blank pass = open |
+| `wifi off` | disconnect (bring the BSS down) |
+| `wifi-invest` | when "connected but ping fails", restart the responder, send a gratuitous ARP, and retry the gateway probe until it works (or report the likely cause) |
+
+```
+xsh$ wifi on
+Scanning for access points (~30s; the radio drops briefly)...
+Available networks:
+  1: MyHome-5G
+  2: Buffalo-G-56A2
+Select AP number (0 = cancel): 1
+Password for "MyHome-5G" (blank = open): ********
+Connecting to "MyHome-5G"...
+WiFi: connected to "MyHome-5G"
+  ip 192.168.3.52  gw 192.168.3.1
+```
+
+> A scan briefly drops the link (the radio retunes all channels); reconnect if
+> needed. WiFi does not auto-reconnect after reboot — run `wifi on` each boot.
+
+The same is available over HTTP on the wired control plane: `/api/wifi/scan`,
+`/api/wifi/join?ssid=S&pass=P`, `/api/wifi/dhcp`, `/api/wifi/ping?ip=A.B.C.D`.
+
+#### 2.4.8 Mesh networking with multiple Xinu nodes (MANET ad-hoc)
+
+Several Xinu boards can form a peer-to-peer mesh with **no access point**, using
+802.11 IBSS (ad-hoc) mode plus on-demand AODV routing — the same stack used in
+the drone-HIL demo (Pi 4 + Pi 3 nodes).
+
+Each node joins the same ad-hoc cell with a distinct node number:
+
+```
+xsh$ wifi adhoc <cell-ssid> [channel] [node]
+```
+
+- `<cell-ssid>` — the ad-hoc cell name; **all nodes must use the same name and channel**.
+- `[channel]` — 802.11 channel (default 6).
+- `[node]` — this node's number (default 2); it gets the static IP `10.0.0.<node>/24`. **Give every node a distinct number.**
+
+On success the node prints `WiFi: ad-hoc up, ip 10.0.0.<node> (responder running)`
+and answers pings on `10.0.0.<node>`.
+
+**Example — a 3-node cell on channel 6:**
+
+```
+# node 1
+xsh$ wifi adhoc mesh1 6 1      # -> 10.0.0.1
+# node 2
+xsh$ wifi adhoc mesh1 6 2      # -> 10.0.0.2
+# node 3
+xsh$ wifi adhoc mesh1 6 3      # -> 10.0.0.3
+```
+
+Nodes within radio range can now reach each other directly at `10.0.0.x` (a Mac
+joined to the same IBSS cell with a `10.0.0.x/24` address can `ping 10.0.0.1`,
+etc.).
+
+**Multi-hop (AODV).** When a destination is not in direct range, the minimal
+AODV module (M13) discovers a route on demand: the originator broadcasts an RREQ
+(UDP port 654), each in-range node relays it and records a reverse route, and the
+destination answers with an RREP that installs the forward route (`route to
+10.0.0.x via 10.0.0.y (k hop)`). Every node runs the AODV control plane (relay +
+reply) automatically as part of its responder, so intermediate nodes forward
+traffic for peers beyond direct range. The route table holds up to 16 entries.
+
+You can also bring a node up over the wired HTTP control plane:
+
+```
+curl "http://<node-wired-ip>:8080/wifi-adhoc?ssid=mesh1&ch=6&n=2"
+```
+
+> IBSS / ad-hoc is independent of the infrastructure `wifi on` mode; run
+> `wifi off` to leave an AP first. Like AP mode, ad-hoc is not restored after
+> reboot — re-run `wifi adhoc` on each node.
+
 ---
 
 ## 3. Using the shell

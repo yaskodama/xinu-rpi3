@@ -100,6 +100,165 @@ xsh$
 
 と表示されればコマンド入力可能です。
 
+### 2.4 実機 (Raspberry Pi 3 B+) での実行
+
+QEMU だけでなく、実機の Raspberry Pi 3 B+ (BCM2837) でもこのワークベンチを動かせます。実機向けは専用プラットフォーム `arm-rpi3` でビルドし、microSD カードにカーネルを焼いて起動します。
+
+#### 2.4.1 実機向けビルド
+
+```sh
+cd compile
+make PLATFORM=arm-rpi3        # → compile/xinu.boot (~305 KB)
+```
+
+> 共有ヘッダ (例: `include/thread.h`) を変更した場合、`make clean` では `libxc` が再ビルドされません。`printf` 系がおかしくなったら強制再ビルド:
+> `rm -f lib/libxc/*.o lib/libxc.a && make PLATFORM=arm-rpi3`
+
+#### 2.4.2 SD カードに必要なもの
+
+Pi 3 のファームウェアは SD の FAT32 パーティションから起動します。以下を置きます。
+
+| ファイル | 入手元 |
+| --- | --- |
+| `bootcode.bin` / `start.elf` / `fixup.dat` | Raspberry Pi OS の boot パーティションからコピー (本リポジトリには含まれません) |
+| `kernel.img` | ビルドした `xinu.boot` をリネーム |
+| `config.txt` | `compile/sdcard-rpi3/config.txt` |
+
+`config.txt` の主な設定:
+
+| 行 | 意味 |
+| --- | --- |
+| `arm_64bit=0` | 32-bit (AArch32) で起動 |
+| `kernel=kernel.img` | 起動カーネル名 |
+| `kernel_address=0x8000` | ロードアドレス (0x8000) |
+| `enable_uart=1` | UART を有効化 |
+| `dtoverlay=disable-bt` | PL011 (UART0) を GPIO14/15 に配線 (Bluetooth 無効化) |
+| `init_uart_clock=48000000` | PL011 基準クロック 48 MHz (115200 8N1 用) |
+| `hdmi_force_hotplug=1` | モニタ未検出でも HDMI 出力を強制 |
+
+#### 2.4.3 SD カードの作り方
+
+**方法 A — FAT32 で新規作成 (推奨):**
+
+```sh
+diskutil list                                         # microSD の diskN を確認 (内蔵 disk0 と間違えない!)
+diskutil eraseDisk FAT32 XINU MBRFormat /dev/diskN    # カードを初期化 (中身は消える)
+cp /Volumes/bootfs/{bootcode.bin,start.elf,fixup.dat} /Volumes/XINU/   # firmware (Pi OS の boot から)
+cp compile/sdcard-rpi3/config.txt /Volumes/XINU/
+cp compile/xinu.boot /Volumes/XINU/kernel.img
+diskutil eject /Volumes/XINU
+```
+
+**方法 B — 既存の Raspberry Pi OS カードを再利用 (フォーマット不要):**
+
+```sh
+# Pi OS の boot パーティション (firmware は既に在る) に対して
+cp compile/xinu.boot /Volumes/XINU/kernel.img
+cp compile/sdcard-rpi3/config.txt /Volumes/XINU/config.txt   # 元の config.txt はバックアップ推奨
+diskutil eject /Volumes/XINU
+```
+
+#### 2.4.4 シリアルコンソールの配線
+
+3.3V の USB-TTL シリアル変換を使います (**アダプタの 5V は接続しない**)。
+
+| アダプタ | Pi 3 ヘッダ |
+| --- | --- |
+| GND | pin 6 (GND) |
+| RX | pin 8 (GPIO14 / TXD) |
+| TX | pin 10 (GPIO15 / RXD) |
+
+```sh
+screen /dev/tty.usbserial-XXXX 115200      # 115200 8N1
+```
+
+#### 2.4.5 起動
+
+SD を Pi 3 に挿し、電源 ON。十数〜40 秒ほどでシリアルに `xsh$` プロンプトが出ます。HDMI を接続していれば (gwm 入りビルドでは) デスクトップも表示されます。あとは QEMU と同じく `cd` / `ls` / `cc` / `abclc` / `make` / `run` が使えます。
+
+> Pi 3 B+ ポートの HDMI デスクトップ (gwm)・WiFi・HTTP サーバなどハードウェア機能の操作は `README.md` と `docs/USERS-GUIDE-JA.md` を参照してください。
+
+#### 2.4.6 SD 交換なしのカーネル更新 (/kexec)
+
+`/kexec` 対応ビルドが既に動いていれば、SD を抜き差しせずネットワーク越しにカーネルを差し替えられます。
+
+```sh
+curl --data-binary @compile/xinu.boot "http://192.168.3.50:8080/upload?dst=xinu.boot"
+curl -X POST http://192.168.3.50:8080/kexec
+sleep 25
+curl http://192.168.3.50:8080/api/mmu     # 新カーネルが起動すれば応答する
+```
+
+これは揮発的で、**電源を入れ直すと SD から再起動**します。開発ループを速くするための機能です。
+
+#### 2.4.7 WiFi への接続
+
+arm-rpi3 ビルドには BCM43455 WiFi ドライバ (Arasan SDIO 経由) が入っています。**起動時に自動接続はしません** — 毎回 `wifi on` してください。`xsh$` シェルから:
+
+| コマンド | 説明 |
+| --- | --- |
+| `wifi status` | 現在の接続 (SSID + IP/GW) を表示 |
+| `wifi on` | 対話: スキャン (~30秒、無線が一瞬切れる) → AP 一覧 → 番号で選択 → パスワード入力 (空 = オープン) → join + DHCP。成功後 ARP/ICMP 応答を開始し ping 可能に |
+| `wifi on <ssid> [pass]` | 非対話 (スキャン/プロンプトなし)。`/shell?cmd=` リモートログイン経由 (stdin なし) 用。pass 省略/空 = オープン |
+| `wifi off` | 切断 (BSS ダウン) |
+| `wifi-invest` | 「接続済みなのに ping 不通」のとき、応答スレッド再起動・gratuitous ARP・ゲートウェイ ping を通るまで自動リトライ |
+
+```
+xsh$ wifi on
+Scanning for access points (~30s; the radio drops briefly)...
+Available networks:
+  1: MyHome-5G
+  2: Buffalo-G-56A2
+Select AP number (0 = cancel): 1
+Password for "MyHome-5G" (blank = open): ********
+Connecting to "MyHome-5G"...
+WiFi: connected to "MyHome-5G"
+  ip 192.168.3.52  gw 192.168.3.1
+```
+
+> スキャンは一瞬 WiFi を切ります (全チャンネル再同調のため)。再起動後は自動再接続しないので、起動のたびに `wifi on` してください。
+
+有線側の HTTP からも操作できます: `/api/wifi/scan`、`/api/wifi/join?ssid=S&pass=P`、`/api/wifi/dhcp`、`/api/wifi/ping?ip=A.B.C.D`。
+
+#### 2.4.8 複数 Xinu でのメッシュネットワーク (MANET ad-hoc)
+
+複数の Xinu ボードを **アクセスポイント無し** で直接つなぎ、ピアツーピアのメッシュを組めます。802.11 の IBSS (ad-hoc) モード + オンデマンドの AODV ルーティングを使います (ドローン HIL デモの Pi 4 + Pi 3 ノードと同じ仕組み)。
+
+各ノードは同じ ad-hoc セルに、別々のノード番号で参加します:
+
+```
+xsh$ wifi adhoc <cell-ssid> [channel] [node]
+```
+
+- `<cell-ssid>` — ad-hoc セル名。**全ノードで同じ名前・同じチャンネル**にすること。
+- `[channel]` — 802.11 チャンネル (既定 6)。
+- `[node]` — 自分のノード番号 (既定 2)。静的 IP `10.0.0.<node>/24` を得ます。**ノードごとに別の番号**を与えること。
+
+成功すると `WiFi: ad-hoc up, ip 10.0.0.<node> (responder running)` と表示され、`10.0.0.<node>` で ping に応答します。
+
+**例 — チャンネル 6 の 3 ノードセル:**
+
+```
+# ノード 1
+xsh$ wifi adhoc mesh1 6 1      # → 10.0.0.1
+# ノード 2
+xsh$ wifi adhoc mesh1 6 2      # → 10.0.0.2
+# ノード 3
+xsh$ wifi adhoc mesh1 6 3      # → 10.0.0.3
+```
+
+電波の届く範囲のノードは `10.0.0.x` で直接通信できます (同じ IBSS セルに `10.0.0.x/24` で参加した Mac から `ping 10.0.0.1` 等も可能)。
+
+**マルチホップ (AODV)。** 宛先が直接届かないとき、最小 AODV モジュール (M13) がオンデマンドで経路探索します: 発信ノードが RREQ をブロードキャスト (UDP port 654) し、範囲内の各ノードが中継して逆経路を記録、宛先が RREP を返して順経路 (`route to 10.0.0.x via 10.0.0.y (k hop)`) を確立します。各ノードは応答スレッドの一部として AODV 制御 (中継 + 返信) を自動で回すので、直接届かないピア宛のトラフィックも中間ノードが転送します。経路表は最大 16 エントリ。
+
+有線 HTTP からノードを ad-hoc に上げることもできます:
+
+```
+curl "http://<ノードの有線IP>:8080/wifi-adhoc?ssid=mesh1&ch=6&n=2"
+```
+
+> IBSS/ad-hoc はインフラ (`wifi on`) モードとは独立です。AP に繋がっている場合は先に `wifi off`。ad-hoc も再起動後は復元しないので、各ノードで `wifi adhoc` を再実行してください。
+
 ---
 
 ## 3. シェルの使い方
