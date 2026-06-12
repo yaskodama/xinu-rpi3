@@ -1,0 +1,348 @@
+% Xinu 移植研究計画書 — Raspberry Pi Zero 2 W / Pico (RP2040)
+% コンパイル: lualatex xinu-porting-plans.tex  (LuaTeX-ja / ltjsarticle, 目次のため2回)
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage{luatexja}
+\usepackage[margin=22mm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=4pt, xrightmargin=4pt,
+  aboveskip=6pt, belowskip=6pt,
+}
+\newcommand{\cmd}[1]{\texttt{#1}}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\textbf{Embedded Xinu 移植研究計画書}\\[3pt]
+  \large Raspberry Pi Zero 2 W ／ Raspberry Pi Pico (RP2040)}
+\author{Xinu-rpi プロジェクト}
+\date{2026年6月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{概要と背景}
+本書は、既存の Embedded Xinu の Raspberry Pi 移植群（32-bit \texttt{xinu-rpi}/%
+\texttt{arm-rpi}、AArch32 Cortex-A53 の \texttt{xinu-rpi3}、AArch64 の
+\texttt{xinu-rpi4}／\texttt{xinu-rpi5}）を土台に、\textbf{Raspberry Pi Zero 2 W}
+および \textbf{Raspberry Pi Pico (RP2040)} への移植を検討する研究計画書である。
+両者は移植の難易度が大きく異なる:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Pi Zero 2 W} --- SoC は Pi 3 と同一ダイ（BCM2837 / Cortex-A53 /
+        ペリフェラル基底 \texttt{0x3F000000}）。\texttt{xinu-rpi3} の
+        \texttt{arm-rpi3} プラットフォームの\textbf{アーキ層がそのまま流用}でき、
+        差分は WiFi・有線 Ethernet・RAM 容量に集約される。\textbf{工数：中}。
+  \item \textbf{Pico (RP2040)} --- Cortex-M0+ の\textbf{マイクロコントローラ}
+        （MMU 無し、Thumb のみ、SRAM 264\,KB、外部フラッシュ XIP）。Xinu の
+        \textbf{アーキ層（boot／コンテキストスイッチ／割り込み）を Cortex-M 用に
+        新規実装}する新アーキポートになる。\textbf{工数：大}。
+\end{itemize}
+
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+ターゲット & 種別 & 流用度 & 工数（最小核）\\
+\midrule
+Pi Zero 2 W & A53/AArch32（Pi3 同ダイ） & アーキ丸ごと流用 & 小〜中（1〜2 週）\\
+Pico (RP2040) & Cortex-M0+ マイコン & 上位 OS は流用・アーキ層は新規 & 大（3〜5 週）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Xinu 移植の前提（共通）.}
+Xinu は\textbf{単一アドレス空間 OS} であり、仮想記憶（MMU）を必須としない。
+実際 Pi 系の移植も MMU off／恒等マップで動作している。したがって Pico の
+「MMU 無し」は障害ではなく、むしろ素直である。アーキ依存面はコンテキストスイッチ・
+割り込み・ブート・タイマに限られ、プロセス管理・スケジューラ・セマフォ・
+メールボックス・シェル等の上位層は\textbf{アーキ非依存 C} としてそのまま移植できる。
+
+%======================================================================
+\part*{第 I 部\quad Raspberry Pi Zero 2 W 移植計画}
+\addcontentsline{toc}{section}{第 I 部 — Raspberry Pi Zero 2 W 移植計画}
+
+\section{前提と結論（Zero 2 W）}
+Pi Zero 2 W の SoC は \textbf{RP3A0 = BCM2837 ダイの再パッケージ}（Cortex-A53,
+AArch32, ペリフェラル基底 \texttt{0x3F000000}、全 MMIO オフセットが Pi 3 と同一、
+RAM 512\,MB）。\texttt{xinu-rpi3} の \texttt{arm-rpi3} プラットフォームと
+\textbf{アーキ・基底・MMIO が完全一致}するため、CPU・割り込み・タイマ・MMU・
+UART・SD・HDMI・USB-DWC2 は\textbf{そのまま流用}できる。新アーキ対応は不要で、
+\textbf{プラットフォーム派生 + ドライバ差し替え}で到達できる。
+
+\section{ハードウェア差分（Pi 3 B+ $\rightarrow$ Zero 2 W）}
+\begin{center}\small
+\begin{longtable}{@{}lp{4.0cm}p{4.0cm}p{3.4cm}@{}}
+\toprule
+項目 & Pi 3 B+（現 arm-rpi3） & Pi Zero 2 W & 対応\\
+\midrule \endhead
+SoC/コア/基底 & BCM2837 / A53 / \texttt{0x3F000000} & 同一 & 流用\\
+UART/Timer/IRQ/Mailbox/PM & 同 & 同一 & 流用\\
+MMU・ctxsw・boot & 同 & 同一 & 流用\\
+HDMI & mailbox FB & 同一（mini-HDMI） & 流用（\texttt{framebuffer\_rpi}）\\
+SD(EMMC) & SDHCI \texttt{+0x300000} & 同一 & 流用\\
+RAM & 1\,GB & 512\,MB & ATAG 自動検出で吸収\\
+有線 Ethernet & 内蔵 LAN78xx(USB) & \textbf{無し} & \textbf{\texttt{smsc9512}/\texttt{ETH0} を外す}\\
+USB & DWC2→内蔵ハブ(4ポート+LAN) & DWC2 OTG 1 ポート直結 & DWC2 流用・ハブ前提調整\\
+WiFi & CYW43455（dual-band, id \texttt{0x4345}） & 単バンド 2.4GHz（43436/43438 系） & \textbf{FW/NVRAM/chip-id 差替}\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{移植戦略（Zero 2 W）}
+\texttt{arm-rpi3} を壊さず、\textbf{派生プラットフォーム \texttt{arm-rpi-zero2w} を
+新設}して Pi 3 と共存させる。
+
+\begin{itemize}[noitemsep]
+  \item \texttt{compile/platforms/arm-rpi-zero2w/}（\texttt{platformVars}・
+        \texttt{xinu.conf}・\texttt{ld.script} を \texttt{arm-rpi3} から複製）
+  \item \texttt{system/platforms/arm-rpi-zero2w/}（同上。差分のみ調整）
+  \item \texttt{DEFS += -D\_XINU\_PLATFORM\_ARM\_RPI\_ -D\_XINU\_PLATFORM\_ARM\_RPI3\_
+        -D\_XINU\_PLATFORM\_ZERO2W\_}
+  \item ビルド：\cmd{make PLATFORM=arm-rpi-zero2w}
+\end{itemize}
+
+\noindent 補足：手早く確認するだけなら \cmd{make PLATFORM=arm-rpi3} のイメージを
+Zero 2 W に載せても、\textbf{シリアルシェルまでは動く可能性が高い}（ETH0 のブート
+待ちでハングしなければ）。本番は派生プラットフォームで行う。
+
+\section{フェーズ別作業計画（Zero 2 W）}
+
+\paragraph{P0 — 足場（半日）.}
+\texttt{compile/} と \texttt{system/} の \texttt{arm-rpi-zero2w} を \texttt{arm-rpi3}
+から複製。\texttt{platformVars} の \texttt{DEVICES} から \textbf{\texttt{smsc9512} を
+削除}。\texttt{xinu.conf} から \textbf{\texttt{ETH0} デバイス定義を削除} →
+\texttt{system/main.c}・\texttt{apps/abcl\_xinu\_net.c} の \texttt{\#ifdef ETH0}
+ブロックが無効化され、\textbf{ブート時の \texttt{etherOpen()} 無限待ちハングを回避}。
+\textbf{検証}：リンクまで通る。
+
+\paragraph{P1 — シリアルシェル起動（1〜2 日）.}
+基本流用（\texttt{boot}・\texttt{platforminit.c}・\texttt{mmu.c}・\texttt{timer.c}・
+割り込み）。RAM は \texttt{platforminit.c} が ATAG から \texttt{platform.maxaddr} を
+取得（512\,MB を自動反映）。\texttt{config.txt} を Zero 2 W 用に
+（\texttt{arm\_64bit=0}, \texttt{kernel=kernel.img}/\texttt{kernel7.img},
+\texttt{dtoverlay=disable-bt}, \texttt{enable\_uart=1}）。シリアルは GPIO14/15。
+\textbf{検証}：実機で \cmd{xsh\$} プロンプト到達、HDMI に framebuffer 出力。
+
+\paragraph{P2 — WiFi（本丸, 3〜6 日）.}
+\texttt{wifi-fw/} に \textbf{Zero 2 W チップ用 \texttt{brcmfmac43436-sdio.bin} +
+nvram} を投入し \texttt{device/wifi/wifi\_fw.c}（焼き込み）を差し替え。
+\texttt{apps/wifi.c} の \texttt{BCM43455\_CHIP\_ID 0x4345} 固定を実機の
+backplane chip-id 読み出し値に合わせて分岐。WL\_ON 投入（firmware GPIO expander 経由）と
+GPCLK2 リファレンスクロックの配線を確認。上位（scan/WPA2/DHCP/ARP/ICMP）は
+チップ非依存で流用。\textbf{検証}：\cmd{wifi probe}→\cmd{wifi scan}→%
+\cmd{wifi on <ssid> <pass>}→DHCP→Mac から ping 応答。
+
+\paragraph{P3 — ネット/HTTP を WiFi で（1〜2 日）.}
+有線 ETH0 が無いので、HTTP ゲートウェイ／レスポンダを WiFi インタフェースに束ねる
+（Pi 3 で WiFi 越し ARP/ICMP/HTTP 実績あり）。\textbf{検証}：%
+\cmd{curl http://<wifi-ip>:8080/...}、\cmd{wifi adhoc}/\cmd{aodv} でメッシュも確認。
+
+\paragraph{P4 — USB 入力（任意, 2〜3 日）.}
+DWC2 をホストモードで単一 OTG ポートに。\texttt{usb}/\texttt{usbkbd}/\texttt{usbmouse}
+流用。Pi 3 のハブ前提列挙を直結用に調整。遠隔操作が効くため後回し可。
+
+\paragraph{P5 — ウィンドウマネージャ（任意, 1 日）.}
+\texttt{apps/gwm.c}・\texttt{apps/gvideo.c}・\texttt{device/gwincon} 流用
+（HDMI 同一）。
+
+\paragraph{P6 — ビルド/デプロイ整備（半日）.}
+\cmd{make PLATFORM=arm-rpi-zero2w} → \texttt{xinu.boot}。SD に
+\texttt{kernel.img}+firmware+\texttt{config.txt}+WiFi FW。
+
+\section{リスク・工数（Zero 2 W）}
+\begin{itemize}[noitemsep]
+  \item \textbf{WiFi チップ FW/chip-id/WL\_ON が最大の不確実性}。実機の chip-id 採取と
+        正しい \texttt{brcmfmac43436} FW/nvram 入手が鍵。ここが取れれば上位は流用で動く。
+  \item ATAG メモリ検出が 512\,MB を正しく返すか（要実測）。
+  \item DWC2 のハブ無し直結列挙、mini-HDMI／GPIO ヘッダ個体差。
+\end{itemize}
+\textbf{工数感}：最小目標（シリアルシェル+HDMI+WiFi 接続）で\textbf{1〜2 週間}、
+フル（USB 入力+gwm+HTTP/メッシュ）で\textbf{3〜4 週間}。律速は P2（WiFi FW）。
+
+%======================================================================
+\part*{第 II 部\quad Raspberry Pi Pico (RP2040) 移植計画}
+\addcontentsline{toc}{section}{第 II 部 — Raspberry Pi Pico (RP2040) 移植計画}
+
+\section{前提と結論（Pico）}
+Pico は \textbf{マイクロコントローラ}：RP2040 = Cortex-M0+ ×2, ARMv6-M, MMU 無し,
+SRAM 264\,KB, コードは外部 QSPI フラッシュ(XIP)。Pi 系（A53/AArch32, MMU, GB級RAM）
+とは別物である。ただし Xinu はアーキ依存面が小さいため、\textbf{新アーキ
+\texttt{cortex-m} + プラットフォーム \texttt{rp2040-pico} を作り、最小核から積み上げる}
+方針が成立する。本丸は\textbf{例外/コンテキスト/ブートのアーキ再実装}（ARMv7-A 用は
+流用不可）と\textbf{SRAM 制約}。\textbf{工数：大（新アーキポート）}。
+
+\section{アーキ/ハード差分（arm-rpi3 $\rightarrow$ RP2040）}
+\begin{center}\small
+\begin{longtable}{@{}lp{3.7cm}p{4.0cm}p{3.6cm}@{}}
+\toprule
+項目 & arm-rpi3 (A53/AArch32) & RP2040 (Cortex-M0+) & 対応\\
+\midrule \endhead
+ISA & ARM+Thumb（\texttt{-marm}） & Thumb のみ（ARMv6-M） & \texttt{-mthumb -mcpu=cortex-m0plus}\\
+例外モデル & IRQ/FIQ バンクモード, CPSR & NVIC + HW スタッキング, MSP/PSP, EXC\_RETURN & 割り込み層を全面書換\\
+ctxsw & r4-r11+lr+pc+CPSR, SYS（\texttt{arch/arm/ctxsw.S}） & r4-r11 退避 + SP 切替（PendSV/直接） & 新規実装\\
+割り込み配送 & コントローラ読取→\texttt{dispatch.c} & ベクタテーブルで各 IRQ 直行 & NVIC 化\\
+タイマ tick & BCM system timer & SysTick（M 標準） & 小さな新ドライバ\\
+MMU & 恒等マップ & 無し（任意で MPU） & \texttt{mmu.c} 不要\\
+RAM & 1\,GB & 264\,KB & 最小構成に絞る\\
+ブート & firmware→kernel.img(ATAG) & bootROM→boot2(256B,XIP)→ベクタ & boot2+ベクタ+crt0（UF2 配布）\\
+UART & PL011 & PL011（RP2040 も PrimeCell） & \texttt{uart-pl011} ほぼ流用\\
+ディスプレイ & HDMI mailbox FB & 無し & 対象外\\
+USB & DWC2 & RP2040 独自 USB & 別ドライバ（任意）\\
+WiFi & SDIO (CYW43455) & Pico W: CYW43439 を PIO 駆動 gSPI & 別バス・別ドライバ（後回し）\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{移植戦略（Pico）}
+\begin{itemize}[noitemsep]
+  \item \textbf{新アーキ層}：\texttt{compile/arch/cortex-m/platformVars} と
+        \texttt{system/arch/cortex-m/\{ctxsw.S, setupStack.c, irq\_handler.S,
+        intutils.S, halt.S, pause.S, memory\_barrier.S\}}（\texttt{arch/arm} の
+        対応物を Cortex-M 用に新規実装）。
+  \item \textbf{新プラットフォーム}：\texttt{compile/platforms/rp2040-pico/} と
+        \texttt{system/platforms/rp2040-pico/\{start.S(ベクタ+crt0), boot2,
+        platforminit.c, clocks.c, systick.c, nvic.c, uart-pl011\}}。
+  \item \textbf{最小デバイス構成}：\texttt{uart}・\texttt{tty}・\texttt{ramdisk}・
+        \texttt{loopback}・\texttt{null} のみ。\texttt{network}/\texttt{usb}/%
+        \texttt{framebuffer}/\texttt{gwincon} は外す。
+  \item \textbf{そのまま流用する Xinu 上位層（移植価値の核心）}：プロセステーブル・
+        \texttt{resched}/ready list・セマフォ・メールボックス・メッセージ送受信
+        （send/receive）・キュー・\texttt{getmem/freemem}・シェル(xsh) と組込み
+        コマンド・tty。これらはアーキ非依存 C で無改造に近い。
+  \item 第一弾は \textbf{RP2040 / Pico}（最も枯れている）。RP2350/Pico 2 は発展課題。
+\end{itemize}
+
+\section{フェーズ別作業計画（Pico）}
+
+\paragraph{P0 — ビルド骨格（1〜2 日）.}
+\texttt{cortex-m} アーキと \texttt{rp2040-pico} プラットフォームの雛形作成。
+\texttt{CFLAGS += -mthumb -mcpu=cortex-m0plus -mfloat-abi=soft}、
+\texttt{DEFS += -D\_XINU\_ARCH\_CORTEXM\_ -D\_XINU\_PLATFORM\_RP2040\_}、
+\texttt{BOOTIMAGE} を \texttt{.uf2}/\texttt{.bin} 出力に。リンカスクリプトは
+\texttt{FLASH(XIP) 0x10000000}（先頭 256B が boot2、続いてベクタ+\texttt{.text}）と
+\texttt{SRAM 0x20000000}（264\,KB、\texttt{.data/.bss/heap/stacks}）。
+\textbf{検証}：\cmd{make PLATFORM=rp2040-pico} がリンクまで通る。
+
+\paragraph{P1 — Boot + UART ``hello''（2〜4 日）.}
+\texttt{start.S} に Cortex-M ベクタテーブル（初期 MSP=SRAM 上端, Reset, NMI,
+HardFault, SVC, PendSV, SysTick …）。Reset で \texttt{.data} コピー/\texttt{.bss}
+ゼロ→\texttt{nulluser()}。boot2 は Pico SDK 由来の W25Q XIP 設定（先頭 256B + CRC）。
+最初は \textbf{SRAM 実行（UF2/bootrom）}で boot2 を回避してもよい。\texttt{uart-pl011}
+は基底 \texttt{0x40034000}、\texttt{clk\_peri} とボーレート除数、IRQ を NVIC に。
+\textbf{検証}：UF2 書込み→UART に起動メッセージ。
+
+\paragraph{P2 — コンテキストスイッチ + スケジューラ（3〜5 日, 山場）.}
+\texttt{system/arch/cortex-m/ctxsw.S}：r4-r11 退避 + \texttt{lr} + SP 切替（特権・
+MSP 共有の協調 ctxsw。Xinu の \texttt{ctxsw()} は関数呼び出しモデルなので直接切替が
+可能）。\texttt{setupStack.c}：新スレッド初回 \texttt{ret} がエントリへ args(r0-r3)
+付きで飛ぶようフレーム構築（CPSR は無いので簡素化）。
+\textbf{検証}：2 プロセスが協調的に交互動作（\texttt{procdemo} 相当）。
+
+\paragraph{P3 — 割り込み + プリエンプション + 同期（3〜5 日）.}
+\texttt{nvic.c}/\texttt{irq\_handler}：NVIC 有効化・優先度、各デバイス IRQ ハンドラ
+登録（ベクタ直行）。\texttt{systick.c}：SysTick を 100\,Hz tick → \texttt{clkhandler}
+→ プリエンプティブスケジューラ。排他 \texttt{disable()/restore()} は \texttt{PRIMASK}
+で実装。\textbf{検証}：セマフォ／メールボックス／\texttt{send/receive}／sleep の
+テスト（\texttt{testsuite} 一部）。
+
+\paragraph{P4 — シェル(xsh)（2〜3 日）.}
+\texttt{shell}+\texttt{tty}(UART)+主要コマンド（\texttt{help/ps/memstat/...}）を最小
+デバイス構成で。任意で \texttt{ramdisk}+簡易 FS、\texttt{cc}/\texttt{abclc}（SRAM
+余裕次第。RP2040 では厳しめ→RP2350 向き）。\textbf{検証}：UART 端末で \cmd{xsh\$} 対話。
+
+\paragraph{P5 — 任意拡張（各 1〜3 週）.}
+USB-CDC コンソール（RP2040 独自 USB device スタック）、WiFi（Pico W の CYW43439 を
+PIO 駆動 gSPI で。第\ref{sec:picowifi}節参照）、SPI SD + FS、PIO 応用。
+
+\section{Pico の WiFi について}
+\label{sec:picowifi}
+WiFi の有無は\textbf{モデル次第}である。
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+モデル & WiFi\\
+\midrule
+Pico（RP2040, 無印） & 無し\\
+Pico W / Pico WH & あり：Infineon CYW43439（2.4GHz b/g/n + BT 5.2）\\
+Pico 2（RP2350, 無印） & 無し\\
+Pico 2 W & あり（同じく CYW43439）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent ただし\textbf{繋ぎ方が Pi 系と全く異なる}。Pi のオンボード WiFi は
+\textbf{SDIO} 接続だが、Pico W の CYW43439 は\textbf{独自 SPI（``gSPI''）を RP2040 の
+PIO で駆動}する方式である（クロック/データ線が一部共有、オンボード LED も同チップ
+経由）。そのため \textbf{Pi の SDIO WiFi ドライバ（\texttt{device/wifi/wifi.c}）は
+そのまま使えず}、bare-metal Xinu で動かすには gSPI/PIO トランスポート + CYW43439
+ファームウェア DL + lwIP 相当のスタックを新規実装する必要がある（\textbf{重い後続
+フェーズ、+3〜6 週}）。WiFi が要るなら \textbf{Pico W／Pico 2 W} を選定する前提となる。
+
+\section{マルチタスクについて}
+\textbf{(a) 1 コアでのプリエンプティブ・マルチタスク：確実に可能で、Xinu 移植の
+中心的成果物。} Cortex-M は NVIC + SysTick + PendSV という RTOS 向けの仕組みを備え、
+本計画の P2（ctxsw）+ P3（SysTick プリエンプション）でプロセス・スケジューラ・
+セマフォ・メールボックス・メッセージ送受信が得られる。SRAM 264\,KB でもスレッドの
+スタックは各数百 B〜数 KB 程度で、多数の軽量プロセスを並行できる。
+
+\textbf{(b) 2 コア同時（デュアルコア SMP）：追加実装が必要。} RP2040/RP2350 は 2 コア
+だが、Xinu は標準でユニプロセッサ（Pi3/4/5 移植も 2 個目以降のコアは \texttt{wfe} で
+停止する単コア運用）。現実的には「1 コアで時分割マルチタスク（もう 1 コアは停止 or
+専用タスク）」が第一段階で、真の SMP はスケジューラ拡張を要する別作業である。
+
+\section{リスク・工数（Pico）}
+\begin{itemize}[noitemsep]
+  \item \textbf{ctxsw/例外モデルの再実装が中核リスク}（P2/P3）。ただし Cortex-M RTOS の
+        定石（PendSV / PSP-MSP / SysTick）があり設計は確立。
+  \item \textbf{SRAM 264\,KB}：核+シェルは収まるが、TCP/IP・cc・XFS の同時搭載は厳しく
+        機能選別が要る（RP2350 で緩和）。
+  \item boot2/イメージ形式（CRC, UF2）。最初は SRAM 実行で回避可。
+  \item WiFi(gSPI/PIO) は別物で重く、第一弾スコープ外。
+  \item ARMv6-M 制約（ハード除算なし等）は \texttt{libgcc}（\texttt{-lgcc}）で吸収。
+\end{itemize}
+\textbf{工数感}：最小核（UART シェル+プリエンプティブ・スケジューラ+セマフォ/
+メールボックス）で\textbf{3〜5 週間}、+USB-CDC で +1〜2 週、+WiFi(Pico W)+ネットで
+さらに \textbf{3〜6 週}。Pi Zero 2 W（最小 1〜2 週）より明確に大きく、\textbf{研究/
+教育テーマ級}である。
+
+\section{RP2040 vs RP2350（Pico 2）}
+\textbf{RP2040/Pico を第一弾推奨}（最も枯れ・資料豊富・安価）。\textbf{RP2350/Pico 2}
+は Cortex-M33（ARMv8-M, ハード除算/DSP/任意 FPU/MPU/TrustZone）+ SRAM 520\,KB で
+RAM とコア性能が楽（cc/FS/ネットを載せやすい）。アーキ層は \texttt{cortex-m} を
+共有しつつ \texttt{-mcpu=cortex-m33} 差分を足す形で発展できる。ブート形式はやや複雑。
+
+%======================================================================
+\section{結び（共通の第一歩）}
+\begin{itemize}[noitemsep]
+  \item \textbf{Pi Zero 2 W}：\texttt{arm-rpi3} を複製して \texttt{arm-rpi-zero2w}
+        を作り（\texttt{smsc9512}/\texttt{ETH0} を外す）、シリアルシェル到達 →
+        \cmd{wifi probe} で実機 chip-id を採取 → WiFi FW 整備、の順。
+  \item \textbf{Pico (RP2040)}：\texttt{arch/cortex-m} + \texttt{platforms/rp2040-pico}
+        の雛形（P0）→ \texttt{start.S}+\texttt{uart-pl011} で UART ``hello''（P1）→
+        \texttt{ctxsw}/\texttt{setupStack} で 2 プロセス協調動作（P2）。ここが通れば
+        移植成功の見通しが立つ。
+\end{itemize}
+
+\vfill
+\begin{center}\small Embedded Xinu 移植研究計画書 — 2026年6月\end{center}
+
+\end{document}
