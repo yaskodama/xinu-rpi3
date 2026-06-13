@@ -484,6 +484,7 @@ struct aipl_ui {
   unsigned char dirty[AIPL_ROWS];
   int  row, col, filled, full;
   int  ed_row, ed_col;
+  int  esc;                   /* CSI parser: 0 idle, 1 saw ESC, 2 saw ESC[   */
   char q[AIPL_QN][256];
   int  qh, qt;
   semaphore sem;
@@ -1779,7 +1780,7 @@ static void basic_run_button(int inst, int idx)
  *  via the abcl_xinu_gui_* hooks (offset by abcl_gui_ox/oy).     *
  * ============================================================ */
 #define AIPL_TB_H  16            /* toolbar height                          */
-#define AIPL_TXT_N 6             /* text-console rows (rest is graphics)    */
+#define AIPL_TXT_N 10            /* text-console rows (rest is graphics)    */
 extern void abcl_rotate4_init(void);
 extern void abcl_rotate4_start(void);
 extern void abcl_rotate4_stop(void);
@@ -1842,8 +1843,27 @@ static int aipl_getline(char *buf, int max) {
   int i = 0; for (; aui.q[aui.qh][i] && i < max - 1; i++) buf[i] = aui.q[aui.qh][i]; buf[i] = 0;
   aui.qh = (aui.qh + 1) % AIPL_QN; return i;
 }
-/* Editor: append / backspace / enter (no history — short commands). */
+static int aipl_linelen(int r) { int n = 0; while (n < AIPL_COLS && aui.ring[r][n]) n++; return n; }
+static int aipl_ed_maxrow(void) { return aui.filled ? AIPL_ROWS - 1 : aui.row; }
+static void aipl_ed_clampcol(void) {
+  int len = aipl_linelen(aui.ed_row);
+  if (aui.ed_col > len) aui.ed_col = len;
+  if (aui.ed_col < 0)   aui.ed_col = 0;
+}
+/* Editor: arrow-key cursor roam (ESC [ A/B/C/D) + append / backspace / enter. */
 void aipl_feed(int c) {
+  if (aui.esc == 1) { aui.esc = (c == '[') ? 2 : 0; return; }
+  if (aui.esc == 2) {
+    aui.esc = 0;
+    switch (c) {
+      case 'A': if (aui.ed_row > 0)                 { aui.dirty[aui.ed_row]=1; aui.ed_row--; aipl_ed_clampcol(); aui.dirty[aui.ed_row]=1; } return; /* up    */
+      case 'B': if (aui.ed_row < aipl_ed_maxrow())  { aui.dirty[aui.ed_row]=1; aui.ed_row++; aipl_ed_clampcol(); aui.dirty[aui.ed_row]=1; } return; /* down  */
+      case 'C': { int len = aipl_linelen(aui.ed_row); if (aui.ed_col < len && aui.ed_col < AIPL_COLS-1) { aui.ed_col++; aui.dirty[aui.ed_row]=1; } } return; /* right */
+      case 'D': if (aui.ed_col > 0) { aui.ed_col--; aui.dirty[aui.ed_row]=1; } return; /* left */
+      default:  return;
+    }
+  }
+  if (c == 0x1b) { aui.esc = 1; return; }
   if (c == '\r' || c == '\n') {
     char line[256]; int n = 0;
     for (; n < AIPL_COLS && aui.ring[aui.ed_row][n]; n++) line[n] = aui.ring[aui.ed_row][n];
@@ -1936,19 +1956,35 @@ static void aipl_draw(window_t *self, unsigned int frame) {
     u->full = 0;
   }
   aipl_draw_toolbar(self);
-  /* text console — the top AIPL_TXT_N rows */
+  /* text console — AIPL_TXT_N rows, scrolled so the edit cursor stays visible
+   * (so arrow-up reveals earlier lines instead of losing the cursor). */
   int txt_top = AIPL_TXT_TOP(self);
   int rows = AIPL_TXT_N;
   int have = u->filled ? AIPL_ROWS : u->row + 1;
-  int start = (u->row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;
-  if (have < rows) { rows = have; start = 0; }
+  if (have < rows) rows = have;
+  int start = (u->row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;   /* latest window */
+  if (have < rows) start = 0;
+  {                                       /* if the cursor row is above the
+                                           * window, scroll up to show it. */
+    int ei = (u->ed_row - start + AIPL_ROWS) % AIPL_ROWS;
+    if (ei >= rows) start = (u->ed_row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;
+  }
   for (int i = 0; i < rows; i++) {
     int r = (start + i) % AIPL_ROWS;
-    if (g_force_redraw || u->dirty[r]) {
-      int ry = txt_top + i * line_h;
-      fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
-      draw_string_at(self->x + 4, ry, u->ring[r], 0xFFD8C0FFU, self->content_bg);
-      if (!g_force_redraw) u->dirty[r] = 0;
+    int ry = txt_top + i * line_h;
+    fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
+    draw_string_at(self->x + 4, ry, u->ring[r], 0xFFD8C0FFU, self->content_bg);
+    u->dirty[r] = 0;
+  }
+  {                                       /* blinking underline at the cursor */
+    int ci = (u->ed_row - start + AIPL_ROWS) % AIPL_ROWS;
+    if (ci >= 0 && ci < rows) {
+      int cr_y = txt_top + ci * line_h;
+      int cr_x = self->x + 4 + u->ed_col * FONT_WIDTH;
+      if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
+        unsigned int col = ((frame >> 2) & 1) ? 0xFFE0B0FFU : self->content_bg;
+        fill_rect(cr_x, cr_y + FONT_HEIGHT - 1, FONT_WIDTH, 2, col);
+      }
     }
   }
   /* graphics area below the strip: clear + paint the rotating lines/buttons */
@@ -1967,7 +2003,7 @@ static void aipl_draw(window_t *self, unsigned int frame) {
 int aipl_window_open(void) {
   if (aui.open) { active_win = &aui.win; wm_raise(&aui.win); g_need_full = 1; return OK; }
   for (int r = 0; r < AIPL_ROWS; r++) aui.dirty[r] = 1;
-  if (aui.win.width == 0) { aui.win.x = 300; aui.win.y = 36; aui.win.width = 640; aui.win.height = 500; }
+  if (aui.win.width == 0) { aui.win.x = 300; aui.win.y = 30; aui.win.width = 660; aui.win.height = 560; }
   title_set(&aui.win, "AIPL");
   aui.win.chrome_color = 0xFFB68AEEU;
   aui.win.title_bg     = 0xFF3A1060U;
