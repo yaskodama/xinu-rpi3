@@ -3147,17 +3147,11 @@ int wifi_scan_ssids(char ssids[][40], int max)
 
 /* Disconnect: bring the BSS down and clear the connected state so the
  * indicator / `wifi status` show "not connected". */
-#define WLC_DISASSOC 52         /* leave the current BSS (deauth) */
-
 void wifi_disconnect(void)
 {
-    /* Cleanly leave the BSS first: a bare WLC_DOWN powers the MAC off without
-     * deauthenticating, so the firmware (and AP) keep stale association +
-     * in-dongle-supplicant state — and a later reconnect's WPA2 4-way handshake
-     * never completes ("WiFi: join failed").  WLC_DISASSOC resets that so the
-     * next wifi_join() associates from a clean slate. */
-    wifi_cmd_int(WLC_DISASSOC, 0);
-    wifi_delay_us(150000);          /* let E_DISASSOC / E_LINK-down settle */
+    /* Bare WLC_DOWN: simple + reliable (a WLC_DISASSOC here wedged the SDIO
+     * control path on real hardware).  The reconnect's clean-association reset
+     * is handled in wifi_do_join() instead, with the MAC already down. */
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_have_ip = 0;
     wifi_cur_ssid[0] = 0;

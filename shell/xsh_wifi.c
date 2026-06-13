@@ -149,6 +149,28 @@ shellcmd xsh_wifi(int nargs, char *args[])
         return 0;
     }
 
+    /* `wifi diag` — dump the LAST join attempt's firmware diagnostics so a
+     * failed (re)connect can be diagnosed from the on-screen shell window. */
+    if (strcmp(args[1], "diag") == 0) {
+        extern void wifi_diag(int *, int *, int *, int *, int *, int *, int *);
+        extern int  wifi_diag_seq(int *, int);
+        extern int  wifi_tgt_diag(int *, int *);
+        int sup, pmk, nev, eapol, link, lastev, laststat;
+        int seq[16], n, i, found = 0, chanspec = 0;
+        wifi_diag(&sup, &pmk, &nev, &eapol, &link, &lastev, &laststat);
+        wifi_tgt_diag(&found, &chanspec);
+        printf("WiFi join diag (last attempt):\n");
+        printf("  tgt_found=%d chanspec=0x%04x  (directed scan saw the AP?)\n", found, chanspec);
+        printf("  sup_wpa rc=%d  PMK rc=%d  (0 = ok)\n", sup, pmk);
+        printf("  events=%d EAPOL=%d link=%d lastev=%d laststat=%d\n",
+               nev, eapol, link, lastev, laststat);
+        n = wifi_diag_seq(seq, 16);
+        printf("  event seq:");
+        for (i = 0; i < n; i++) printf(" %d", seq[i]);
+        printf("\n  (0=SET_SSID 3=AUTH 7=ASSOC 16=LINK 46=PSK_SUP)\n");
+        return 0;
+    }
+
     if (strcmp(args[1], "off") == 0) {
         wifi_disconnect();
         printf("WiFi: disconnected\n");
