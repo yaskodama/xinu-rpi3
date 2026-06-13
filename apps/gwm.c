@@ -461,6 +461,10 @@ static struct shcon shc[NSHELL];
 /* Forward decls: defined further down, used by gwin_shell_window_open_n(). */
 static void wm_raise(window_t *w);
 static int  g_need_full;
+/* The BASIC window + its on-screen flag (full defs in the BASIC section);
+ * declared here so wm_close_window() can dismiss/re-open it like a shell. */
+static window_t basic_win;
+static int      basic_open;
 
 /* Which shell index a window pointer belongs to (0 if not a shell window). */
 static int sh_index_of(window_t *self)
@@ -702,6 +706,7 @@ static void wm_close_window(window_t *w)
     if (!w) return;
     idx = sh_index_of_strict(w);
     if (idx >= 0) shc[idx].opened = 0;
+    if (w == &basic_win) basic_open = 0;     /* allow menu to re-open it */
     wm_remove(w);
     if (active_win == w) active_win = 0;
     g_need_full = 1;
@@ -1171,6 +1176,29 @@ static unsigned char bas_dirty[BAS_ROWS];
 static int           bas_row, bas_col, bas_filled, bas_full;
 static int           bas_gfx;       /* 1 = pixel graphics (CLS/PLOT/LINE), 0 = text scroll */
 static window_t      basic_win;
+static int           basic_open;    /* 1 while the BASIC window is on screen */
+static void          basic_draw(window_t *self, unsigned int frame);
+
+/* Open (idempotently) the BASIC window and add it to the WM.  Mirrors
+ * gwin_shell_window_open_n(): if already shown, just raise + focus it;
+ * otherwise (re)build its chrome and add it.  The basic_main interpreter
+ * thread keeps running regardless, so its program/state survive a close. */
+void basic_window_open(void)
+{
+    if (basic_open) { active_win = &basic_win; wm_raise(&basic_win); g_need_full = 1; return; }
+    if (basic_win.width == 0) {      /* first open: capture the saved layout */
+        basic_win.x = 23; basic_win.y = 421; basic_win.width = 560; basic_win.height = 360;
+    }
+    title_set(&basic_win, "BASIC");
+    basic_win.chrome_color = 0xFF66FF99U;
+    basic_win.title_bg     = 0xFF105028U;
+    basic_win.title_fg     = 0xFFFFFFFFU;
+    basic_win.content_bg   = 0xFF001405U;
+    basic_win.draw_content = basic_draw;
+    wm_add(&basic_win);
+    basic_open = 1;
+    active_win = &basic_win; wm_raise(&basic_win); g_need_full = 1;
+}
 
 /* Top of the scrolling text / graphics area, below the title bar + toolbar. */
 #define BAS_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + BAS_TB_H)
@@ -1568,8 +1596,8 @@ static void menu_exec(int sel)
         for (i = 0; i < NSHELL; i++)
             if (!shc[i].opened) { gwin_shell_window_open_n(i); opened = 1; break; }
         if (!opened) gwin_shell_window_open_n(0); /* all open -> raise Shell 0 */
-    } else if (sel == 1) {                       /* BASIC */
-        active_win = &basic_win; wm_raise(&basic_win);
+    } else if (sel == 1) {                       /* BASIC: open/raise its window */
+        basic_window_open();
     }
     g_need_full = 1;
 }
@@ -1755,13 +1783,7 @@ thread gwm_main(void)
     /* BASIC interpreter window.  Initial position captured from the live
      * on-screen layout (/api/wm/dump) so the desktop boots as last arranged. */
     basic_win.x = 23;     basic_win.y = 421;    basic_win.width = 560;  basic_win.height = 360;
-    title_set(&basic_win, "BASIC");
-    basic_win.chrome_color = 0xFF66FF99U;
-    basic_win.title_bg     = 0xFF105028U;
-    basic_win.title_fg     = 0xFFFFFFFFU;
-    basic_win.content_bg   = 0xFF001405U;
-    basic_win.draw_content = basic_draw;
-    wm_add(&basic_win);
+    basic_window_open();
 
     gwin_shell_window_open();
     /* Diagnostic test line written directly into the ring (bypasses the
