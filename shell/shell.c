@@ -76,6 +76,7 @@ const struct centry commandtab[] = {
 #endif
     {"ps", FALSE, xsh_ps},
     {"pwd", FALSE, xsh_pwd},
+    {"rcutest", FALSE, xsh_rcutest},
 #if NETHER
     {"ping", FALSE, xsh_ping},
     {"pktgen", FALSE, xsh_pktgen},

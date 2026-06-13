@@ -12,6 +12,7 @@
 extern void ctxsw(void *, void *, uchar);
 extern tid_typ getitem(tid_typ);
 extern void mlfq_reset_quantum(int tid);  /* S2 MLFQ — system/aging.c */
+extern volatile int rcu_nest;             /* >0 inside an RCU read section — system/rcu.c */
 int resdefer;                   /* >0 if rescheduling deferred */
 
 /* S3 DeadlineHints: scan thrtab for the THRREADY thread with the
@@ -56,6 +57,15 @@ int resched(void)
     if (resdefer > 0)
     {                           /* if deferred, increase count & return */
         resdefer++;
+        return (OK);
+    }
+
+    /* RCU read side: while a reader is mid-section, stay non-preemptible so it
+     * runs to completion within this quantum.  A dropped preemption tick costs
+     * at most one tick of latency (read sections are microseconds, the tick is
+     * 10 ms); the next tick after rcu_read_unlock() preempts normally. */
+    if (rcu_nest > 0)
+    {
         return (OK);
     }
 
