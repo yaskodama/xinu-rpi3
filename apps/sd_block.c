@@ -1,130 +1,128 @@
 /**
  * @file sd_block.c
  *
- * SDHCI v3 single-block read/write for BCM2837 (Raspberry Pi 3).
+ * Single-block read for the Raspberry Pi 3 (BCM2837) SD card.
  *
- * Ported from xinu-rpi4 device/sd/sd.c with two changes:
- *   1. SD_BASE adjusted from 0xFE340000 (BCM2711 EMMC2) to 0x3F300000
- *      (BCM2837 EMMC).
- *   2. Added sd_write_block (CMD24, WRITE_SINGLE_BLOCK).
+ * IMPORTANT Pi 3 wiring (see apps/wifi.c): the SD CARD is on the Broadcom
+ * "SDHOST" controller at 0x3F202000 (GPIO48-53).  The Arasan SDHCI "EMMC"
+ * block at 0x3F300000 is wired to the *WiFi* chip's SDIO bus, NOT the card.
+ * This driver therefore talks to SDHOST.  (The earlier version was ported
+ * straight from the Pi 4, where the card is on EMMC2, and consequently read
+ * the WiFi SDIO host instead of the card — every sd_read_block failed.)
  *
- * The firmware bootloader read kernel.img off the card to boot us, which
- * means the EMMC controller is already at high speed, the card is already
- * selected, and block-address mode is in effect (SDHC/SDXC).  We do not
- * touch clocks, power, CMD0, CMD2/3, CMD7, etc. — just issue CMD17
- * (read) or CMD24 (write) against the already-selected card.
+ * The firmware bootloader already brought the card up on SDHOST to load
+ * kernel.img (a live register read shows SDCDIV=9, the last command was
+ * CMD17/READ, SDHSTS clean), so we reuse that state: no clock/power/CMD0/
+ * CMD2/3/7 — just issue CMD17 and drain the 512-byte FIFO.  WiFi lives on
+ * the separate EMMC block, so this never conflicts with it.
  */
 
 #include "sd_block.h"
 
-/* BCM2837 EMMC base.  Pi 4 / BCM2711 uses the wholly separate EMMC2 at
- * 0xFE340000; Pi 3 / BCM2837 only has the legacy single EMMC at
- * peripheral_base(0x3F000000) + 0x300000. */
-#define SD_BASE              0x3F300000UL
+#define SDHOST_BASE        0x3F202000UL
 
-#define EMMC_ARG2          (*(volatile unsigned int *)(SD_BASE + 0x00))
-#define EMMC_BLKSIZECNT    (*(volatile unsigned int *)(SD_BASE + 0x04))
-#define EMMC_ARG1          (*(volatile unsigned int *)(SD_BASE + 0x08))
-#define EMMC_CMDTM         (*(volatile unsigned int *)(SD_BASE + 0x0C))
-#define EMMC_RESP0         (*(volatile unsigned int *)(SD_BASE + 0x10))
-#define EMMC_DATA          (*(volatile unsigned int *)(SD_BASE + 0x20))
-#define EMMC_STATUS        (*(volatile unsigned int *)(SD_BASE + 0x24))
-#define EMMC_INTERRUPT     (*(volatile unsigned int *)(SD_BASE + 0x30))
+#define SDCMD   (*(volatile unsigned int *)(SDHOST_BASE + 0x00))  /* command  */
+#define SDARG   (*(volatile unsigned int *)(SDHOST_BASE + 0x04))  /* argument */
+#define SDTOUT  (*(volatile unsigned int *)(SDHOST_BASE + 0x08))  /* timeout  */
+#define SDCDIV  (*(volatile unsigned int *)(SDHOST_BASE + 0x0C))  /* clk div  */
+#define SDRSP0  (*(volatile unsigned int *)(SDHOST_BASE + 0x10))  /* response */
+#define SDHSTS  (*(volatile unsigned int *)(SDHOST_BASE + 0x20))  /* status   */
+#define SDVDD   (*(volatile unsigned int *)(SDHOST_BASE + 0x30))  /* power    */
+#define SDEDM   (*(volatile unsigned int *)(SDHOST_BASE + 0x34))  /* FIFO FSM */
+#define SDHCFG  (*(volatile unsigned int *)(SDHOST_BASE + 0x38))  /* host cfg */
+#define SDHBCT  (*(volatile unsigned int *)(SDHOST_BASE + 0x3C))  /* byte cnt */
+#define SDDATA  (*(volatile unsigned int *)(SDHOST_BASE + 0x40))  /* FIFO     */
+#define SDHBLC  (*(volatile unsigned int *)(SDHOST_BASE + 0x50))  /* blk cnt  */
 
-/* CMDTM bit fields per SDHCI spec.
- *   bits 24-31 = command index
- *   bit  21    = data direction transfer flag (ISDATA)
- *   bit  20    = check response index against CMD index
- *   bit  19    = check response CRC7
- *   bits 16-17 = response type (10 = 48-bit, 00 = none)
- *   bit  4     = data transfer direction (0 = host->card, 1 = card->host)
- */
-#define CMDTM_CMD17_READ \
-    ((17u << 24) | (1u << 21) | (1u << 20) | (1u << 19) | (2u << 16) | (1u << 4))
-#define CMDTM_CMD24_WRITE \
-    ((24u << 24) | (1u << 21) | (1u << 20) | (1u << 19) | (2u << 16))
+#define SDCMD_NEW_FLAG       0x8000
+#define SDCMD_FAIL_FLAG      0x4000
+#define SDCMD_READ_CMD       0x0040
+#define SDCMD_WRITE_CMD      0x0080
 
-#define INT_CMD_DONE       (1u << 0)
-#define INT_DATA_DONE      (1u << 1)
-#define INT_WRITE_RDY      (1u << 4)
-#define INT_READ_RDY       (1u << 5)
-#define INT_ERROR_MASK     0xFFFF8000u
+#define SDHSTS_REW_TIME_OUT  0x80
+#define SDHSTS_CMD_TIME_OUT  0x40
+#define SDHSTS_CRC16_ERROR   0x20
+#define SDHSTS_CRC7_ERROR    0x10
+#define SDHSTS_FIFO_ERROR    0x08
+#define SDHSTS_DATA_FLAG     0x01
+#define SDHSTS_ERR_MASK \
+    (SDHSTS_REW_TIME_OUT | SDHSTS_CMD_TIME_OUT | SDHSTS_CRC16_ERROR | \
+     SDHSTS_CRC7_ERROR | SDHSTS_FIFO_ERROR)
+/* W1C status/IRPT bits to clear before a command (BUSY|BLOCK|SDIO|errors). */
+#define SDHSTS_CLEAR         0x07F8
 
-#define POLL_LIMIT         5000000UL
+#define POLL_LIMIT           2000000UL
 
-static int wait_intr(unsigned int flag)
+#define SDVDD_POWER_ON       0x01
+
+/* The firmware powers the SDHOST host block DOWN after loading kernel.img
+ * (a live read shows SDVDD=0, and a fresh CMD17 leaves SDCMD's NEW_FLAG set
+ * with no timeout — i.e. no clock is going out).  The card itself keeps its
+ * 3.3V rail and stays selected, so re-asserting host power + clearing status
+ * is enough to make commands flow again.  Done once, lazily. */
+static int sd_kicked;
+static void sd_hw_kick(void)
 {
-    for (unsigned long t = 0; t < POLL_LIMIT; t++)
-    {
-        unsigned int v = EMMC_INTERRUPT;
-        if (v & INT_ERROR_MASK)
-        {
-            return -1;
-        }
-        if (v & flag)
-        {
-            EMMC_INTERRUPT = flag;          /* W1C — clear that flag only */
-            return 0;
-        }
-    }
-    return -1;
-}
-
-int sd_init(void)
-{
-    unsigned char block[SD_BLOCK_SIZE];
-    if (sd_read_block(0, block) != 0)
-    {
-        return -1;
-    }
-    /* MBR ends with 0x55 0xAA at offset 510 */
-    if (block[510] != 0x55 || block[511] != 0xAA)
-    {
-        return -1;
-    }
-    return 0;
+    volatile unsigned long d;
+    if (sd_kicked) return;
+    SDVDD  = SDVDD_POWER_ON;                 /* re-enable host power/clock   */
+    SDHSTS = SDHSTS_CLEAR;
+    for (d = 0; d < 200000; d++) { }         /* let the clock settle         */
+    sd_kicked = 1;
 }
 
 int sd_read_block(unsigned long lba, void *buf)
 {
-    EMMC_INTERRUPT = 0xFFFFFFFFu;
-    EMMC_BLKSIZECNT = (1u << 16) | SD_BLOCK_SIZE;
-    EMMC_ARG1 = (unsigned int)lba;
-    EMMC_CMDTM = CMDTM_CMD17_READ;
-
-    if (wait_intr(INT_CMD_DONE) != 0) return -1;
-    if (wait_intr(INT_READ_RDY) != 0) return -1;
-
     unsigned int *p = (unsigned int *)buf;
+    unsigned long t;
     int i;
+
+    sd_hw_kick();
+
+    /* wait for the controller to be idle, then clear stale status */
+    for (t = 0; t < POLL_LIMIT; t++)
+        if (!(SDCMD & SDCMD_NEW_FLAG)) break;
+    SDHSTS = SDHSTS_CLEAR;
+
+    /* one 512-byte block at @lba (SDHC/SDXC use block addressing) */
+    SDHBCT = SD_BLOCK_SIZE;
+    SDHBLC = 1;
+    SDARG  = (unsigned int)lba;
+    SDCMD  = 17u | SDCMD_READ_CMD | SDCMD_NEW_FLAG;     /* CMD17 */
+
+    for (t = 0; t < POLL_LIMIT; t++)                    /* command accepted? */
+        if (!(SDCMD & SDCMD_NEW_FLAG)) break;
+    if (SDCMD & (SDCMD_NEW_FLAG | SDCMD_FAIL_FLAG)) return -1;
+
+    /* drain 128 words as the data FIFO fills */
     for (i = 0; i < SD_BLOCK_SIZE / 4; i++)
     {
-        p[i] = EMMC_DATA;
+        int ready = 0;
+        for (t = 0; t < POLL_LIMIT; t++)
+        {
+            unsigned int hs = SDHSTS;
+            if (hs & SDHSTS_ERR_MASK) return -1;
+            if (hs & SDHSTS_DATA_FLAG) { ready = 1; break; }
+        }
+        if (!ready) return -1;
+        p[i] = SDDATA;
     }
-    if (wait_intr(INT_DATA_DONE) != 0) return -1;
+    if (SDHSTS & SDHSTS_ERR_MASK) return -1;
     return 0;
 }
 
+int sd_init(void)
+{
+    unsigned char block[SD_BLOCK_SIZE] __attribute__((aligned(4)));
+    if (sd_read_block(0, block) != 0) return -1;
+    if (block[510] != 0x55 || block[511] != 0xAA) return -1;   /* MBR sig */
+    return 0;
+}
+
+/* Writing is not needed for `ls /microsd` and is left unimplemented on the
+ * SDHOST path to avoid risking the card the kernel boots from. */
 int sd_write_block(unsigned long lba, const void *buf)
 {
-    EMMC_INTERRUPT = 0xFFFFFFFFu;
-    EMMC_BLKSIZECNT = (1u << 16) | SD_BLOCK_SIZE;
-    EMMC_ARG1 = (unsigned int)lba;
-    EMMC_CMDTM = CMDTM_CMD24_WRITE;
-
-    if (wait_intr(INT_CMD_DONE) != 0) return -1;
-    /* For writes the controller signals it's ready to ACCEPT data via
-     * INT_WRITE_RDY (bit 4), not INT_READ_RDY (bit 5).  After we push
-     * 128 words the controller transfers them to the card and asserts
-     * INT_DATA_DONE. */
-    if (wait_intr(INT_WRITE_RDY) != 0) return -1;
-
-    const unsigned int *p = (const unsigned int *)buf;
-    int i;
-    for (i = 0; i < SD_BLOCK_SIZE / 4; i++)
-    {
-        EMMC_DATA = p[i];
-    }
-    if (wait_intr(INT_DATA_DONE) != 0) return -1;
-    return 0;
+    (void)lba; (void)buf;
+    return -1;
 }

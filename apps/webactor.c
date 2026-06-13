@@ -686,6 +686,41 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /mmio-write?addr=0xN&val=0xN — poke a 32-bit register.  Companion
+             * to /mmio-read, used to bring up the Pi 3 SDHOST SD controller
+             * (0x3F202000) interactively over the network so the init sequence
+             * can be discovered without reflashing.  Same no-fault-catch
+             * caveat — only poke known-mapped registers. */
+            if (0 == strncmp(reqbuf, "GET /mmio-write", 15) ||
+                0 == strncmp(reqbuf, "POST /mmio-write", 16))
+            {
+                unsigned long addr = 0, val = 0;
+                const char *url = strchr(reqbuf, ' ');
+                if (NULL != url) {
+                    const char *pa = strstr(url, "addr=");
+                    const char *pv = strstr(url, "val=");
+                    if (NULL != pa) { pa += 5; if (pa[0]=='0'&&(pa[1]=='x'||pa[1]=='X')) pa+=2;
+                        while (*pa) { char c=*pa; unsigned d;
+                            if (c>='0'&&c<='9') d=c-'0'; else if (c>='a'&&c<='f') d=c-'a'+10;
+                            else if (c>='A'&&c<='F') d=c-'A'+10; else break; addr=(addr<<4)|d; pa++; } }
+                    if (NULL != pv) { pv += 4; if (pv[0]=='0'&&(pv[1]=='x'||pv[1]=='X')) pv+=2;
+                        while (*pv) { char c=*pv; unsigned d;
+                            if (c>='0'&&c<='9') d=c-'0'; else if (c>='a'&&c<='f') d=c-'a'+10;
+                            else if (c>='A'&&c<='F') d=c-'A'+10; else break; val=(val<<4)|d; pv++; } }
+                }
+                *(volatile unsigned int *)addr = (unsigned int)val;
+                { unsigned int rb = *(volatile unsigned int *)addr;
+                  static char wresp[200];
+                  int blen = sprintf(wresp + 100, "wrote addr=0x%08lx val=0x%08lx readback=0x%08x\r\n",
+                                     addr, val, rb);
+                  int hlen = sprintf(wresp, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                     "Content-Length: %d\r\n\r\n", blen);
+                  memcpy(wresp + hlen, wresp + 100, blen);
+                  write(tcpdev, wresp, hlen + blen); }
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /wifi-adhoc?ssid=NAME&ch=N&n=M — join a MANET ad-hoc (IBSS)
              * cell on the WiFi as 10.0.0.M.  Control stays on ethernet, so
              * this returns over the wire even though the WiFi switches to
