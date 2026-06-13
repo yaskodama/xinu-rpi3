@@ -21,6 +21,7 @@
  * WM_CURSOR_STEP_MS and move just the 12x12 sprite, so the pointer tracks the
  * mouse at ~1000/WM_CURSOR_STEP_MS Hz instead of jumping once per content frame. */
 #define WM_CURSOR_STEP_MS 2          /* poll the cursor ~500 Hz (USB caps it) */
+#define WM_CLOSE_W        9          /* title-bar close (X) box, px (fits 8px glyph) */
 
 static window_t *wm_head;
 static void    (*wm_tick)(void);
@@ -198,8 +199,17 @@ static void draw_chrome(window_t *w)
     /* title bar background (one pixel inside the border) */
     fill_rect(w->x + 1, w->y + 1, w->width - 2, WM_TITLEBAR_H, w->title_bg);
 
-    /* title text — left-aligned with a 4 px gutter */
-    draw_string_at(w->x + 4, w->y + 2, w->title, w->title_fg, w->title_bg);
+    /* close box (X) at the left end of the title bar — click to dismiss */
+    {
+        int bx = w->x + 2, by = w->y + 2;
+        fill_rect(bx, by, WM_CLOSE_W, WM_CLOSE_W, 0xFFC0382EU);   /* red box */
+        draw_rect(bx, by, WM_CLOSE_W, WM_CLOSE_W, 0xFFFFFFFFU);   /* white edge */
+        draw_string_at(bx + 1, by + 1, "x", 0xFFFFFFFFU, 0xFFC0382EU);
+    }
+
+    /* title text — to the right of the close box */
+    draw_string_at(w->x + WM_CLOSE_W + 6, w->y + 2, w->title,
+                   w->title_fg, w->title_bg);
 
     /* separator under the title */
     fill_rect(w->x + 1, w->y + WM_TITLEBAR_H + 1,
@@ -460,6 +470,14 @@ static int sh_index_of(window_t *self)
     return 0;
 }
 
+/* Like sh_index_of() but returns -1 for a non-shell window. */
+static int sh_index_of_strict(window_t *self)
+{
+    int i;
+    for (i = 0; i < NSHELL; i++) if (self == &shc[i].win) return i;
+    return -1;
+}
+
 static void sh_newline(struct shcon *s)
 {
     s->ring[s->cur_row][s->cur_col] = 0;
@@ -663,6 +681,32 @@ static window_t *window_at_titlebar(int sx, int sy)
     return hit;
 }
 
+/* Topmost window whose title-bar close (X) box covers (sx,sy), or 0. */
+static window_t *window_at_close(int sx, int sy)
+{
+    int dx = sx + vp_x, dy = sy + vp_y;
+    window_t *hit = 0;
+    for (window_t *w = wm_head; w; w = w->next)
+        if (dx >= w->x + 2 && dx < w->x + 2 + WM_CLOSE_W &&
+            dy >= w->y + 2 && dy < w->y + 2 + WM_CLOSE_W)
+            hit = w;                        /* last match = on top */
+    return hit;
+}
+
+/* Dismiss a window from its close box.  Shell windows are marked closed so
+ * the right-click menu can re-open them (their supervisor shell keeps
+ * running); other windows are simply unlinked from the WM. */
+static void wm_close_window(window_t *w)
+{
+    int idx;
+    if (!w) return;
+    idx = sh_index_of_strict(w);
+    if (idx >= 0) shc[idx].opened = 0;
+    wm_remove(w);
+    if (active_win == w) active_win = 0;
+    g_need_full = 1;
+}
+
 /* Topmost window whose bottom-right resize grip covers (sx,sy), or 0. */
 static window_t *window_at_resize(int sx, int sy)
 {
@@ -758,6 +802,13 @@ static void wm_drag_tick(void)
         menu_open = 0; g_need_full = 1;
         if (sel >= 0) menu_exec(sel);
         prev_left = left; return;
+    }
+
+    /* On a fresh press, a click on a title-bar close (X) box dismisses
+     * that window.  Checked before drag/toolbar so the box always wins. */
+    if (left && !prev_left) {
+        window_t *cw = window_at_close(cursor_x, cursor_y);
+        if (cw) { wm_close_window(cw); prev_left = left; return; }
     }
 
     /* On a fresh press, a click on a BASIC toolbar button runs its command
