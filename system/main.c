@@ -403,11 +403,15 @@ thread main(void)
 #ifdef _XINU_PLATFORM_ARM_RPI3_
     {
         extern thread gwm_main(void);
-        extern thread basic_main(void);
+        extern thread basic_main_n(int inst);
         ready(create((void *)gwm_main, 65536, INITPRIO, "GWM", 0),
               RESCHED_NO);
-        /* BASIC interpreter window (its own REPL thread) */
-        ready(create((void *)basic_main, 32768, INITPRIO, "BASIC", 0),
+        /* Two independent BASIC interpreter windows, each its own REPL thread
+         * + interpreter instance (apps/basic.c bs[]).  The 2nd window is opened
+         * on demand from the right-click menu; its thread runs from boot. */
+        ready(create((void *)basic_main_n, 32768, INITPRIO, "BASIC0", 1, 0),
+              RESCHED_NO);
+        ready(create((void *)basic_main_n, 32768, INITPRIO, "BASIC1", 1, 1),
               RESCHED_NO);
         /* physical USB keyboard -> active window (shell or BASIC) */
         ready(create((void *)gwin_kbd_bridge, 8192, INITPRIO, "kbdbridge", 0),

@@ -461,10 +461,10 @@ static struct shcon shc[NSHELL];
 /* Forward decls: defined further down, used by gwin_shell_window_open_n(). */
 static void wm_raise(window_t *w);
 static int  g_need_full;
-/* The BASIC window + its on-screen flag (full defs in the BASIC section);
- * declared here so wm_close_window() can dismiss/re-open it like a shell. */
-static window_t basic_win;
-static int      basic_open;
+/* BASIC windows live in bui[] (full defs in the BASIC section); these
+ * accessors let wm_close_window() dismiss one like a shell window. */
+static int  bas_index_of(window_t *w);   /* BASIC window -> instance, else -1 */
+static void bas_mark_closed(int idx);    /* mark BASIC instance idx off-screen */
 
 /* Which shell index a window pointer belongs to (0 if not a shell window). */
 static int sh_index_of(window_t *self)
@@ -702,11 +702,12 @@ static window_t *window_at_close(int sx, int sy)
  * running); other windows are simply unlinked from the WM. */
 static void wm_close_window(window_t *w)
 {
-    int idx;
+    int idx, bi;
     if (!w) return;
     idx = sh_index_of_strict(w);
     if (idx >= 0) shc[idx].opened = 0;
-    if (w == &basic_win) basic_open = 0;     /* allow menu to re-open it */
+    bi = bas_index_of(w);
+    if (bi >= 0) bas_mark_closed(bi);        /* allow menu to re-open it */
     wm_remove(w);
     if (active_win == w) active_win = 0;
     g_need_full = 1;
@@ -748,8 +749,8 @@ static void wm_raise(window_t *w)
 }
 
 /* BASIC-window toolbar (defined in the BASIC section below). */
-static int  basic_toolbar_hit(int sx, int sy);   /* button index at screen pt, or -1 */
-static void basic_run_button(int idx);           /* run that button's command */
+static int  basic_toolbar_hit(int sx, int sy, int *inst); /* button idx @pt, or -1 */
+static void basic_run_button(int inst, int idx);          /* run that button's command */
 
 /* ---- right-click pull-down menu --------------------------------------- */
 #define MENU_W  76
@@ -819,8 +820,8 @@ static void wm_drag_tick(void)
     /* On a fresh press, a click on a BASIC toolbar button runs its command
      * (edge-triggered so holding doesn't fire it every frame). */
     if (left && !prev_left) {
-        int b = basic_toolbar_hit(cursor_x, cursor_y);
-        if (b >= 0) { basic_run_button(b); prev_left = left; return; }
+        int bi = 0, b = basic_toolbar_hit(cursor_x, cursor_y, &bi);
+        if (b >= 0) { basic_run_button(bi, b); prev_left = left; return; }
     }
     prev_left = left;
 
@@ -1165,50 +1166,95 @@ extern void basic_set_emit(void (*)(const char *));
 extern void basic_set_input(int (*)(char *, int));
 extern void basic_init(void);
 extern void basic_exec_line(const char *);
+extern int  basic_curi(void);              /* current interpreter instance     */
+extern void basic_bind_thread(int inst);   /* register this thread's instance  */
+extern void basic_break_n(int inst);       /* Ctrl-C a specific window         */
 
 #define BAS_ROWS 56
 #define BAS_COLS 60
 #define BAS_TB_H  32                /* toolbar height (px) — two button rows  */
 #define BAS_BTN_H 12                /* one button's height                    */
 #define BAS_ROW_H 16                /* row pitch (button + gap)               */
-static char          bas_ring[BAS_ROWS][BAS_COLS + 1];
-static unsigned char bas_dirty[BAS_ROWS];
-static int           bas_row, bas_col, bas_filled, bas_full;
-static int           bas_gfx;       /* 1 = pixel graphics (CLS/PLOT/LINE), 0 = text scroll */
-static window_t      basic_win;
-static int           basic_open;    /* 1 while the BASIC window is on screen */
+#define BAS_QN 8                    /* interpreter input line queue depth     */
+#ifndef NBASIC
+#define NBASIC 2                    /* independent BASIC windows (== basic.c)  */
+#endif
+
+/* All per-window BASIC UI state: text ring + editor cursor + graphics flag +
+ * the line queue feeding this window's interpreter thread.  One struct per
+ * on-screen BASIC window; the matching interpreter state lives in apps/basic.c
+ * bs[].  Instance is resolved by basic_curi() (interpreter-thread hooks) or by
+ * the window pointer (draw) or the active window (keystrokes). */
+struct basic_ui {
+    char          ring[BAS_ROWS][BAS_COLS + 1];
+    unsigned char dirty[BAS_ROWS];
+    int           row, col, filled, full;
+    int           gfx;              /* 1 = pixel graphics (CLS/PLOT/LINE)     */
+    int           ed_row, ed_col;   /* full-screen editor cursor              */
+    int           esc;              /* CSI parser: 0 idle, 1 ESC, 2 ESC[      */
+    char          q[BAS_QN][256];   /* logical-line queue -> interpreter      */
+    int           qh, qt;
+    semaphore     sem;
+    window_t      win;
+    int           open;             /* 1 while this BASIC window is on screen */
+};
+static struct basic_ui bui[NBASIC];
 static void          basic_draw(window_t *self, unsigned int frame);
 
-/* Open (idempotently) the BASIC window and add it to the WM.  Mirrors
- * gwin_shell_window_open_n(): if already shown, just raise + focus it;
- * otherwise (re)build its chrome and add it.  The basic_main interpreter
- * thread keeps running regardless, so its program/state survive a close. */
-void basic_window_open(void)
+/* BASIC window <-> instance helpers (used by wm_close_window via accessors). */
+static int bas_index_of(window_t *w)
 {
-    if (basic_open) { active_win = &basic_win; wm_raise(&basic_win); g_need_full = 1; return; }
-    if (basic_win.width == 0) {      /* first open: capture the saved layout */
-        basic_win.x = 23; basic_win.y = 421; basic_win.width = 560; basic_win.height = 360;
-    }
-    title_set(&basic_win, "BASIC");
-    basic_win.chrome_color = 0xFF66FF99U;
-    basic_win.title_bg     = 0xFF105028U;
-    basic_win.title_fg     = 0xFFFFFFFFU;
-    basic_win.content_bg   = 0xFF001405U;
-    basic_win.draw_content = basic_draw;
-    wm_add(&basic_win);
-    basic_open = 1;
-    active_win = &basic_win; wm_raise(&basic_win); g_need_full = 1;
+    int i;
+    for (i = 0; i < NBASIC; i++) if (w == &bui[i].win) return i;
+    return -1;
 }
+static void bas_mark_closed(int idx) { if (idx >= 0 && idx < NBASIC) bui[idx].open = 0; }
+/* The instance whose window is currently active (for keystroke routing); -1. */
+static int bas_active_index(void)
+{
+    int i;
+    for (i = 0; i < NBASIC; i++) if (active_win == &bui[i].win && bui[i].open) return i;
+    return -1;
+}
+
+/* Open (idempotently) BASIC window @idx and add it to the WM.  Mirrors
+ * gwin_shell_window_open_n(): if already shown, just raise + focus it;
+ * otherwise (re)build its chrome and add it.  The basic_main_n interpreter
+ * thread keeps running regardless, so its program/state survive a close. */
+int basic_window_open_n(int idx)
+{
+    struct basic_ui *u;
+    if (idx < 0 || idx >= NBASIC) return SYSERR;
+    u = &bui[idx];
+    if (u->open) { active_win = &u->win; wm_raise(&u->win); g_need_full = 1; return OK; }
+    if (u->win.width == 0) {          /* first open: default layout (offset 2nd) */
+        u->win.x = (idx == 0) ? 23  : 90;
+        u->win.y = (idx == 0) ? 421 : 300;
+        u->win.width = 560; u->win.height = 360;
+    }
+    title_set(&u->win, (idx == 0) ? "BASIC" : "BASIC 2");
+    u->win.chrome_color = 0xFF66FF99U;
+    u->win.title_bg     = 0xFF105028U;
+    u->win.title_fg     = 0xFFFFFFFFU;
+    u->win.content_bg   = 0xFF001405U;
+    u->win.draw_content = basic_draw;
+    wm_add(&u->win);
+    u->open = 1;
+    active_win = &u->win; wm_raise(&u->win); g_need_full = 1;
+    return OK;
+}
+/* Back-compat: gwm_main + the `bas` command open BASIC 0. */
+void basic_window_open(void) { basic_window_open_n(0); }
 
 /* Top of the scrolling text / graphics area, below the title bar + toolbar. */
 #define BAS_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + BAS_TB_H)
-/* The graphics content rectangle (desktop coords) of the BASIC window. */
-static void bas_gfx_rect(int *gx0, int *gy0, int *gw, int *gh)
+/* The graphics content rectangle (desktop coords) of BASIC window @u. */
+static void bas_gfx_rect(struct basic_ui *u, int *gx0, int *gy0, int *gw, int *gh)
 {
-    *gx0 = basic_win.x + 4;
-    *gy0 = basic_win.y + WM_TITLEBAR_H + 2 + BAS_TB_H;
-    *gw  = basic_win.width - 8;
-    *gh  = basic_win.height - (*gy0 - basic_win.y) - 3;
+    *gx0 = u->win.x + 4;
+    *gy0 = u->win.y + WM_TITLEBAR_H + 2 + BAS_TB_H;
+    *gw  = u->win.width - 8;
+    *gh  = u->win.height - (*gy0 - u->win.y) - 3;
 }
 static int bas_abs(int v) { return v < 0 ? -v : v; }
 static unsigned int bas_palette(int c)
@@ -1223,42 +1269,44 @@ static unsigned int bas_palette(int c)
 
 /* Full-screen editor cursor (classic micro-BASIC style): arrow keys roam it
  * over the on-screen program text; Enter submits the logical line under it.
- * It tracks the output position (bas_row/bas_col) while the interpreter is
- * printing, then the user can move it up to re-edit a previous line. */
-static int           bas_ed_row, bas_ed_col;
-static int           bas_esc;      /* CSI parser: 0 idle, 1 saw ESC, 2 saw ESC[ */
-
-static void bas_newline(void)
+ * It tracks the output position (u->row/u->col) while the interpreter is
+ * printing, then the user can move it up to re-edit a previous line.
+ * (Cursor state ed_row/ed_col/esc now lives in struct basic_ui.) */
+static void bas_newline(struct basic_ui *u)
 {
-    bas_ring[bas_row][bas_col] = 0;
-    bas_row = (bas_row + 1) % BAS_ROWS; bas_col = 0; bas_ring[bas_row][0] = 0;
-    if (bas_row == 0) bas_filled = 1;
-    for (int r = 0; r < BAS_ROWS; r++) bas_dirty[r] = 1;
+    u->ring[u->row][u->col] = 0;
+    u->row = (u->row + 1) % BAS_ROWS; u->col = 0; u->ring[u->row][0] = 0;
+    if (u->row == 0) u->filled = 1;
+    for (int r = 0; r < BAS_ROWS; r++) u->dirty[r] = 1;
 }
-static void bas_putc(char c)
+static void bas_putc(struct basic_ui *u, char c)
 {
-    if (bas_gfx) {               /* leaving graphics mode — wipe + reset to text */
-        bas_gfx = 0; bas_full = 1;
-        bas_row = 0; bas_col = 0; bas_filled = 0; bas_ring[0][0] = 0;
+    if (u->gfx) {                /* leaving graphics mode — wipe + reset to text */
+        u->gfx = 0; u->full = 1;
+        u->row = 0; u->col = 0; u->filled = 0; u->ring[0][0] = 0;
     }
     if (c == '\r') return;
-    if (c == '\n') { bas_newline(); return; }
-    if (c == '\t') { do { if (bas_col < BAS_COLS) bas_ring[bas_row][bas_col++] = ' '; }
-                     while ((bas_col % 8) && bas_col < BAS_COLS);
-                     bas_ring[bas_row][bas_col] = 0; bas_dirty[bas_row] = 1; return; }
-    if (c == 8 || c == 0x7f) { if (bas_col > 0) { bas_col--; bas_ring[bas_row][bas_col] = 0; bas_dirty[bas_row] = 1; } return; }
+    if (c == '\n') { bas_newline(u); return; }
+    if (c == '\t') { do { if (u->col < BAS_COLS) u->ring[u->row][u->col++] = ' '; }
+                     while ((u->col % 8) && u->col < BAS_COLS);
+                     u->ring[u->row][u->col] = 0; u->dirty[u->row] = 1; return; }
+    if (c == 8 || c == 0x7f) { if (u->col > 0) { u->col--; u->ring[u->row][u->col] = 0; u->dirty[u->row] = 1; } return; }
     if (c < 0x20) return;
-    if (bas_col >= BAS_COLS) bas_newline();
-    bas_ring[bas_row][bas_col++] = c; bas_ring[bas_row][bas_col] = 0; bas_dirty[bas_row] = 1;
+    if (u->col >= BAS_COLS) bas_newline(u);
+    u->ring[u->row][u->col++] = c; u->ring[u->row][u->col] = 0; u->dirty[u->row] = 1;
 }
-static void bas_emit(const char *s)
+/* Emit a string to a specific BASIC window's ring. */
+static void bas_emit_u(struct basic_ui *u, const char *s)
 {
-    while (*s) bas_putc(*s++);
+    while (*s) bas_putc(u, *s++);
     /* Interpreter output lands at the bottom; keep the edit cursor there so
      * the next keystroke continues from the live line (the user can still
      * arrow up afterwards to re-edit history). */
-    bas_ed_row = bas_row; bas_ed_col = bas_col;
+    u->ed_row = u->row; u->ed_col = u->col;
 }
+/* Interpreter output hook — runs on the BASIC thread, so basic_curi() picks
+ * the right window. */
+static void bas_emit(const char *s) { bas_emit_u(&bui[basic_curi()], s); }
 
 /* ---- CLS / PLOT / LINE / PAUSE: pixel graphics drawn straight into the
  * BASIC window's content area.  basic_draw() leaves the content untouched
@@ -1267,26 +1315,28 @@ static void bas_emit(const char *s)
 /* CLS mode: 1 = text screen, 2 = graphics screen, 3 = both. */
 static void bas_cls(int mode)
 {
+    struct basic_ui *u = &bui[basic_curi()];
     if (mode == 2 || mode == 3) {            /* clear the graphics layer */
         int gx0, gy0, gw, gh;
-        bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+        bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
         if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, 0xFF001405U);
     }
     if (mode == 1 || mode == 3) {            /* clear the text screen */
         int r;
-        for (r = 0; r < BAS_ROWS; r++) { bas_ring[r][0] = 0; bas_dirty[r] = 1; }
-        bas_row = 0; bas_col = 0; bas_filled = 0;
-        bas_ed_row = 0; bas_ed_col = 0; bas_full = 1;
+        for (r = 0; r < BAS_ROWS; r++) { u->ring[r][0] = 0; u->dirty[r] = 1; }
+        u->row = 0; u->col = 0; u->filled = 0;
+        u->ed_row = 0; u->ed_col = 0; u->full = 1;
     }
     /* show the graphics layer for a graphics clear, else the text layer */
-    bas_gfx = (mode == 2) ? 1 : 0;
+    u->gfx = (mode == 2) ? 1 : 0;
 }
 /* PLOT x,y[,char]: a character at pixel cell (x,y) on the graphics screen. */
 static void bas_plot(int x, int y, int ch)
 {
+    struct basic_ui *u = &bui[basic_curi()];
     int gx0, gy0, gw, gh; char s[2];
-    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
-    bas_gfx = 1;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    u->gfx = 1;
     if (ch < 0x20 || ch > 0x7e) ch = '*';
     if (x < 0 || x * FONT_WIDTH >= gw || y < 0 || y * FONT_HEIGHT >= gh) return;
     s[0] = (char)ch; s[1] = 0;
@@ -1296,13 +1346,14 @@ static void bas_plot(int x, int y, int ch)
  * screen, coordinates in content-area pixels, colour 0..15. */
 static void bas_line(int x1, int y1, int x2, int y2, int color)
 {
+    struct basic_ui *u = &bui[basic_curi()];
     int gx0, gy0, gw, gh;
     unsigned int col = bas_palette(color);
     int dx = bas_abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
     int dy = -bas_abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
     int err = dx + dy, e2;
-    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
-    bas_gfx = 1;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    u->gfx = 1;
     for (;;) {
         if (x1 >= 0 && x1 < gw && y1 >= 0 && y1 < gh)
             fill_rect(gx0 + x1, gy0 + y1, 1, 1, col);
@@ -1315,10 +1366,11 @@ static void bas_line(int x1, int y1, int x2, int y2, int color)
 /* CIRCLE (cx,cy),r,color: outline circle (midpoint algorithm). */
 static void bas_circle(int cx, int cy, int r, int color)
 {
+    struct basic_ui *u = &bui[basic_curi()];
     int gx0, gy0, gw, gh, x = r, y = 0, err = 1 - r;
     unsigned int col = bas_palette(color);
-    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
-    bas_gfx = 1;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    u->gfx = 1;
     if (r < 0) return;
 #define BAS_PX(px, py) do { int ax = (px), ay = (py); \
         if (ax >= 0 && ax < gw && ay >= 0 && ay < gh) fill_rect(gx0 + ax, gy0 + ay, 1, 1, col); } while (0)
@@ -1399,15 +1451,15 @@ static const struct { const char *label; const char *cmd; } bas_btns[] = {
 
 /* Button i's rectangle in desktop coords, laid out left-to-right and wrapped
  * to a new row when it would overflow the window width. */
-static void bas_btn_rect(int i, int *bx, int *by, int *bw, int *bh)
+static void bas_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh)
 {
-    int left = basic_win.x + 4, right = basic_win.x + basic_win.width - 2;
+    int left = self->x + 4, right = self->x + self->width - 2;
     int x = left, row = 0, k;
     for (k = 0; ; k++) {
         int w = bas_slen(bas_btns[k].label) * FONT_WIDTH + 8;
         if (x + w > right && x > left) { row++; x = left; }   /* wrap */
         if (k == i) {
-            *bx = x; *by = basic_win.y + WM_TITLEBAR_H + 3 + row * BAS_ROW_H;
+            *bx = x; *by = self->y + WM_TITLEBAR_H + 3 + row * BAS_ROW_H;
             *bw = w; *bh = BAS_BTN_H; return;
         }
         x += w + 4;
@@ -1418,7 +1470,7 @@ static void basic_draw_toolbar(window_t *self)
     int i, bx, by, bw, bh;
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, BAS_TB_H, 0xFF0A2A12U);
     for (i = 0; i < BAS_NBTN; i++) {
-        bas_btn_rect(i, &bx, &by, &bw, &bh);
+        bas_btn_rect(self, i, &bx, &by, &bw, &bh);
         fill_rect(bx, by, bw, bh, 0xFF1E6E38U);
         fill_rect(bx, by, bw, 1, 0xFF2EA050U);              /* top highlight  */
         draw_string_at(bx + 4, by + 1, bas_btns[i].label, 0xFFEFFFE0U, 0xFF1E6E38U);
@@ -1428,33 +1480,34 @@ static void basic_draw_toolbar(window_t *self)
 static void basic_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
-    if (bas_full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
-                              self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); bas_full = 0; }
+    struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
+    if (u->full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+                             self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); u->full = 0; }
     basic_draw_toolbar(self);
     /* Graphics mode: CLS/PLOT/LINE paint the content directly; leave it be. */
-    if (bas_gfx) return;
+    if (u->gfx) return;
     int content_h = self->height - (BAS_TXT_TOP(self) - self->y) - 3;
     int max_rows = content_h / line_h; if (max_rows < 1) return; if (max_rows > BAS_ROWS) max_rows = BAS_ROWS;
     int rows, start;
     {                                    /* scrolling text console */
-        int have = bas_filled ? BAS_ROWS : bas_row + 1;
+        int have = u->filled ? BAS_ROWS : u->row + 1;
         rows = have < max_rows ? have : max_rows;
-        start = (bas_row - rows + 1 + BAS_ROWS) % BAS_ROWS;
+        start = (u->row - rows + 1 + BAS_ROWS) % BAS_ROWS;
     }
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % BAS_ROWS;
-        if (g_force_redraw || bas_dirty[r]) {
+        if (g_force_redraw || u->dirty[r]) {
             int ry = BAS_TXT_TOP(self) + i * line_h;
             fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
-            draw_string_at(self->x + 4, ry, bas_ring[r], 0xFFB6FFB6U, self->content_bg);
-            if (!g_force_redraw) bas_dirty[r] = 0;
+            draw_string_at(self->x + 4, ry, u->ring[r], 0xFFB6FFB6U, self->content_bg);
+            if (!g_force_redraw) u->dirty[r] = 0;
         }
     }
     {                                    /* blinking underline at the edit cursor */
-        int i = (bas_ed_row - start + BAS_ROWS) % BAS_ROWS;
+        int i = (u->ed_row - start + BAS_ROWS) % BAS_ROWS;
         if (i >= 0 && i < rows) {
             int cr_y = BAS_TXT_TOP(self) + i * line_h;
-            int cr_x = self->x + 4 + bas_ed_col * FONT_WIDTH;
+            int cr_x = self->x + 4 + u->ed_col * FONT_WIDTH;
             if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
                 unsigned int col = ((frame >> 2) & 1) ? 0xFF66FF66U : self->content_bg;
                 fill_rect(cr_x, cr_y + FONT_HEIGHT - 2, FONT_WIDTH, 2, col);
@@ -1464,128 +1517,136 @@ static void basic_draw(window_t *self, unsigned int frame)
 }
 
 /* Click test (screen coords): index of the toolbar button under the point, or
- * -1.  Requires the BASIC window to be the topmost window there. */
-static int basic_toolbar_hit(int sx, int sy)
+ * -1.  Requires a BASIC window to be the topmost window there; *inst returns
+ * which BASIC instance was hit. */
+static int basic_toolbar_hit(int sx, int sy, int *inst)
 {
-    int dx = sx + vp_x, dy = sy + vp_y, i, bx, by, bw, bh;
-    if (window_at_point(sx, sy) != &basic_win) return -1;
+    int dx = sx + vp_x, dy = sy + vp_y, i, bx, by, bw, bh, bi;
+    window_t *top = window_at_point(sx, sy);
+    bi = bas_index_of(top);
+    if (bi < 0) return -1;
+    if (inst) *inst = bi;
     for (i = 0; i < BAS_NBTN; i++) {
-        bas_btn_rect(i, &bx, &by, &bw, &bh);
+        bas_btn_rect(top, i, &bx, &by, &bw, &bh);
         if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) return i;
     }
     return -1;
 }
 
-/* line queue: the editor (Enter) enqueues a logical line, basic_main + INPUT
- * dequeue it.  Decoupling the keyboard thread from the interpreter thread. */
-#define BAS_QN 8
-static char      bas_q[BAS_QN][256];
-static int       bas_qh, bas_qt;
-static semaphore bas_sem;
-
-/* ---- screen-editor primitives (operate on the bas_ring grid) ---------- */
-
-static int bas_linelen(int r)
+/* Enqueue a logical line onto window @u's interpreter queue + wake its REPL. */
+static void bas_enqueue(struct basic_ui *u, const char *line)
 {
-    int n = 0; while (n < BAS_COLS && bas_ring[r][n]) n++; return n;
+    int k = 0;
+    for (; line[k] && k < 255; k++) u->q[u->qt][k] = line[k];
+    u->q[u->qt][k] = 0;
+    u->qt = (u->qt + 1) % BAS_QN;
+    if (u->sem != (semaphore)SYSERR) signaln(u->sem, 1);
+}
+
+/* ---- screen-editor primitives (operate on a window's ring grid) -------- */
+
+static int bas_linelen(struct basic_ui *u, int r)
+{
+    int n = 0; while (n < BAS_COLS && u->ring[r][n]) n++; return n;
 }
 /* Highest ring row the cursor may visit: the live output row (or the whole
  * ring once it has wrapped). */
-static int bas_ed_maxrow(void) { return bas_filled ? BAS_ROWS - 1 : bas_row; }
+static int bas_ed_maxrow(struct basic_ui *u) { return u->filled ? BAS_ROWS - 1 : u->row; }
 
-static void bas_ed_clampcol(void)
+static void bas_ed_clampcol(struct basic_ui *u)
 {
-    int len = bas_linelen(bas_ed_row);
-    if (bas_ed_col > len) bas_ed_col = len;
-    if (bas_ed_col < 0)   bas_ed_col = 0;
+    int len = bas_linelen(u, u->ed_row);
+    if (u->ed_col > len) u->ed_col = len;
+    if (u->ed_col < 0)   u->ed_col = 0;
 }
 
-static void bas_ed_putchar(char ch)        /* overwrite at the cursor, extend EOL */
+static void bas_ed_putchar(struct basic_ui *u, char ch)  /* overwrite, extend EOL */
 {
-    int len = bas_linelen(bas_ed_row);
-    if (bas_ed_col >= BAS_COLS) return;
-    if (bas_ed_col > len) { for (int k = len; k < bas_ed_col; k++) bas_ring[bas_ed_row][k] = ' '; len = bas_ed_col; }
-    bas_ring[bas_ed_row][bas_ed_col] = ch;
-    if (bas_ed_col == len) bas_ring[bas_ed_row][bas_ed_col + 1] = 0;   /* appended a char */
-    if (bas_ed_col < BAS_COLS - 1) bas_ed_col++;
+    int len = bas_linelen(u, u->ed_row);
+    if (u->ed_col >= BAS_COLS) return;
+    if (u->ed_col > len) { for (int k = len; k < u->ed_col; k++) u->ring[u->ed_row][k] = ' '; len = u->ed_col; }
+    u->ring[u->ed_row][u->ed_col] = ch;
+    if (u->ed_col == len) u->ring[u->ed_row][u->ed_col + 1] = 0;   /* appended a char */
+    if (u->ed_col < BAS_COLS - 1) u->ed_col++;
     /* keep the output cursor in step while editing the live bottom line so a
      * later newline doesn't truncate the freshly typed text */
-    if (bas_ed_row == bas_row && bas_ed_col > bas_col) bas_col = bas_ed_col;
-    bas_dirty[bas_ed_row] = 1;
+    if (u->ed_row == u->row && u->ed_col > u->col) u->col = u->ed_col;
+    u->dirty[u->ed_row] = 1;
 }
 
-static void bas_ed_backspace(void)         /* destructive: delete left, shift up */
+static void bas_ed_backspace(struct basic_ui *u)         /* delete left, shift up */
 {
-    if (bas_ed_col <= 0) return;
-    bas_ed_col--;
-    int len = bas_linelen(bas_ed_row);
-    for (int k = bas_ed_col; k < len; k++) bas_ring[bas_ed_row][k] = bas_ring[bas_ed_row][k + 1];
-    if (bas_ed_row == bas_row && bas_col > 0) bas_col--;
-    bas_dirty[bas_ed_row] = 1;
+    if (u->ed_col <= 0) return;
+    u->ed_col--;
+    int len = bas_linelen(u, u->ed_row);
+    for (int k = u->ed_col; k < len; k++) u->ring[u->ed_row][k] = u->ring[u->ed_row][k + 1];
+    if (u->ed_row == u->row && u->col > 0) u->col--;
+    u->dirty[u->ed_row] = 1;
 }
 
 /* Submit the logical line under the cursor to the interpreter queue, then
  * return the cursor to the live bottom line. */
-static void bas_ed_enter(void)
+static void bas_ed_enter(struct basic_ui *u)
 {
     char line[256]; int n = 0;
-    for (; n < BAS_COLS && bas_ring[bas_ed_row][n]; n++) line[n] = bas_ring[bas_ed_row][n];
+    for (; n < BAS_COLS && u->ring[u->ed_row][n]; n++) line[n] = u->ring[u->ed_row][n];
     while (n > 0 && line[n - 1] == ' ') n--;      /* trim trailing pad */
     line[n] = 0;
 
-    if (bas_ed_row == bas_row) {                  /* editing the live line: scroll down */
-        bas_col = bas_linelen(bas_row);
-        bas_putc('\n');
+    if (u->ed_row == u->row) {                    /* editing the live line: scroll down */
+        u->col = bas_linelen(u, u->row);
+        bas_putc(u, '\n');
     }
-    bas_ed_row = bas_row; bas_ed_col = bas_col;    /* cursor home to the bottom */
-
-    { int k = 0; for (; line[k] && k < 255; k++) bas_q[bas_qt][k] = line[k]; bas_q[bas_qt][k] = 0; }
-    bas_qt = (bas_qt + 1) % BAS_QN;
-    if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
+    u->ed_row = u->row; u->ed_col = u->col;        /* cursor home to the bottom */
+    bas_enqueue(u, line);
 }
 
-/* Route a keystroke into the editor.  Parses the ANSI arrow CSI sequences the
- * USB keyboard emits (ESC [ A/B/C/D). */
+/* Route a keystroke into the active BASIC window's editor.  Parses the ANSI
+ * arrow CSI sequences the USB keyboard emits (ESC [ A/B/C/D). */
 void basic_feed(int c)
 {
-    if (c == 3) { extern void basic_break(void); basic_break(); return; }  /* Ctrl-C */
-    if (bas_esc == 1) { bas_esc = (c == '[') ? 2 : 0; return; }
-    if (bas_esc == 2) {
-        bas_esc = 0;
+    int bi = bas_active_index();
+    struct basic_ui *u;
+    if (bi < 0) return;                           /* no BASIC window focused */
+    u = &bui[bi];
+    if (c == 3) { basic_break_n(bi); return; }    /* Ctrl-C this window       */
+    if (u->esc == 1) { u->esc = (c == '[') ? 2 : 0; return; }
+    if (u->esc == 2) {
+        u->esc = 0;
         switch (c) {
-            case 'A': if (bas_ed_row > 0)               { bas_dirty[bas_ed_row] = 1; bas_ed_row--; bas_ed_clampcol(); bas_dirty[bas_ed_row] = 1; } return; /* up    */
-            case 'B': if (bas_ed_row < bas_ed_maxrow()) { bas_dirty[bas_ed_row] = 1; bas_ed_row++; bas_ed_clampcol(); bas_dirty[bas_ed_row] = 1; } return; /* down  */
-            case 'C': { int len = bas_linelen(bas_ed_row); if (bas_ed_col < len && bas_ed_col < BAS_COLS - 1) { bas_ed_col++; bas_dirty[bas_ed_row] = 1; } } return; /* right */
-            case 'D': if (bas_ed_col > 0) { bas_ed_col--; bas_dirty[bas_ed_row] = 1; } return; /* left */
+            case 'A': if (u->ed_row > 0)                { u->dirty[u->ed_row] = 1; u->ed_row--; bas_ed_clampcol(u); u->dirty[u->ed_row] = 1; } return; /* up    */
+            case 'B': if (u->ed_row < bas_ed_maxrow(u)) { u->dirty[u->ed_row] = 1; u->ed_row++; bas_ed_clampcol(u); u->dirty[u->ed_row] = 1; } return; /* down  */
+            case 'C': { int len = bas_linelen(u, u->ed_row); if (u->ed_col < len && u->ed_col < BAS_COLS - 1) { u->ed_col++; u->dirty[u->ed_row] = 1; } } return; /* right */
+            case 'D': if (u->ed_col > 0) { u->ed_col--; u->dirty[u->ed_row] = 1; } return; /* left */
             default:  return;
         }
     }
-    if (c == 0x1b) { bas_esc = 1; return; }
-    if (c == '\r' || c == '\n') { bas_ed_enter(); return; }
-    if (c == 8 || c == 0x7f)    { bas_ed_backspace(); return; }
-    if (c >= 0x20 && c < 0x7f)  { bas_ed_putchar((char)c); return; }
+    if (c == 0x1b) { u->esc = 1; return; }
+    if (c == '\r' || c == '\n') { bas_ed_enter(u); return; }
+    if (c == 8 || c == 0x7f)    { bas_ed_backspace(u); return; }
+    if (c >= 0x20 && c < 0x7f)  { bas_ed_putchar(u, (char)c); return; }
 }
 
+/* INPUT hook — runs on the BASIC thread, so basic_curi() picks the window. */
 static int basic_getline(char *buf, int max)
 {
-    wait(bas_sem);
-    int i = 0; for (; bas_q[bas_qh][i] && i < max - 1; i++) buf[i] = bas_q[bas_qh][i]; buf[i] = 0;
-    bas_qh = (bas_qh + 1) % BAS_QN; return i;
+    struct basic_ui *u = &bui[basic_curi()];
+    wait(u->sem);
+    int i = 0; for (; u->q[u->qh][i] && i < max - 1; i++) buf[i] = u->q[u->qh][i]; buf[i] = 0;
+    u->qh = (u->qh + 1) % BAS_QN; return i;
 }
 
-/* Toolbar button -> run its command: echo it (so it looks typed) and push it
- * onto the interpreter queue, exactly like pressing ENTER on that line. */
-static void basic_run_button(int idx)
+/* Toolbar button -> run its command on window @inst: echo it (so it looks
+ * typed) and push it onto that window's interpreter queue. */
+static void basic_run_button(int inst, int idx)
 {
     const char *cmd;
-    int k;
-    if (idx < 0 || idx >= BAS_NBTN) return;
+    struct basic_ui *u;
+    if (inst < 0 || inst >= NBASIC || idx < 0 || idx >= BAS_NBTN) return;
+    u = &bui[inst];
     cmd = bas_btns[idx].cmd;
-    bas_emit(cmd); bas_emit("\n");
-    for (k = 0; cmd[k] && k < 255; k++) bas_q[bas_qt][k] = cmd[k];
-    bas_q[bas_qt][k] = 0;
-    bas_qt = (bas_qt + 1) % BAS_QN;
-    if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
+    bas_emit_u(u, cmd); bas_emit_u(u, "\n");
+    bas_enqueue(u, cmd);
 }
 
 /* Right-click menu action. */
@@ -1596,49 +1657,62 @@ static void menu_exec(int sel)
         for (i = 0; i < NSHELL; i++)
             if (!shc[i].opened) { gwin_shell_window_open_n(i); opened = 1; break; }
         if (!opened) gwin_shell_window_open_n(0); /* all open -> raise Shell 0 */
-    } else if (sel == 1) {                       /* BASIC: open/raise its window */
-        basic_window_open();
+    } else if (sel == 1) {                       /* BASIC: open a closed slot */
+        int i, opened = 0;
+        for (i = 0; i < NBASIC; i++)
+            if (!bui[i].open) { basic_window_open_n(i); opened = 1; break; }
+        if (!opened) basic_window_open_n(0);     /* all open -> raise BASIC 0 */
     }
     g_need_full = 1;
 }
 
-thread basic_main(void)
+/* Set the interpreter hooks (global function pointers — idempotent; both
+ * BASIC threads call this, the last write wins and they're identical). */
+static void basic_install_hooks(void)
 {
-    char line[256];
-    bas_sem = semcreate(0);
+    extern void basic_set_cls(void (*)(int));
+    extern void basic_set_plot(void (*)(int, int, int));
+    extern void basic_set_pause(void (*)(int));
+    extern void basic_set_line(void (*)(int, int, int, int, int));
+    extern void basic_set_circle(void (*)(int, int, int, int));
+    extern void basic_set_wifi(void (*)(int));
     basic_set_emit(bas_emit);
     basic_set_input(basic_getline);
-    {
-        extern void basic_set_cls(void (*)(int));
-        extern void basic_set_plot(void (*)(int, int, int));
-        extern void basic_set_pause(void (*)(int));
-        extern void basic_set_line(void (*)(int, int, int, int, int));
-        basic_set_cls(bas_cls);
-        basic_set_plot(bas_plot);
-        basic_set_pause(bas_pause);
-        basic_set_line(bas_line);
-        { extern void basic_set_circle(void (*)(int, int, int, int));
-          extern void basic_set_wifi(void (*)(int));
-          basic_set_circle(bas_circle);
-          basic_set_wifi(bas_wifi); }
-    }
-    basic_init();
-    bas_emit("Xinu BASIC ready.  Full-screen editor:\n"
-             "  type a line + ENTER to enter it; arrow keys roam the screen,\n"
-             "  edit any line and press ENTER to re-register it.\n"
-             "  RUN / LIST / NEW / FILES / RUN \"hello.bas\".\n");
+    basic_set_cls(bas_cls);
+    basic_set_plot(bas_plot);
+    basic_set_pause(bas_pause);
+    basic_set_line(bas_line);
+    basic_set_circle(bas_circle);
+    basic_set_wifi(bas_wifi);
+}
+
+/* One REPL thread per BASIC window (apps/basic.c instance @inst). */
+thread basic_main_n(int inst)
+{
+    char line[256];
+    struct basic_ui *u = &bui[inst];
+    basic_bind_thread(inst);          /* so basic_curi() resolves to @inst    */
+    u->sem = semcreate(0);
+    basic_install_hooks();
+    basic_init();                     /* inits this thread's instance (bs[inst]) */
+    bas_emit_u(u, "Xinu BASIC ready.  Full-screen editor:\n"
+                  "  type a line + ENTER to enter it; arrow keys roam the screen,\n"
+                  "  edit any line and press ENTER to re-register it.\n"
+                  "  RUN / LIST / NEW / FILES / RUN \"hello.bas\".\n");
     for (;;) {
         basic_getline(line, sizeof line);
         basic_exec_line(line);
     }
     return OK;
 }
+/* Back-compat entry (BASIC 0) for any caller still using the old name. */
+thread basic_main(void) { return basic_main_n(0); }
 
 /* Route a keystroke to the active window's input (shell or BASIC). */
 void gwm_feed_key(int c)
 {
     extern void gwincon_feed(int, int);          /* (minor, char) */
-    if (active_win == &basic_win)      basic_feed(c);
+    if (bas_active_index() >= 0)        basic_feed(c);
     else if (active_win == &shc[1].win) gwincon_feed(1, c);
     else                                gwincon_feed(0, c);
 }
@@ -1653,7 +1727,7 @@ void wm_reset_layout(void)
     softkbd_win.x = 832;  softkbd_win.y = 503;  softkbd_win.width = 439; softkbd_win.height = 223;
     actor_win.x = 19;     actor_win.y = 143;    actor_win.width = 412;  actor_win.height = 270;
     graphics_win.x = 444; graphics_win.y = 15;  graphics_win.width = 374; graphics_win.height = 402;
-    basic_win.x = 23;     basic_win.y = 421;    basic_win.width = 560;  basic_win.height = 360;
+    bui[0].win.x = 23;    bui[0].win.y = 421;   bui[0].win.width = 560; bui[0].win.height = 360;
     shc[0].win.x = 824;   shc[0].win.y = 18;    shc[0].win.width = 456; shc[0].win.height = 476;
     active_win = 0;
     g_need_full = 1;          /* force a full repaint at the next frame */
@@ -1671,7 +1745,7 @@ int wm_dump_layout(char *buf, int max)
         { "softkbd_win",  &softkbd_win  },
         { "actor_win",    &actor_win    },
         { "graphics_win", &graphics_win },
-        { "basic_win",    &basic_win    },
+        { "basic_win",    &bui[0].win   },
         { "sh_win",       &shc[0].win   },
     };
     int n = 0, i;
@@ -1782,7 +1856,7 @@ thread gwm_main(void)
      * of the initial full scene paint. */
     /* BASIC interpreter window.  Initial position captured from the live
      * on-screen layout (/api/wm/dump) so the desktop boots as last arranged. */
-    basic_win.x = 23;     basic_win.y = 421;    basic_win.width = 560;  basic_win.height = 360;
+    bui[0].win.x = 23;    bui[0].win.y = 421;   bui[0].win.width = 560; bui[0].win.height = 360;
     basic_window_open();
 
     gwin_shell_window_open();

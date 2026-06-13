@@ -94,49 +94,112 @@ static void num_str(double v, char *out)
 /* ---- program + variables ------------------------------------------ */
 #define MAXPROG  320
 #define PLINELEN 96
-static struct { int no; char text[PLINELEN]; } prog[MAXPROG];
-static int    nprog;
-/* Variables are kept in a name table so multi-character names (NP, PIVOT,
- * TVX, RAD, ...) work, not just A..Z / A0..Z9.  Each slot holds a scalar
- * value, a string value (used when the name ends in '$'), and optional array
- * metadata (a name can be both a scalar and an array, classic-BASIC style). */
 #define SVAR_LEN 64
 #define NVAR     224
-static char   vname[NVAR][12];        /* uppercased name; "" = free slot      */
-static double vval[NVAR];             /* scalar numeric value                 */
-static char   vstr[NVAR][SVAR_LEN];   /* string value (name ends in '$')      */
-static struct { int base, d1, d2, ndim; } varr[NVAR];   /* array (ndim 0 = none) */
-static int    nvar;
-
 #define ARR_POOL 4096
-static double arrpool[ARR_POOL];
-static int    arrtop;
-
-/* DATA/READ/RESTORE cursor: data_pc = prog[] index of the DATA line being
- * read (-1 before the first READ / after RESTORE); data_ip walks its
- * items, NULL forces a re-scan from data_pc+1. */
-static int         data_pc = -1;
-static const char *data_ip;
-
-/* ---- runtime state ------------------------------------------------- */
-static int         running;
-static int         pc;                /* current prog[] index while running */
-static const char *ip;                /* statement cursor                   */
-static int         err;
-static char        errmsg[64];
-static int         g_goto;            /* -1 none, -2 pc/ip already set, >=0 target line */
-static volatile int g_break;          /* set by Ctrl-C to interrupt a running program */
-void basic_break(void) { g_break = 1; }
-
 #define FOR_MAX 32
-static struct { int var; double limit, step; int idx; const char *stmt; } forstk[FOR_MAX];
-static int fortop;
 #define GOSUB_MAX 256          /* deep enough for recursive programs (maze) */
-static struct { int pc; const char *ip; } gosubstk[GOSUB_MAX];   /* return addr */
-static int gosubtop;
 #define WHILE_MAX 32
-static struct { int pc; const char *ip; } whilestk[WHILE_MAX];   /* the WHILE's condition */
-static int whiletop;
+
+/* ---- multiple independent interpreters ----------------------------------
+ * Each on-screen BASIC window (apps/gwm.c) runs its own REPL thread with a
+ * fully independent program + variables + runtime stacks.  All the former
+ * file-scope globals now live in one struct, instanced per window in bs[].
+ * The "current" instance is resolved from the running thread id (robust
+ * under preemption — no shared cursor to race on); a #define redirect below
+ * leaves the ~1700-line interpreter body unchanged.
+ *
+ * Variables are kept in a name table so multi-character names (NP, PIVOT,
+ * TVX, RAD, ...) work, not just A..Z / A0..Z9.  Each slot holds a scalar
+ * value, a string value (used when the name ends in '$'), and optional array
+ * metadata (a name can be both a scalar and an array, classic-BASIC style).
+ * DATA/READ/RESTORE cursor: data_pc = prog[] index of the DATA line being
+ * read (-1 before the first READ / after RESTORE); data_ip walks its items,
+ * NULL forces a re-scan from data_pc+1. */
+#define NBASIC 2
+struct basic_state {
+    struct { int no; char text[PLINELEN]; } prog[MAXPROG];
+    int    nprog;
+    char   vname[NVAR][12];        /* uppercased name; "" = free slot      */
+    double vval[NVAR];             /* scalar numeric value                 */
+    char   vstr[NVAR][SVAR_LEN];   /* string value (name ends in '$')      */
+    struct { int base, d1, d2, ndim; } varr[NVAR];   /* array (ndim 0 = none) */
+    int    nvar;
+    double arrpool[ARR_POOL];
+    int    arrtop;
+    int    data_pc;
+    const char *data_ip;
+    /* runtime state */
+    int    running;
+    int    pc;                     /* current prog[] index while running   */
+    const char *ip;                /* statement cursor                     */
+    int    err;
+    char   errmsg[64];
+    int    g_goto;                 /* -1 none, -2 pc/ip already set, >=0 target line */
+    volatile int brk;              /* set by Ctrl-C to interrupt a program (g_break) */
+    struct { int var; double limit, step; int idx; const char *stmt; } forstk[FOR_MAX];
+    int    fortop;
+    struct { int rpc; const char *rip; } gosubstk[GOSUB_MAX];   /* return addr */
+    int    gosubtop;
+    struct { int rpc; const char *rip; } whilestk[WHILE_MAX];   /* WHILE cond  */
+    int    whiletop;
+};
+static struct basic_state bs[NBASIC];
+
+/* Which instance the running thread drives.  basic_bind_thread() records the
+ * tid at REPL start; the gwm.c hooks call basic_curi() to agree on it. */
+static int basic_tid[NBASIC] = { -1, -1 };
+#ifdef BASIC_HOST_TEST
+int basic_host_inst = 0;               /* host test: which instance is "current" */
+#endif
+int basic_curi(void)
+{
+#ifdef BASIC_HOST_TEST
+    return basic_host_inst;
+#else
+    extern int thrcurrent;             /* tid_typ == int (include/stddef.h) */
+    int i;
+    for (i = 0; i < NBASIC; i++) if (basic_tid[i] == thrcurrent) return i;
+    return 0;                          /* non-BASIC thread -> instance 0     */
+#endif
+}
+#ifndef BASIC_HOST_TEST
+void basic_bind_thread(int inst)
+{
+    extern int thrcurrent;
+    if (inst >= 0 && inst < NBASIC) basic_tid[inst] = thrcurrent;
+}
+#endif
+
+/* Redirect every former global to the current instance's field. */
+#define prog      (bs[basic_curi()].prog)
+#define nprog     (bs[basic_curi()].nprog)
+#define vname     (bs[basic_curi()].vname)
+#define vval      (bs[basic_curi()].vval)
+#define vstr      (bs[basic_curi()].vstr)
+#define varr      (bs[basic_curi()].varr)
+#define nvar      (bs[basic_curi()].nvar)
+#define arrpool   (bs[basic_curi()].arrpool)
+#define arrtop    (bs[basic_curi()].arrtop)
+#define data_pc   (bs[basic_curi()].data_pc)
+#define data_ip   (bs[basic_curi()].data_ip)
+#define running   (bs[basic_curi()].running)
+#define pc        (bs[basic_curi()].pc)
+#define ip        (bs[basic_curi()].ip)
+#define err       (bs[basic_curi()].err)
+#define errmsg    (bs[basic_curi()].errmsg)
+#define g_goto    (bs[basic_curi()].g_goto)
+#define g_break   (bs[basic_curi()].brk)
+#define forstk    (bs[basic_curi()].forstk)
+#define fortop    (bs[basic_curi()].fortop)
+#define gosubstk  (bs[basic_curi()].gosubstk)
+#define gosubtop  (bs[basic_curi()].gosubtop)
+#define whilestk  (bs[basic_curi()].whilestk)
+#define whiletop  (bs[basic_curi()].whiletop)
+
+/* Ctrl-C: interrupt instance @inst's running program. */
+void basic_break_n(int inst) { if (inst >= 0 && inst < NBASIC) bs[inst].brk = 1; }
+void basic_break(void) { g_break = 1; }   /* current instance (back-compat) */
 
 static void berr(const char *m)
 { if (err) return; err = 1; int i = 0; for (; m[i] && i < (int)sizeof errmsg - 1; i++) errmsg[i] = m[i]; errmsg[i] = 0; }
@@ -1630,10 +1693,10 @@ static void exec_stmt(void)
     if (kw("END") || kw("STOP")) { running = 0; return; }
     if (kw("GOTO"))  { g_goto = goto_target(); return; }
     if (kw("GOSUB")) { int tgt = goto_target();
-        if (gosubtop < GOSUB_MAX) { gosubstk[gosubtop].pc = pc; gosubstk[gosubtop].ip = ip; gosubtop++; }
+        if (gosubtop < GOSUB_MAX) { gosubstk[gosubtop].rpc = pc; gosubstk[gosubtop].rip = ip; gosubtop++; }
         else berr("GOSUB overflow");
         g_goto = tgt; return; }
-    if (kw("RETURN")){ if (gosubtop > 0) { pc = gosubstk[--gosubtop].pc; ip = gosubstk[gosubtop].ip; g_goto = -2; }
+    if (kw("RETURN")){ if (gosubtop > 0) { pc = gosubstk[--gosubtop].rpc; ip = gosubstk[gosubtop].rip; g_goto = -2; }
                        else berr("RETURN without GOSUB"); return; }
     if (kw("WIFI")) {                         /* WIFI ON | OFF | STATUS */
         int action = 2; skipsp();
@@ -1754,7 +1817,7 @@ static void exec_stmt(void)
         const char *cond_ip = ip; int cond_pc = pc;
         double c = expr();
         if (c != 0) {
-            if (whiletop < WHILE_MAX) { whilestk[whiletop].pc = cond_pc; whilestk[whiletop].ip = cond_ip; whiletop++; }
+            if (whiletop < WHILE_MAX) { whilestk[whiletop].rpc = cond_pc; whilestk[whiletop].rip = cond_ip; whiletop++; }
             else berr("WHILE overflow");
         } else {                                          /* skip to matching WEND */
             int depth = 1;
@@ -1771,7 +1834,7 @@ static void exec_stmt(void)
     if (kw("WEND")) {
         if (whiletop == 0) { berr("WEND without WHILE"); return; }
         int t = whiletop - 1; const char *after_ip = ip; int after_pc = pc;
-        ip = whilestk[t].ip; pc = whilestk[t].pc;
+        ip = whilestk[t].rip; pc = whilestk[t].rpc;
         double c = expr();
         if (c != 0) { g_goto = -2; }                      /* loop: resume body after cond */
         else { whiletop--; ip = after_ip; pc = after_pc; }/* exit: continue after WEND */
@@ -1880,6 +1943,7 @@ static int  host_input(char *buf, int max) {
     if (!fgets(buf, max, stdin)) return -1;
     int n = (int)strlen(buf); while (n && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = 0; return n;
 }
+#ifndef BASIC_NO_MAIN
 int main(void)
 {
     basic_set_emit(host_emit); basic_set_input(host_input); basic_init();
@@ -1890,4 +1954,5 @@ int main(void)
     }
     return 0;
 }
+#endif /* !BASIC_NO_MAIN */
 #endif
