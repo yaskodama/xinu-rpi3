@@ -2747,8 +2747,14 @@ thread webactor_server(void)
                 int blen;
                 if (rc != 0)
                 {
+                    extern int sd_get_step(void);
+                    extern unsigned int sd_get_int(void), sd_get_resp(void);
                     blen = sprintf(sd_resp + 100,
-                                   "sd_read_block(0) FAILED rc=%d\r\n", rc);
+                                   "sd_read_block(0) FAILED rc=%d  init_step=%d "
+                                   "int=0x%08x resp0=0x%08x\r\n"
+                                   "(step: 1 reset, 2 clock, 3 cmd0, 4 cmd8, 7 acmd41, "
+                                   "8 cmd2, 9 cmd3, 10 cmd7, 11 cmd16 ok; x0 = that cmd failed)\r\n",
+                                   rc, sd_get_step(), sd_get_int(), sd_get_resp());
                 }
                 else
                 {
