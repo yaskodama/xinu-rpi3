@@ -1120,12 +1120,22 @@ static void bas_emit(const char *s)
  * BASIC window's content area.  basic_draw() leaves the content untouched
  * while in graphics mode (bas_gfx), so what we paint here persists frame to
  * frame; a program animates by CLS + draw + PAUSE in a loop (rotate.bas). -- */
-static void bas_cls(void)
+/* CLS mode: 1 = text screen, 2 = graphics screen, 3 = both. */
+static void bas_cls(int mode)
 {
-    int gx0, gy0, gw, gh;
-    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
-    if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, 0xFF001405U);
-    bas_gfx = 1;
+    if (mode == 2 || mode == 3) {            /* clear the graphics layer */
+        int gx0, gy0, gw, gh;
+        bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+        if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, 0xFF001405U);
+    }
+    if (mode == 1 || mode == 3) {            /* clear the text screen */
+        int r;
+        for (r = 0; r < BAS_ROWS; r++) { bas_ring[r][0] = 0; bas_dirty[r] = 1; }
+        bas_row = 0; bas_col = 0; bas_filled = 0;
+        bas_ed_row = 0; bas_ed_col = 0; bas_full = 1;
+    }
+    /* show the graphics layer for a graphics clear, else the text layer */
+    bas_gfx = (mode == 2) ? 1 : 0;
 }
 /* PLOT x,y[,char]: a character at pixel cell (x,y) on the graphics screen. */
 static void bas_plot(int x, int y, int ch)
@@ -1368,7 +1378,7 @@ thread basic_main(void)
     basic_set_emit(bas_emit);
     basic_set_input(basic_getline);
     {
-        extern void basic_set_cls(void (*)(void));
+        extern void basic_set_cls(void (*)(int));
         extern void basic_set_plot(void (*)(int, int, int));
         extern void basic_set_pause(void (*)(int));
         extern void basic_set_line(void (*)(int, int, int, int, int));

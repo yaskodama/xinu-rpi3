@@ -48,13 +48,13 @@ static double b_cos(double x) { return b_sin(x + 1.57079632679490); }
 /* ---- I/O callbacks ------------------------------------------------- */
 static void (*g_emit)(const char *);
 static int  (*g_input)(char *buf, int max);  /* read one line for INPUT */
-static void (*g_cls)(void);                  /* CLS: clear the screen */
+static void (*g_cls)(int mode);              /* CLS[ n]: 1=text 2=gfx 3=both */
 static void (*g_plot)(int x, int y, int ch); /* PLOT x,y[,c]: char at cell */
 static void (*g_pause)(int ms);              /* PAUSE n: sleep n ms */
 static void (*g_line)(int x1, int y1, int x2, int y2, int color); /* LINE seg */
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
-void basic_set_cls(void (*fn)(void))                 { g_cls = fn; }
+void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
 void basic_set_plot(void (*fn)(int, int, int))       { g_plot = fn; }
 void basic_set_pause(void (*fn)(int))                { g_pause = fn; }
 void basic_set_line(void (*fn)(int, int, int, int, int)) { g_line = fn; }
@@ -463,7 +463,7 @@ static const char *S_rotate[] = {
     "10 REM ROTATING LINE SEGMENT",
     "20 FOR N=1 TO 10",
     "30 FOR A=0 TO 170 STEP 10",
-    "40 CLS",
+    "40 CLS 2",
     "50 R=A*3.14159/180",
     "60 X1=200-130*COS(R) : Y1=150-130*SIN(R)",
     "70 X2=200+130*COS(R) : Y2=150+130*SIN(R)",
@@ -668,9 +668,10 @@ static void exec_stmt(void)
         if (again) { pc = forstk[t].idx; ip = forstk[t].stmt; g_goto = -2; } else fortop--;
         return;
     }
-    if (kw("CLS")) {                          /* CLS [mode] — clear screen */
-        skipsp(); if (b_isdigit(*ip) || *ip == '-') (void)expr();
-        if (g_cls) g_cls();
+    if (kw("CLS")) {                          /* CLS=text  CLS 2=gfx  CLS 3=both */
+        int mode = 1; skipsp();
+        if (b_isdigit(*ip)) mode = (int)expr();
+        if (g_cls) g_cls(mode);
         return;
     }
     if (kw("PLOT")) {                         /* PLOT x,y[,charcode] */
