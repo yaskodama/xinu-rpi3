@@ -688,10 +688,24 @@ static void wm_raise(window_t *w)
     window_t *t = wm_head; while (t->next) t = t->next; t->next = w;
 }
 
+/* BASIC-window toolbar (defined in the BASIC section below). */
+static int  basic_toolbar_hit(int sx, int sy);   /* button index at screen pt, or -1 */
+static void basic_run_button(int idx);           /* run that button's command */
+
 /* Process the left button each cursor poll: start / continue / end a drag. */
 static void wm_drag_tick(void)
 {
+    static int prev_left = 0;
     int left = usbmouse_buttons & 1;
+
+    /* On a fresh press, a click on a BASIC toolbar button runs its command
+     * (edge-triggered so holding doesn't fire it every frame). */
+    if (left && !prev_left) {
+        int b = basic_toolbar_hit(cursor_x, cursor_y);
+        if (b >= 0) { basic_run_button(b); prev_left = left; return; }
+    }
+    prev_left = left;
+
     if (left && !drag_win) {                         /* press: focus + maybe grab */
         window_t *w = window_at_resize(cursor_x, cursor_y);    /* corner first */
         if (w) {
@@ -1110,12 +1124,51 @@ static void bas_pause(int ms)
     sleep(ms);   /* yields so the wm render thread paints each frame */
 }
 
+/* ---- BASIC window toolbar: clickable buttons that run a command --------- */
+#define BAS_TB_H   16                        /* toolbar height (px)          */
+static int bas_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static const struct { const char *label; const char *cmd; } bas_btns[] = {
+    { "FILES",      "files" },
+    { "LIST",       "list" },
+    { "RUN hello",  "run \"hello.bas\"" },
+    { "RUN rotate", "run \"rotate.bas\"" },
+};
+#define BAS_NBTN ((int)(sizeof(bas_btns) / sizeof(bas_btns[0])))
+
+/* Button i's rectangle in desktop coords (what basic_draw paints + what the
+ * click test compares against). */
+static void bas_btn_rect(int i, int *bx, int *by, int *bw, int *bh)
+{
+    int x = basic_win.x + 4, k;
+    for (k = 0; k < i; k++) x += bas_slen(bas_btns[k].label) * FONT_WIDTH + 8 + 4;
+    *bx = x;
+    *by = basic_win.y + WM_TITLEBAR_H + 3;
+    *bw = bas_slen(bas_btns[i].label) * FONT_WIDTH + 8;
+    *bh = BAS_TB_H - 4;
+}
+static void basic_draw_toolbar(window_t *self)
+{
+    int i, bx, by, bw, bh;
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, BAS_TB_H, 0xFF0A2A12U);
+    for (i = 0; i < BAS_NBTN; i++) {
+        bas_btn_rect(i, &bx, &by, &bw, &bh);
+        if (bx + bw > self->x + self->width - 2) break;     /* clip to window */
+        fill_rect(bx, by, bw, bh, 0xFF1E6E38U);
+        fill_rect(bx, by, bw, 1, 0xFF2EA050U);              /* top highlight  */
+        draw_string_at(bx + 4, by + 1, bas_btns[i].label, 0xFFEFFFE0U, 0xFF1E6E38U);
+    }
+}
+
+/* Top of the scrolling text area, leaving room for the toolbar. */
+#define BAS_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + BAS_TB_H)
+
 static void basic_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
     if (bas_full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                               self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); bas_full = 0; }
-    int content_h = self->height - WM_TITLEBAR_H - 7;
+    basic_draw_toolbar(self);
+    int content_h = self->height - (BAS_TXT_TOP(self) - self->y) - 3;
     int max_rows = content_h / line_h; if (max_rows < 1) return; if (max_rows > BAS_ROWS) max_rows = BAS_ROWS;
     int rows, start;
     if (bas_canvas) {                    /* top-aligned PLOT canvas */
@@ -1128,7 +1181,7 @@ static void basic_draw(window_t *self, unsigned int frame)
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % BAS_ROWS;
         if (g_force_redraw || bas_dirty[r]) {
-            int ry = self->y + WM_TITLEBAR_H + 4 + i * line_h;
+            int ry = BAS_TXT_TOP(self) + i * line_h;
             fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
             draw_string_at(self->x + 4, ry, bas_ring[r], 0xFFB6FFB6U, self->content_bg);
             if (!g_force_redraw) bas_dirty[r] = 0;
@@ -1137,7 +1190,7 @@ static void basic_draw(window_t *self, unsigned int frame)
     if (!bas_canvas) {                   /* blinking underline at the edit cursor */
         int i = (bas_ed_row - start + BAS_ROWS) % BAS_ROWS;
         if (i >= 0 && i < rows) {
-            int cr_y = self->y + WM_TITLEBAR_H + 4 + i * line_h;
+            int cr_y = BAS_TXT_TOP(self) + i * line_h;
             int cr_x = self->x + 4 + bas_ed_col * FONT_WIDTH;
             if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
                 unsigned int col = ((frame >> 2) & 1) ? 0xFF66FF66U : self->content_bg;
@@ -1145,6 +1198,19 @@ static void basic_draw(window_t *self, unsigned int frame)
             }
         }
     }
+}
+
+/* Click test (screen coords): index of the toolbar button under the point, or
+ * -1.  Requires the BASIC window to be the topmost window there. */
+static int basic_toolbar_hit(int sx, int sy)
+{
+    int dx = sx + vp_x, dy = sy + vp_y, i, bx, by, bw, bh;
+    if (window_at_point(sx, sy) != &basic_win) return -1;
+    for (i = 0; i < BAS_NBTN; i++) {
+        bas_btn_rect(i, &bx, &by, &bw, &bh);
+        if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) return i;
+    }
+    return -1;
 }
 
 /* line queue: the editor (Enter) enqueues a logical line, basic_main + INPUT
@@ -1241,6 +1307,21 @@ static int basic_getline(char *buf, int max)
     wait(bas_sem);
     int i = 0; for (; bas_q[bas_qh][i] && i < max - 1; i++) buf[i] = bas_q[bas_qh][i]; buf[i] = 0;
     bas_qh = (bas_qh + 1) % BAS_QN; return i;
+}
+
+/* Toolbar button -> run its command: echo it (so it looks typed) and push it
+ * onto the interpreter queue, exactly like pressing ENTER on that line. */
+static void basic_run_button(int idx)
+{
+    const char *cmd;
+    int k;
+    if (idx < 0 || idx >= BAS_NBTN) return;
+    cmd = bas_btns[idx].cmd;
+    bas_emit(cmd); bas_emit("\n");
+    for (k = 0; cmd[k] && k < 255; k++) bas_q[bas_qt][k] = cmd[k];
+    bas_q[bas_qt][k] = 0;
+    bas_qt = (bas_qt + 1) % BAS_QN;
+    if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
 }
 
 thread basic_main(void)
