@@ -1182,6 +1182,7 @@ static const struct { const char *label; const char *cmd; } bas_btns[] = {
     { "LIST",       "list" },
     { "RUN hello",  "run \"hello.bas\"" },
     { "RUN rotate", "run \"rotate.bas\"" },
+    { "CLS 3",      "cls 3" },
 };
 #define BAS_NBTN ((int)(sizeof(bas_btns) / sizeof(bas_btns[0])))
 
