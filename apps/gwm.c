@@ -1049,11 +1049,33 @@ extern void basic_exec_line(const char *);
 
 #define BAS_ROWS 56
 #define BAS_COLS 60
+#define BAS_TB_H 16                 /* toolbar height (px)                    */
 static char          bas_ring[BAS_ROWS][BAS_COLS + 1];
 static unsigned char bas_dirty[BAS_ROWS];
 static int           bas_row, bas_col, bas_filled, bas_full;
-static int           bas_canvas;   /* 1 = top-aligned PLOT canvas, 0 = scroll */
+static int           bas_gfx;       /* 1 = pixel graphics (CLS/PLOT/LINE), 0 = text scroll */
 static window_t      basic_win;
+
+/* Top of the scrolling text / graphics area, below the title bar + toolbar. */
+#define BAS_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + BAS_TB_H)
+/* The graphics content rectangle (desktop coords) of the BASIC window. */
+static void bas_gfx_rect(int *gx0, int *gy0, int *gw, int *gh)
+{
+    *gx0 = basic_win.x + 4;
+    *gy0 = basic_win.y + WM_TITLEBAR_H + 2 + BAS_TB_H;
+    *gw  = basic_win.width - 8;
+    *gh  = basic_win.height - (*gy0 - basic_win.y) - 3;
+}
+static int bas_abs(int v) { return v < 0 ? -v : v; }
+static unsigned int bas_palette(int c)
+{
+    static const unsigned int pal[16] = {
+        0xFF000000U, 0xFF3060FFU, 0xFF30D040U, 0xFF30D0D0U,
+        0xFFE03030U, 0xFFE040E0U, 0xFFE0E040U, 0xFFF0F0F0U,
+        0xFF808080U, 0xFF80A0FFU, 0xFF80FF80U, 0xFF80FFFFU,
+        0xFFFF8080U, 0xFFFF80FFU, 0xFFFFFF80U, 0xFFFFFFFFU };
+    return pal[c & 15];
+}
 
 /* Full-screen editor cursor (classic micro-BASIC style): arrow keys roam it
  * over the on-screen program text; Enter submits the logical line under it.
@@ -1071,8 +1093,8 @@ static void bas_newline(void)
 }
 static void bas_putc(char c)
 {
-    if (bas_canvas) {            /* leaving the PLOT canvas — wipe + reset */
-        bas_canvas = 0; bas_full = 1;
+    if (bas_gfx) {               /* leaving graphics mode — wipe + reset to text */
+        bas_gfx = 0; bas_full = 1;
         bas_row = 0; bas_col = 0; bas_filled = 0; bas_ring[0][0] = 0;
     }
     if (c == '\r') return;
@@ -1094,28 +1116,47 @@ static void bas_emit(const char *s)
     bas_ed_row = bas_row; bas_ed_col = bas_col;
 }
 
-/* ---- CLS / PLOT / PAUSE: a simple top-aligned character canvas so a BASIC
- * program can clear the window and plot at (col,row) (rotate.bas). -------- */
+/* ---- CLS / PLOT / LINE / PAUSE: pixel graphics drawn straight into the
+ * BASIC window's content area.  basic_draw() leaves the content untouched
+ * while in graphics mode (bas_gfx), so what we paint here persists frame to
+ * frame; a program animates by CLS + draw + PAUSE in a loop (rotate.bas). -- */
 static void bas_cls(void)
 {
-    for (int r = 0; r < BAS_ROWS; r++) {
-        for (int c = 0; c < BAS_COLS; c++) bas_ring[r][c] = ' ';
-        bas_ring[r][BAS_COLS] = 0;
-        bas_dirty[r] = 1;
-    }
-    bas_row = 0; bas_col = 0; bas_filled = 0; bas_full = 1; bas_canvas = 1;
+    int gx0, gy0, gw, gh;
+    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+    if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, 0xFF001405U);
+    bas_gfx = 1;
 }
+/* PLOT x,y[,char]: a character at pixel cell (x,y) on the graphics screen. */
 static void bas_plot(int x, int y, int ch)
 {
-    if (x < 0 || x >= BAS_COLS || y < 0 || y >= BAS_ROWS) return;
+    int gx0, gy0, gw, gh; char s[2];
+    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+    bas_gfx = 1;
     if (ch < 0x20 || ch > 0x7e) ch = '*';
-    bas_canvas = 1;
-    /* make the row full-width (replace the terminating NUL and any beyond
-     * it with spaces) so the plotted column is actually rendered. */
-    for (int c = 0; c < BAS_COLS; c++) if (bas_ring[y][c] == 0) bas_ring[y][c] = ' ';
-    bas_ring[y][BAS_COLS] = 0;
-    bas_ring[y][x] = (char)ch;
-    bas_dirty[y] = 1;
+    if (x < 0 || x * FONT_WIDTH >= gw || y < 0 || y * FONT_HEIGHT >= gh) return;
+    s[0] = (char)ch; s[1] = 0;
+    draw_string_at(gx0 + x * FONT_WIDTH, gy0 + y * FONT_HEIGHT, s, 0xFFB6FFB6U, 0xFF001405U);
+}
+/* LINE(x1,y1)-(x2,y2),color: a line segment (Bresenham) on the graphics
+ * screen, coordinates in content-area pixels, colour 0..15. */
+static void bas_line(int x1, int y1, int x2, int y2, int color)
+{
+    int gx0, gy0, gw, gh;
+    unsigned int col = bas_palette(color);
+    int dx = bas_abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+    int dy = -bas_abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+    int err = dx + dy, e2;
+    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+    bas_gfx = 1;
+    for (;;) {
+        if (x1 >= 0 && x1 < gw && y1 >= 0 && y1 < gh)
+            fill_rect(gx0 + x1, gy0 + y1, 1, 1, col);
+        if (x1 == x2 && y1 == y2) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x1 += sx; }
+        if (e2 <= dx) { err += dx; y1 += sy; }
+    }
 }
 static void bas_pause(int ms)
 {
@@ -1125,7 +1166,6 @@ static void bas_pause(int ms)
 }
 
 /* ---- BASIC window toolbar: clickable buttons that run a command --------- */
-#define BAS_TB_H   16                        /* toolbar height (px)          */
 static int bas_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static const struct { const char *label; const char *cmd; } bas_btns[] = {
     { "FILES",      "files" },
@@ -1159,21 +1199,18 @@ static void basic_draw_toolbar(window_t *self)
     }
 }
 
-/* Top of the scrolling text area, leaving room for the toolbar. */
-#define BAS_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + BAS_TB_H)
-
 static void basic_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
     if (bas_full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                               self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); bas_full = 0; }
     basic_draw_toolbar(self);
+    /* Graphics mode: CLS/PLOT/LINE paint the content directly; leave it be. */
+    if (bas_gfx) return;
     int content_h = self->height - (BAS_TXT_TOP(self) - self->y) - 3;
     int max_rows = content_h / line_h; if (max_rows < 1) return; if (max_rows > BAS_ROWS) max_rows = BAS_ROWS;
     int rows, start;
-    if (bas_canvas) {                    /* top-aligned PLOT canvas */
-        rows = max_rows; start = 0;
-    } else {                             /* scrolling text console */
+    {                                    /* scrolling text console */
         int have = bas_filled ? BAS_ROWS : bas_row + 1;
         rows = have < max_rows ? have : max_rows;
         start = (bas_row - rows + 1 + BAS_ROWS) % BAS_ROWS;
@@ -1187,7 +1224,7 @@ static void basic_draw(window_t *self, unsigned int frame)
             if (!g_force_redraw) bas_dirty[r] = 0;
         }
     }
-    if (!bas_canvas) {                   /* blinking underline at the edit cursor */
+    {                                    /* blinking underline at the edit cursor */
         int i = (bas_ed_row - start + BAS_ROWS) % BAS_ROWS;
         if (i >= 0 && i < rows) {
             int cr_y = BAS_TXT_TOP(self) + i * line_h;
@@ -1334,9 +1371,11 @@ thread basic_main(void)
         extern void basic_set_cls(void (*)(void));
         extern void basic_set_plot(void (*)(int, int, int));
         extern void basic_set_pause(void (*)(int));
+        extern void basic_set_line(void (*)(int, int, int, int, int));
         basic_set_cls(bas_cls);
         basic_set_plot(bas_plot);
         basic_set_pause(bas_pause);
+        basic_set_line(bas_line);
     }
     basic_init();
     bas_emit("Xinu BASIC ready.  Full-screen editor:\n"

@@ -51,11 +51,13 @@ static int  (*g_input)(char *buf, int max);  /* read one line for INPUT */
 static void (*g_cls)(void);                  /* CLS: clear the screen */
 static void (*g_plot)(int x, int y, int ch); /* PLOT x,y[,c]: char at cell */
 static void (*g_pause)(int ms);              /* PAUSE n: sleep n ms */
+static void (*g_line)(int x1, int y1, int x2, int y2, int color); /* LINE seg */
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(void))                 { g_cls = fn; }
 void basic_set_plot(void (*fn)(int, int, int))       { g_plot = fn; }
 void basic_set_pause(void (*fn)(int))                { g_pause = fn; }
+void basic_set_line(void (*fn)(int, int, int, int, int)) { g_line = fn; }
 static void emit(const char *s) { if (g_emit) g_emit(s); }
 static void emitc(char c) { char b[2]; b[0] = c; b[1] = 0; emit(b); }
 
@@ -455,24 +457,21 @@ static const char *S_add[]     = { "10 A=10", "20 B=20", "30 C=A+B", "40 PRINT C
 static const char *S_sum100[]  = { "10 S=0", "20 FOR I=1 TO 100", "30 S=S+I", "40 NEXT", "50 PRINT S" };
 static const char *S_fibon[]   = { "10 A=0", "20 B=1", "30 FOR I=1 TO 12", "40 PRINT A", "50 C=A+B", "60 A=B", "70 B=C", "80 NEXT" };
 static const char *S_squares[] = { "10 FOR I=1 TO 10", "20 K=I*I", "30 PRINT K", "40 NEXT" };
-/* rotate.bas — clear the screen (CLS) and spin a line segment about the
- * centre using CLS + PLOT + SIN/COS + PAUSE. */
+/* rotate.bas — spin a line segment about the centre of the graphics screen,
+ * ten times, drawing it with the LINE statement (CLS + LINE + SIN/COS). */
 static const char *S_rotate[] = {
     "10 REM ROTATING LINE SEGMENT",
-    "15 FOR N=1 TO 20",
-    "20 FOR A=0 TO 170 STEP 10",
-    "30 CLS",
-    "40 R=A*3.14159/180",
-    "50 FOR T=-16 TO 16",
-    "60 X=28+T*COS(R)",
-    "70 Y=16+T*SIN(R)*0.55",
-    "80 PLOT X,Y,42",
-    "90 NEXT",
-    "100 PLOT 28,16,43",
-    "110 PAUSE 90",
-    "120 NEXT",
-    "125 NEXT",
-    "130 END"
+    "20 FOR N=1 TO 10",
+    "30 FOR A=0 TO 170 STEP 10",
+    "40 CLS",
+    "50 R=A*3.14159/180",
+    "60 X1=200-130*COS(R) : Y1=150-130*SIN(R)",
+    "70 X2=200+130*COS(R) : Y2=150+130*SIN(R)",
+    "80 LINE(X1,Y1)-(X2,Y2),5",
+    "90 PAUSE 80",
+    "100 NEXT",
+    "110 NEXT",
+    "120 END"
 };
 
 /* New-feature demos: strings, arrays (DIM), WHILE/WEND + MOD, DATA/READ. */
@@ -509,7 +508,7 @@ static const struct { const char *name; const char *const *line; int n; } sample
     { "sum100.bas",  S_sum100,  5 },
     { "fibon.bas",   S_fibon,   8 },
     { "squares.bas", S_squares, 4 },
-    { "rotate.bas",  S_rotate,  15 },
+    { "rotate.bas",  S_rotate,  12 },
     { "strings.bas", S_strings, 7 },
     { "bsort.bas",   S_bsort,   12 },
     { "fizz.bas",    S_fizz,    6 },
@@ -681,6 +680,19 @@ static void exec_stmt(void)
         int ch = '*'; skipsp();
         if (*ip == ',') { ip++; ch = (int)expr(); }
         if (g_plot) g_plot(x, y, ch);
+        return;
+    }
+    if (kw("LINE")) {                         /* LINE(x1,y1)-(x2,y2)[,color] */
+        int x1, y1, x2, y2, c = 7;
+        skipsp(); if (*ip != '(') { berr("LINE ("); return; } ip++;
+        x1 = (int)expr(); skipsp(); if (*ip != ',') { berr("LINE ,"); return; } ip++;
+        y1 = (int)expr(); skipsp(); if (*ip != ')') { berr("LINE )"); return; } ip++;
+        skipsp(); if (*ip != '-') { berr("LINE -"); return; } ip++;
+        skipsp(); if (*ip != '(') { berr("LINE ("); return; } ip++;
+        x2 = (int)expr(); skipsp(); if (*ip != ',') { berr("LINE ,"); return; } ip++;
+        y2 = (int)expr(); skipsp(); if (*ip != ')') { berr("LINE )"); return; } ip++;
+        skipsp(); if (*ip == ',') { ip++; c = (int)expr(); }
+        if (g_line) g_line(x1, y1, x2, y2, c);
         return;
     }
     if (kw("PAUSE")) { int ms = (int)expr(); if (g_pause) g_pause(ms); return; }
