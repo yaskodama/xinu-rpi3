@@ -37,12 +37,16 @@ static void wifi_rstrip(char *s)
  * Returns 0 if at least an SSID was found, -1 otherwise. */
 int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
 {
-    /* SD and WiFi share the Arasan EMMC controller, so once WiFi is up the
-     * /microsd card is no longer reachable.  A reconnect (wifi off -> wifi on)
-     * therefore can't re-read wifi.txt — so cache the last good credentials in
-     * RAM and hand them back when the SD read fails.  This keeps the reconnect
-     * on the wifi_join() path (which worked the first time) instead of falling
-     * through to a broad scan that the post-disconnect radio can't satisfy. */
+    /* SD and WiFi share the ONE Arasan EMMC controller.  Reading the SD card
+     * (fat_mount) re-muxes the controller to the card's pins — which STEALS the
+     * bus from the WiFi SDIO link.  On the first connect that is fine (we read
+     * wifi.txt, THEN wifi_bringup() muxes the controller to WiFi).  But on a
+     * reconnect (wifi off -> wifi on) bringup is skipped, so a second SD read
+     * would leave the controller on the card and kill WiFi — exactly the
+     * observed failure (iovars rc=-1, events=0, join failed).
+     *
+     * Fix: cache the credentials on the first good read and, once cached, hand
+     * them back WITHOUT touching the SD at all, so the EMMC stays with WiFi. */
     static char c_ssid[40], c_pass[68];
     static int  c_have = 0;
     struct fat_dirent e;
@@ -50,6 +54,14 @@ int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
     struct wifi_cfgbuf cb;
     char *p;
     int got = 0, i;
+
+    if (c_have) {                                    /* cached: never re-touch SD */
+        for (i = 0; i < sl - 1 && c_ssid[i]; i++) ssid[i] = c_ssid[i];
+        ssid[i] = 0;
+        for (i = 0; i < pl - 1 && c_pass[i]; i++) pass[i] = c_pass[i];
+        pass[i] = 0;
+        return 0;
+    }
 
     cb.buf = raw; cb.len = 0; cb.max = (int)sizeof(raw);
     ssid[0] = 0; pass[0] = 0;
@@ -85,14 +97,7 @@ int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
         c_have = 1;
         return 0;
     }
-    if (c_have) {                                    /* SD unreadable: use cache */
-        for (i = 0; i < sl - 1 && c_ssid[i]; i++) ssid[i] = c_ssid[i];
-        ssid[i] = 0;
-        for (i = 0; i < pl - 1 && c_pass[i]; i++) pass[i] = c_pass[i];
-        pass[i] = 0;
-        return 0;
-    }
-    return -1;
+    return -1;                                        /* no wifi.txt, nothing cached */
 }
 
 extern int         wifi_connected(void);
