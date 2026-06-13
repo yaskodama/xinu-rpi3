@@ -37,4 +37,20 @@ int fat_mount(void);
  */
 int fat_list_root(int (*cb)(const struct fat_dirent *e, void *ctx), void *ctx);
 
+/**
+ * Find a root-directory entry by name (case-insensitive, long or 8.3).
+ * Fills *out and returns 0 if found, -1 otherwise.
+ */
+int fat_find_root(const char *name, struct fat_dirent *out);
+
+/**
+ * Stream a file's bytes: starting at @first_cluster, walk the cluster chain
+ * and invoke @cb with each chunk (<= 512 bytes) until @size bytes have been
+ * delivered.  @cb returns 0 to continue, non-zero to stop.  Returns 0 on a
+ * clean read, -1 on mount/read error.
+ */
+int fat_read_file(unsigned long first_cluster, unsigned long size,
+                  int (*cb)(const unsigned char *buf, int len, void *ctx),
+                  void *ctx);
+
 #endif /* _FAT_H_ */

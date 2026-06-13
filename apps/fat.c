@@ -110,6 +110,56 @@ static void short_name(const unsigned char *d, char *name)
     name[n] = 0;
 }
 
+/* case-insensitive ASCII string equality */
+static int fat_ci_eq(const char *a, const char *b)
+{
+    while (*a && *b)
+    {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+struct fat_find { const char *want; struct fat_dirent *out; int found; };
+static int fat_find_cb(const struct fat_dirent *e, void *ctx)
+{
+    struct fat_find *f = (struct fat_find *)ctx;
+    if (fat_ci_eq(e->name, f->want)) { *f->out = *e; f->found = 1; return 1; }
+    return 0;
+}
+int fat_find_root(const char *name, struct fat_dirent *out)
+{
+    struct fat_find f; f.want = name; f.out = out; f.found = 0;
+    if (fat_list_root(fat_find_cb, &f) != 0) return -1;
+    return f.found ? 0 : -1;
+}
+
+int fat_read_file(unsigned long clus, unsigned long size,
+                  int (*cb)(const unsigned char *buf, int len, void *ctx),
+                  void *ctx)
+{
+    unsigned long remaining = size;
+
+    if (fat_mount() != 0) return -1;
+    while (clus >= 2 && clus < 0x0FFFFFF8UL && remaining > 0)
+    {
+        unsigned s;
+        for (s = 0; s < fat_spc && remaining > 0; s++)
+        {
+            int n = (remaining < SD_BLOCK_SIZE) ? (int)remaining : SD_BLOCK_SIZE;
+            if (sd_read_block(clus_to_lba(clus) + s, secbuf) != 0) return -1;
+            if (cb(secbuf, n, ctx) != 0) return 0;
+            remaining -= n;
+        }
+        clus = fat_next(clus);
+    }
+    return 0;
+}
+
 int fat_list_root(int (*cb)(const struct fat_dirent *e, void *ctx), void *ctx)
 {
     unsigned long clus;

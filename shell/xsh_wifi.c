@@ -14,8 +14,59 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <fat.h>
 
 #ifdef _XINU_PLATFORM_ARM_RPI3_
+
+/* Accumulate the (small) /microsd/wifi.txt into a buffer. */
+struct wifi_cfgbuf { char *buf; int len, max; };
+static int wifi_cfg_emit(const unsigned char *b, int n, void *ctx)
+{
+    struct wifi_cfgbuf *c = (struct wifi_cfgbuf *)ctx;
+    int i;
+    for (i = 0; i < n && c->len < c->max - 1; i++) c->buf[c->len++] = (char)b[i];
+    c->buf[c->len] = 0;
+    return 0;
+}
+static void wifi_rstrip(char *s)
+{
+    int n = (int)strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = 0;
+}
+/* Read /microsd/wifi.txt and parse `ssid=` / `pass=` (with '#' comments).
+ * Returns 0 if at least an SSID was found, -1 otherwise. */
+static int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
+{
+    struct fat_dirent e;
+    char raw[640];
+    struct wifi_cfgbuf cb;
+    char *p;
+
+    cb.buf = raw; cb.len = 0; cb.max = (int)sizeof(raw);
+    ssid[0] = 0; pass[0] = 0;
+
+    if (fat_mount() != 0) return -1;
+    if (0 != fat_find_root("wifi.txt", &e) || e.is_dir) return -1;
+    if (0 != fat_read_file(e.cluster, e.size, wifi_cfg_emit, &cb)) return -1;
+
+    for (p = raw; *p; )
+    {
+        char *d; int i;
+        while (*p == ' ' || *p == '\t') p++;
+        if (0 == strncmp(p, "ssid=", 5)) { d = ssid; i = sl; p += 5; }
+        else if (0 == strncmp(p, "pass=", 5)) { d = pass; i = pl; p += 5; }
+        else d = NULL;
+        if (d != NULL) {
+            int k = 0;
+            while (*p && *p != '\n' && *p != '\r' && k < i - 1) d[k++] = *p++;
+            d[k] = 0;
+            wifi_rstrip(d);
+        }
+        while (*p && *p != '\n') p++;            /* to end of line */
+        if (*p == '\n') p++;
+    }
+    return ssid[0] ? 0 : -1;
+}
 
 extern int         wifi_connected(void);
 extern const char *wifi_ssid(void);
@@ -118,6 +169,24 @@ shellcmd xsh_wifi(int nargs, char *args[])
             wifi_serve_start();   /* ARP/ICMP responder -> the AP IP is pingable */
             wifi_show_status();
             return 0;
+        }
+
+        /* No SSID on the command line: try the saved /microsd/wifi.txt so a
+         * plain `wifi on` connects to the usual network with no scan/prompt.
+         * (The SD card is read first, then wifi_join takes over the shared
+         * EMMC controller for the WiFi SDIO bus.) */
+        {
+            char cssid[40], cpass[68];
+            if (0 == wifi_load_cfg(cssid, sizeof(cssid), cpass, sizeof(cpass))) {
+                printf("Using /microsd/wifi.txt -> \"%s\"\n", cssid);
+                printf("Connecting...\n");
+                if (wifi_join(cssid, cpass) != 0) { printf("WiFi: join failed.\n"); return 0; }
+                if (wifi_dhcp() != 0 || !wifi_connected()) { printf("WiFi: DHCP failed (no IP).\n"); return 0; }
+                wifi_serve_start();
+                wifi_show_status();
+                return 0;
+            }
+            printf("(no /microsd/wifi.txt — falling back to scan)\n");
         }
 
         printf("Scanning for access points (~30s; the radio drops briefly)...\n");
