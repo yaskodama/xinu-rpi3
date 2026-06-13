@@ -176,6 +176,22 @@ shellcmd xsh_wifi(int nargs, char *args[])
         return 0;
     }
 
+    /* `wifi trace` — dump the tail of the WiFi driver log for the LAST connect
+     * attempt (wifi_join resets the buffer each try).  Shows the bring-up
+     * stages so a failed reconnect's stopping point is visible on-screen. */
+    if (strcmp(args[1], "trace") == 0) {
+        extern const char *wifi_trace(void);
+        const char *t = wifi_trace();
+        int len = 0, start;
+        while (t[len]) len++;
+        start = (len > 2000) ? len - 2000 : 0;     /* last ~2000 chars */
+        while (start > 0 && t[start - 1] != '\n') start--;  /* line boundary */
+        printf("---- wifi log tail (%d bytes total) ----\n", len);
+        printf("%s", t + start);
+        printf("---- end ----\n");
+        return 0;
+    }
+
     if (strcmp(args[1], "off") == 0) {
         wifi_disconnect();
         printf("WiFi: disconnected\n");
