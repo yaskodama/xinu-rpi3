@@ -1758,6 +1758,12 @@ static int wifi_do_join(const char *ssid, const char *pass)
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_cmd_int(WLC_SET_INFRA, 1);
     wifi_cmd_int(2, 1);                          /* WLC_UP */
+    /* Re-assert "minimize power consumption" OFF on every join.  wifi_radio_up()
+     * sets mpc=0 only once (it's wifi_radio_done-guarded), but a prior
+     * `wifi off` (WLC_DOWN) can let the firmware power the radio back down — so
+     * on a RECONNECT the directed scan below finds no AP ("No access points").
+     * Forcing mpc=0 here keeps the radio awake for the scan + association. */
+    wifi_set_iovar_int("mpc", 0);
     wifi_delay_us(50000);
 
     /* A prior scan populates the firmware's BSS cache (brcmfmac always connects

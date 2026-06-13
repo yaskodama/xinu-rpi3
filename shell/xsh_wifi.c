@@ -37,35 +37,62 @@ static void wifi_rstrip(char *s)
  * Returns 0 if at least an SSID was found, -1 otherwise. */
 int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
 {
+    /* SD and WiFi share the Arasan EMMC controller, so once WiFi is up the
+     * /microsd card is no longer reachable.  A reconnect (wifi off -> wifi on)
+     * therefore can't re-read wifi.txt — so cache the last good credentials in
+     * RAM and hand them back when the SD read fails.  This keeps the reconnect
+     * on the wifi_join() path (which worked the first time) instead of falling
+     * through to a broad scan that the post-disconnect radio can't satisfy. */
+    static char c_ssid[40], c_pass[68];
+    static int  c_have = 0;
     struct fat_dirent e;
     char raw[640];
     struct wifi_cfgbuf cb;
     char *p;
+    int got = 0, i;
 
     cb.buf = raw; cb.len = 0; cb.max = (int)sizeof(raw);
     ssid[0] = 0; pass[0] = 0;
 
-    if (fat_mount() != 0) return -1;
-    if (0 != fat_find_root("wifi.txt", &e) || e.is_dir) return -1;
-    if (0 != fat_read_file(e.cluster, e.size, wifi_cfg_emit, &cb)) return -1;
-
-    for (p = raw; *p; )
+    if (fat_mount() == 0 &&
+        0 == fat_find_root("wifi.txt", &e) && !e.is_dir &&
+        0 == fat_read_file(e.cluster, e.size, wifi_cfg_emit, &cb))
     {
-        char *d; int i;
-        while (*p == ' ' || *p == '\t') p++;
-        if (0 == strncmp(p, "ssid=", 5)) { d = ssid; i = sl; p += 5; }
-        else if (0 == strncmp(p, "pass=", 5)) { d = pass; i = pl; p += 5; }
-        else d = NULL;
-        if (d != NULL) {
-            int k = 0;
-            while (*p && *p != '\n' && *p != '\r' && k < i - 1) d[k++] = *p++;
-            d[k] = 0;
-            wifi_rstrip(d);
+        for (p = raw; *p; )
+        {
+            char *d; int n;
+            while (*p == ' ' || *p == '\t') p++;
+            if (0 == strncmp(p, "ssid=", 5)) { d = ssid; n = sl; p += 5; }
+            else if (0 == strncmp(p, "pass=", 5)) { d = pass; n = pl; p += 5; }
+            else d = NULL;
+            if (d != NULL) {
+                int k = 0;
+                while (*p && *p != '\n' && *p != '\r' && k < n - 1) d[k++] = *p++;
+                d[k] = 0;
+                wifi_rstrip(d);
+            }
+            while (*p && *p != '\n') p++;            /* to end of line */
+            if (*p == '\n') p++;
         }
-        while (*p && *p != '\n') p++;            /* to end of line */
-        if (*p == '\n') p++;
+        got = ssid[0] ? 1 : 0;
     }
-    return ssid[0] ? 0 : -1;
+
+    if (got) {                                       /* cache the good read */
+        for (i = 0; i < (int)sizeof(c_ssid) - 1 && ssid[i]; i++) c_ssid[i] = ssid[i];
+        c_ssid[i] = 0;
+        for (i = 0; i < (int)sizeof(c_pass) - 1 && pass[i]; i++) c_pass[i] = pass[i];
+        c_pass[i] = 0;
+        c_have = 1;
+        return 0;
+    }
+    if (c_have) {                                    /* SD unreadable: use cache */
+        for (i = 0; i < sl - 1 && c_ssid[i]; i++) ssid[i] = c_ssid[i];
+        ssid[i] = 0;
+        for (i = 0; i < pl - 1 && c_pass[i]; i++) pass[i] = c_pass[i];
+        pass[i] = 0;
+        return 0;
+    }
+    return -1;
 }
 
 extern int         wifi_connected(void);
