@@ -81,6 +81,7 @@ const struct centry commandtab[] = {
     {"pktgen", FALSE, xsh_pktgen},
     {"rdate", FALSE, xsh_rdate},
 #endif
+    {"reboot", FALSE, xsh_reboot},
     {"reset", FALSE, xsh_reset},
     {"rm", FALSE, xsh_rm},
     {"rmdir", FALSE, xsh_rmdir},

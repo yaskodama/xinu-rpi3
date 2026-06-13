@@ -231,23 +231,31 @@ static void draw_wifi_indicator(void)
 {
     extern int wifi_connected(void);
     extern const char *wifi_ssid(void);
+    extern void wifi_dhcp_diag(unsigned char *ip, unsigned char *gw, int *have);
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
     int conn = wifi_connected();
     unsigned int col = conn ? 0xFF36D35AU : 0xFFFFFFFFU;   /* green / white */
     int cx = sw - 24;          /* fan centre x */
-    int by = sh - 32;          /* mark dot baseline (room for SSID below) */
+    int by = sh - 40;          /* mark dot baseline (room for SSID + IP below) */
 
-    /* Dark backing box covering the mark + SSID label line. */
-    fill_rect(sw - 152, by - 22, 150, 50, 0xFF182028U);
+    /* Dark backing box covering the mark + SSID + IP label lines. */
+    fill_rect(sw - 152, by - 22, 150, 60, 0xFF182028U);
     /* Three arcs (approximated by centred bars) + a dot, fanning upward. */
     fill_rect(cx - 13, by - 18, 26, 2, col);   /* outer */
     fill_rect(cx - 9,  by - 13, 18, 2, col);   /* middle */
     fill_rect(cx - 5,  by - 8,  10, 2, col);   /* inner */
     fill_rect(cx - 2,  by - 3,   4, 4, col);   /* dot */
-    /* SSID under the mark when connected, else a hint. */
+    /* SSID + IP under the mark when connected, else a hint. */
     if (conn && wifi_ssid()[0]) {
+        unsigned char ip[4], gw[4]; int have = 0;
         draw_string_at(sw - 148, by + 8, wifi_ssid(), 0xFFA0E0FFU, 0xFF182028U);
+        wifi_dhcp_diag(ip, gw, &have);
+        if (have) {
+            char ipstr[20];
+            sprintf(ipstr, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+            draw_string_at(sw - 148, by + 20, ipstr, 0xFF80FF80U, 0xFF182028U);
+        }
     } else {
         draw_string_at(sw - 110, by + 8, "not connected", 0xFF888888U, 0xFF182028U);
     }

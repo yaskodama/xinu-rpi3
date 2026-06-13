@@ -146,6 +146,7 @@ shellcmd xsh_mkdir(int, char *[]);
 shellcmd xsh_rmdir(int, char *[]);
 shellcmd xsh_touch(int, char *[]);
 shellcmd xsh_cat(int, char *[]);
+shellcmd xsh_reboot(int, char *[]);
 shellcmd xsh_rm(int, char *[]);
 shellcmd xsh_cp(int, char *[]);
 shellcmd xsh_mv(int, char *[]);
