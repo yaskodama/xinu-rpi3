@@ -348,34 +348,29 @@ thread main(void)
      * fed keystroke-by-keystroke over HTTP (apps/webactor.c
      * /api/wifi/key -> gwincon_feed()).  Added to the shell pool so the
      * loop below forks a real shell() bound to it. */
-#if defined(_XINU_PLATFORM_ARM_RPI3_) && defined(GWINCON0) && HAVE_SHELL
-    if (OK == open(GWINCON0))
+    /* Windowed shells run under gwin_shell_supervisor (apps/gwm.c) rather
+     * than the generic shelldevs pool: the supervisor re-runs shell() and,
+     * when the user types `exit`, dismisses the on-screen window instead of
+     * leaving a dead one.  The window is re-opened from the right-click menu. */
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && HAVE_SHELL
     {
-        shelldevs[nshells][0] = GWINCON0;
-        shelldevs[nshells][1] = GWINCON0;
-        shelldevs[nshells][2] = GWINCON0;
-        nshells++;
-    }
-    else
-    {
-        kprintf("WARNING: Can't open GWINCON0\r\n");
-    }
+        extern int gwin_shell_supervisor(int, int, int, int);
+#ifdef GWINCON0
+        if (OK == open(GWINCON0))
+            ready(create((void *)gwin_shell_supervisor, INITSTK, INITPRIO,
+                         "SHGWIN0", 4, 0, GWINCON0, GWINCON0, GWINCON0),
+                  RESCHED_NO);
+        else
+            kprintf("WARNING: Can't open GWINCON0\r\n");
 #endif
-    /* GWINCON1 — second windowed shell (right-click menu -> "Shell" opens
-     * its window via gwin_shell_window_open_n(1)).  A real shell() is
-     * forked here too so the 2nd window is interactive from the start;
-     * its output ring just isn't drawn until the window is opened. */
-#if defined(_XINU_PLATFORM_ARM_RPI3_) && defined(GWINCON1) && HAVE_SHELL
-    if (OK == open(GWINCON1))
-    {
-        shelldevs[nshells][0] = GWINCON1;
-        shelldevs[nshells][1] = GWINCON1;
-        shelldevs[nshells][2] = GWINCON1;
-        nshells++;
-    }
-    else
-    {
-        kprintf("WARNING: Can't open GWINCON1\r\n");
+#ifdef GWINCON1
+        if (OK == open(GWINCON1))
+            ready(create((void *)gwin_shell_supervisor, INITSTK, INITPRIO,
+                         "SHGWIN1", 4, 1, GWINCON1, GWINCON1, GWINCON1),
+                  RESCHED_NO);
+        else
+            kprintf("WARNING: Can't open GWINCON1\r\n");
+#endif
     }
 #endif
 

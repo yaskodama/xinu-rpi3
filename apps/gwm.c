@@ -180,6 +180,16 @@ void wm_add(window_t *w)
     t->next = w;
 }
 
+/* Unlink a window from the manager (no-op if it isn't currently shown). */
+void wm_remove(window_t *w)
+{
+    window_t *p;
+    if (!w || !wm_head) return;
+    if (wm_head == w) { wm_head = w->next; w->next = 0; return; }
+    for (p = wm_head; p->next; p = p->next)
+        if (p->next == w) { p->next = w->next; w->next = 0; return; }
+}
+
 static void draw_chrome(window_t *w)
 {
     /* outer border */
@@ -592,6 +602,41 @@ int gwin_shell_window_open_n(int idx)
 /* Back-compat: the `win` shell command + gwm_main open shell 0. */
 int gwin_shell_window_open(void) { return gwin_shell_window_open_n(0); }
 
+/* Close shell window @idx: unlink from the WM, reset its console ring,
+ * mark it closed.  Called when its shell() returns (the user typed
+ * `exit`); the supervisor below then waits for a re-open. */
+static void gwin_shell_close(int idx)
+{
+    struct shcon *s;
+    if (idx < 0 || idx >= NSHELL) return;
+    s = &shc[idx];
+    wm_remove(&s->win);
+    if (active_win == &s->win) active_win = 0;
+    s->opened = 0;
+    /* wipe the console so the next session starts on a clean window */
+    for (int r = 0; r < SHW_ROWS; r++) { s->ring[r][0] = 0; s->row_dirty[r] = 1; }
+    s->cur_row = s->cur_col = s->filled = 0;
+    s->esc = s->cr = s->csi_n = 0;
+    g_need_full = 1;
+}
+
+/* Supervisor thread for a windowed shell (one per GWINCON minor).  Runs
+ * shell() until the user exits, closes the window, then blocks until the
+ * window is re-opened (right-click menu -> Shell) and runs a fresh shell.
+ * This makes `exit` actually dismiss the window instead of leaving a dead
+ * one on screen. */
+thread gwin_shell_supervisor(int minor, int d0, int d1, int d2)
+{
+    extern thread shell(int, int, int);
+    for (;;) {
+        shell(d0, d1, d2);              /* returns when the user types `exit` */
+        gwin_shell_close(minor);
+        /* Park until the menu re-opens this window (sets opened = 1). */
+        while (!shc[minor].opened) sleep(120);
+    }
+    return OK;
+}
+
 /* ---- title-bar drag (move) + corner drag (resize) -----------------
  * Hold the LEFT mouse button (usbmouse_buttons bit 0, USB boot protocol):
  *   - on a window's title bar  -> move the window
@@ -677,15 +722,20 @@ static int menu_hit(int dx, int dy)
 }
 static void draw_menu(void)
 {
-    int i, h;
+    int i, h, hot;
     if (!menu_open) return;
     h = NMENU * MENU_IH + 4;
     fill_rect(menu_x, menu_y, MENU_W, h, 0xFF202830U);
     fill_rect(menu_x, menu_y, MENU_W, 1, 0xFF4878C0U);          /* top edge */
     fill_rect(menu_x, menu_y, 1, h, 0xFF4878C0U);
-    for (i = 0; i < NMENU; i++)
-        draw_string_at(menu_x + 6, menu_y + 4 + i * MENU_IH, menu_labels[i],
-                       0xFFE6ECF4U, 0xFF202830U);
+    hot = menu_hit(cursor_x + vp_x, cursor_y + vp_y);           /* hovered item */
+    for (i = 0; i < NMENU; i++) {
+        unsigned int bg = (i == hot) ? 0xFF3A6CB8U : 0xFF202830U;
+        unsigned int fg = (i == hot) ? 0xFFFFFFFFU : 0xFFE6ECF4U;
+        if (i == hot)
+            fill_rect(menu_x + 1, menu_y + 2 + i * MENU_IH, MENU_W - 2, MENU_IH, bg);
+        draw_string_at(menu_x + 6, menu_y + 4 + i * MENU_IH, menu_labels[i], fg, bg);
+    }
 }
 
 /* Process the left button each cursor poll: start / continue / end a drag. */
@@ -1462,8 +1512,11 @@ static void basic_run_button(int idx)
 /* Right-click menu action. */
 static void menu_exec(int sel)
 {
-    if (sel == 0) {                              /* Shell: open the 2nd shell */
-        gwin_shell_window_open_n(1);             /* independent shell window 2 */
+    if (sel == 0) {                              /* Shell: open a closed slot */
+        int i, opened = 0;
+        for (i = 0; i < NSHELL; i++)
+            if (!shc[i].opened) { gwin_shell_window_open_n(i); opened = 1; break; }
+        if (!opened) gwin_shell_window_open_n(0); /* all open -> raise Shell 0 */
     } else if (sel == 1) {                       /* BASIC */
         active_win = &basic_win; wm_raise(&basic_win);
     }
