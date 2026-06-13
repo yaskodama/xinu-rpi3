@@ -1664,12 +1664,24 @@ static void do_print(void)
 }
 static void do_input(void)
 {
+    /* Capture the prompt we emit (optional "literal" + "? ") so we can strip
+     * it back off: the windowed full-screen editor returns the whole on-screen
+     * line — prompt included — exactly like the `debug` prompt does. */
+    char prompt[80]; int pl = 0;
     skipsp();
-    if (*ip == '"') { ip++; while (*ip && *ip != '"') emitc(*ip++); if (*ip == '"') ip++; skipsp(); if (*ip == ';' || *ip == ',') ip++; }
-    emit("? ");
+    if (*ip == '"') {
+        ip++;
+        while (*ip && *ip != '"') { if (pl < (int)sizeof prompt - 3) prompt[pl++] = *ip; ip++; }
+        if (*ip == '"') ip++;
+        skipsp(); if (*ip == ';' || *ip == ',') ip++;
+    }
+    prompt[pl++] = '?'; prompt[pl++] = ' '; prompt[pl] = 0;
+    emit(prompt);
     char inbuf[96]; int n = g_input ? g_input(inbuf, sizeof inbuf) : -1;
     if (n < 0) { berr("no input"); return; }
     const char *src = inbuf;
+    /* strip the echoed prompt prefix if the editor returned it */
+    { int i = 0; while (prompt[i] && src[i] == prompt[i]) i++; if (prompt[i] == 0) src += i; }
     for (;;) {
         const char *save = ip; int si = svaridx();
         if (si >= 0) { while (*src == ' ' || *src == ',') src++;
