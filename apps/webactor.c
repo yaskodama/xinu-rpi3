@@ -38,9 +38,9 @@
  * stage-1 testing; the kernel.img is ~290 KB so a future commit needs
  * a streamed upload path that doesn't pre-allocate. */
 static char           upload_slot_name[64];
-/* 512 KB — bumped from 64 KB so a full xinu.boot (~305 KB) can be
- * uploaded for the /kexec network-update path.  Lives in .bss so it
- * doesn't inflate the on-disk binary, just runtime footprint.
+/* 1.5 MB — sized so a full xinu.boot (~940 KB, grown with BASIC/gwm/WiFi/
+ * JIT) can be uploaded for the /kexec network-update path.  Lives in .bss
+ * so it doesn't inflate the on-disk binary, just runtime footprint.
  *
  * MUST be word-aligned: the kexec stub uses LDR r3, [r0], #4 to copy
  * the buffer to 0x8000 with the MMU disabled (treats memory as
@@ -48,7 +48,7 @@ static char           upload_slot_name[64];
  * SCTLR.A).  Without this attribute the linker may park the array at
  * an odd offset and only some kernel sizes survive — silent boot
  * failure with `!EXC A` at PC=0x7fec. */
-static unsigned char  upload_slot_data[524288] __attribute__((aligned(16)));
+static unsigned char  upload_slot_data[1572864] __attribute__((aligned(16)));
 static int            upload_slot_size = 0;
 
 void _upload_set(const char *name, const unsigned char *data, int size)
@@ -87,13 +87,14 @@ extern int  abcl_web_init(void);
 extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 
 #define WEBACTOR_PORT 8080
-#define WEB_BUFSZ     524288   /* 512 KB — was 64 KB; bumped to fit a full
-                                 * xinu.boot upload for /kexec network update.
-                                 * Earlier note (kept for context):
-                                 * was 1024 — bumped for /upload bodies (up
-                                * to ~64 KB).  Stack-resident in the server
-                                * thread; the thread is created with 64 KB
-                                * stack so this allocates the stack itself. */
+#define WEB_BUFSZ     1572864  /* 1.5 MB — bumped from 512 KB so a full
+                                 * xinu.boot (~940 KB, grown with BASIC/gwm/
+                                 * WiFi/JIT) fits in one /upload for the
+                                 * /kexec network update.  reqbuf is `static`
+                                 * (.bss), NOT stack-resident, so this is just
+                                 * runtime footprint, not the server thread's
+                                 * stack.  Keep in sync with upload_slot_data
+                                 * and the /upload handler's upload_data. */
 
 /* Static network config used by the boot auto-start (webactor_autostart). */
 #define WEBACTOR_IP   "192.168.3.50"
@@ -734,8 +735,9 @@ thread webactor_server(void)
             {
                 /* Parse ?dst=NAME from URL */
                 static char upload_name[64];
-                /* 512 KB so a full xinu.boot fits for /kexec network update */
-                static unsigned char upload_data[524288];
+                /* 1.5 MB so a full xinu.boot fits for /kexec network update
+                 * (keep in sync with WEB_BUFSZ + upload_slot_data) */
+                static unsigned char upload_data[1572864];
                 static int  upload_size = 0;
                 upload_name[0] = '\0';
                 const char *url = strchr(reqbuf, ' ');
