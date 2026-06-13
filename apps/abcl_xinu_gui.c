@@ -110,6 +110,11 @@ static gline_t   g_lines[MAX_GLINES];
 static semaphore lines_mu;
 static int       lines_init_done = 0;
 
+/* Render offset: the AIPL window (apps/gwm.c) sets these to its content origin
+ * each frame so the rotating lines + Start/Stop buttons (authored at absolute
+ * coords) paint INSIDE the window.  Default 0 = full-screen (legacy). */
+int abcl_gui_ox = 0, abcl_gui_oy = 0;
+
 static void lines_ensure_init(void)
 {
     if (!lines_init_done) {
@@ -649,8 +654,8 @@ int abcl_xinu_gui_handle_click(int mx, int my)
     for (i = 0; i < g_n_buttons; i++) {
         gbutton_t *b = &g_buttons[i];
         if (!b->valid) continue;
-        if (mx >= b->x && mx < b->x + b->w &&
-            my >= b->y && my < b->y + b->h) {
+        if (mx >= b->x + abcl_gui_ox && mx < b->x + abcl_gui_ox + b->w &&
+            my >= b->y + abcl_gui_oy && my < b->y + abcl_gui_oy + b->h) {
             b->pressed_frames = 6;
             abcl_enqueue(-1, b->target, b->method, 0, NULL);
             return 1;
@@ -719,8 +724,8 @@ void abcl_xinu_gui_render(void)
     for (i = 0; i < MAX_GLINES; i++) {
         if (g_lines[i].valid) {
             unsigned short c = rgb565(g_lines[i].r, g_lines[i].g, g_lines[i].b);
-            int x1 = g_lines[i].x1, y1 = g_lines[i].y1;
-            int x2 = g_lines[i].x2, y2 = g_lines[i].y2;
+            int x1 = g_lines[i].x1 + abcl_gui_ox, y1 = g_lines[i].y1 + abcl_gui_oy;
+            int x2 = g_lines[i].x2 + abcl_gui_ox, y2 = g_lines[i].y2 + abcl_gui_oy;
             draw_line(x1,   y1,   x2,   y2,   c);
             draw_line(x1+1, y1,   x2+1, y2,   c);
             draw_line(x1,   y1+1, x2,   y2+1, c);
@@ -866,15 +871,15 @@ void abcl_xinu_gui_render(void)
         }
         bg = rgb565(cr, cg, cb);
         outline_c = rgb565(240, 240, 240);
-        fill_rect_pub(b->x, b->y, b->w, b->h, bg);
-        rect_outline_pub(b->x, b->y, b->w, b->h, outline_c);
+        fill_rect_pub(b->x + abcl_gui_ox, b->y + abcl_gui_oy, b->w, b->h, bg);
+        rect_outline_pub(b->x + abcl_gui_ox, b->y + abcl_gui_oy, b->w, b->h, outline_c);
         /* ラベルを中央寄せ。8x2 = 16px char (FONT_SCALE=2) */
         slen = 0;
         for (p = b->label; *p; p++) slen++;
         char_w = 16;
         text_w = slen * char_w;
-        tx = b->x + (b->w - text_w) / 2;
-        ty = b->y + (b->h - char_w) / 2;
+        tx = b->x + abcl_gui_ox + (b->w - text_w) / 2;
+        ty = b->y + abcl_gui_oy + (b->h - char_w) / 2;
         draw_string_pub(tx, ty, b->label, rgb565(255, 255, 255));
     }
 }

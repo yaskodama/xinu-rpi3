@@ -10,6 +10,7 @@
 #include <thread.h>
 #include <semaphore.h>
 #include <stdio.h>      /* sprintf() for wm_dump_layout() */
+#include <string.h>     /* strncmp() for the AIPL window command dispatch */
 #include <gwm.h>
 #include <gvideo.h>
 #include <gsoftkbd.h>
@@ -471,6 +472,28 @@ static window_t *window_at_point(int sx, int sy);   /* topmost window @point */
  * accessors let wm_close_window() dismiss one like a shell window. */
 static int  bas_index_of(window_t *w);   /* BASIC window -> instance, else -1 */
 static void bas_mark_closed(int idx);    /* mark BASIC instance idx off-screen */
+static int  aipl_is_win(window_t *w);    /* 1 if w is the AIPL window */
+static void aipl_mark_closed(void);      /* mark the AIPL window off-screen */
+
+/* AIPL window state — declared early (used by wm_drag_tick / the frame loop). */
+#define AIPL_ROWS 44
+#define AIPL_COLS 72
+#define AIPL_QN   8
+struct aipl_ui {
+  char ring[AIPL_ROWS][AIPL_COLS + 1];
+  unsigned char dirty[AIPL_ROWS];
+  int  row, col, filled, full;
+  int  ed_row, ed_col;
+  char q[AIPL_QN][256];
+  int  qh, qt;
+  semaphore sem;
+  window_t win;
+  int  open;
+  volatile int running;       /* a program is live -> draw + tick graphics */
+};
+static struct aipl_ui aui;
+static int  aipl_toolbar_hit(int sx, int sy);
+static void aipl_run_button(int idx);
 
 /* Which shell index a window pointer belongs to (0 if not a shell window). */
 static int sh_index_of(window_t *self)
@@ -781,6 +804,7 @@ static void wm_close_window(window_t *w)
     if (idx >= 0) shc[idx].opened = 0;
     bi = bas_index_of(w);
     if (bi >= 0) bas_mark_closed(bi);        /* allow menu to re-open it */
+    if (aipl_is_win(w)) aipl_mark_closed();
     wm_remove(w);
     if (active_win == w) active_win = 0;
     g_need_full = 1;
@@ -828,7 +852,7 @@ static void basic_run_button(int inst, int idx);          /* run that button's c
 /* ---- right-click pull-down menu --------------------------------------- */
 #define MENU_W  76
 #define MENU_IH 15
-static const char *menu_labels[] = { "Shell", "BASIC" };
+static const char *menu_labels[] = { "Shell", "BASIC", "AIPL" };
 #define NMENU ((int)(sizeof(menu_labels) / sizeof(menu_labels[0])))
 static int menu_open, menu_x, menu_y;            /* desktop coords           */
 static void menu_exec(int sel);                  /* defined after the windows */
@@ -901,6 +925,19 @@ static void wm_drag_tick(void)
     if (left && !prev_left) {
         int mi = 0, b = sh_toolbar_hit(cursor_x, cursor_y, &mi);
         if (b >= 0) { sh_run_button(mi, b); prev_left = left; return; }
+    }
+    /* AIPL window: toolbar button, else a click in its graphics area routes to
+     * the AIPL program's Start/Stop buttons (abcl_xinu_gui_handle_click). */
+    if (left && !prev_left) {
+        int b = aipl_toolbar_hit(cursor_x, cursor_y);
+        if (b >= 0) { aipl_run_button(b); prev_left = left; return; }
+        if (aui.open && window_at_point(cursor_x, cursor_y) == &aui.win) {
+            extern int abcl_xinu_gui_handle_click(int, int);
+            if (abcl_xinu_gui_handle_click(cursor_x + vp_x, cursor_y + vp_y)) {
+                active_win = &aui.win; wm_raise(&aui.win);
+                prev_left = left; return;
+            }
+        }
     }
     prev_left = left;
 
@@ -1007,6 +1044,11 @@ void wm_run(void)
             }
             chrome_done = newtail;
         }
+
+        /* Drive the AIPL actor program's ticks once per frame so the Spinner
+         * actors advance their angle (they update g_lines, which aipl_draw
+         * paints).  Only while the AIPL window is open + a program is live. */
+        if (aui.open && aui.running) { extern void abcl_xinu_gui_tick_all(void); abcl_xinu_gui_tick_all(); }
 
         draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
         draw_menu();             /* right-click pull-down menu, if open    */
@@ -1728,6 +1770,231 @@ static void basic_run_button(int inst, int idx)
     bas_enqueue(u, cmd);
 }
 
+/* ============================================================ *
+ *  AIPL development window.  BASIC-style console + toolbar, but  *
+ *  `run "Rotate4Lines.abcl"` launches the AIPL ACTOR program     *
+ *  (apps/abcl_program.c Spinner/Controller, translated from      *
+ *  abclc/Rotate4LinesXinu.abcl by abcl2c).  The 4 rotating lines *
+ *  + Start/Stop buttons render into this window's graphics area  *
+ *  via the abcl_xinu_gui_* hooks (offset by abcl_gui_ox/oy).     *
+ * ============================================================ */
+#define AIPL_TB_H  16            /* toolbar height                          */
+#define AIPL_TXT_N 6             /* text-console rows (rest is graphics)    */
+extern void abcl_rotate4_init(void);
+extern void abcl_rotate4_start(void);
+extern void abcl_rotate4_stop(void);
+extern void abcl_xinu_gui_render(void);
+extern void abcl_xinu_gui_tick_all(void);
+extern int  abcl_xinu_gui_handle_click(int, int);
+extern int  abcl_gui_ox, abcl_gui_oy;
+
+static const char *aipl_files[] = { "Rotate4Lines.abcl" };
+#define AIPL_NFILE ((int)(sizeof(aipl_files) / sizeof(aipl_files[0])))
+static const char *aipl_src[] = {
+  "// Rotate4LinesXinu.abcl  (abcl2c -> C -> kernel actors)",
+  "class Spinner {",
+  "  method tick() {",
+  "    if (running==1) angle = angle + speed;",
+  "    var c = cos(angle); var s = sin(angle);",
+  "    var dx = c*radius/1024; var dy = s*radius/1024;",
+  "    xinu_gui_set_line(idx, cx+dx,cy+dy, cx-dx,cy-dy, rr,gg,bb);",
+  "  }",
+  "}",
+  "class Controller {",
+  "  method init() {",
+  "    s1..s4 = new Spinner(...);  register tickers;",
+  "    add_button(Start); add_button(Stop);",
+  "  }",
+  "}",
+  "var ctrl = new Controller();",
+};
+#define AIPL_NSRC ((int)(sizeof(aipl_src) / sizeof(aipl_src[0])))
+
+static void aipl_draw(window_t *self, unsigned int frame);
+static int  aipl_is_win(window_t *w) { return w == &aui.win; }
+static void aipl_mark_closed(void) { aui.open = 0; }
+
+static void aipl_newline(struct aipl_ui *u) {
+  u->ring[u->row][u->col] = 0;
+  u->row = (u->row + 1) % AIPL_ROWS; u->col = 0; u->ring[u->row][0] = 0;
+  if (u->row == 0) u->filled = 1;
+  for (int r = 0; r < AIPL_ROWS; r++) u->dirty[r] = 1;
+}
+static void aipl_putc(struct aipl_ui *u, char c) {
+  if (c == '\r') return;
+  if (c == '\n') { aipl_newline(u); return; }
+  if (c == 8 || c == 0x7f) { if (u->col > 0) { u->col--; u->ring[u->row][u->col] = 0; u->dirty[u->row] = 1; } return; }
+  if (c < 0x20) return;
+  if (u->col >= AIPL_COLS) aipl_newline(u);
+  u->ring[u->row][u->col++] = c; u->ring[u->row][u->col] = 0; u->dirty[u->row] = 1;
+}
+static void aipl_emit(const char *s) {
+  while (*s) aipl_putc(&aui, *s++);
+  aui.ed_row = aui.row; aui.ed_col = aui.col;
+}
+static void aipl_enqueue(const char *line) {
+  int k = 0; for (; line[k] && k < 255; k++) aui.q[aui.qt][k] = line[k]; aui.q[aui.qt][k] = 0;
+  aui.qt = (aui.qt + 1) % AIPL_QN;
+  if (aui.sem != (semaphore)SYSERR) signaln(aui.sem, 1);
+}
+static int aipl_getline(char *buf, int max) {
+  wait(aui.sem);
+  int i = 0; for (; aui.q[aui.qh][i] && i < max - 1; i++) buf[i] = aui.q[aui.qh][i]; buf[i] = 0;
+  aui.qh = (aui.qh + 1) % AIPL_QN; return i;
+}
+/* Editor: append / backspace / enter (no history — short commands). */
+void aipl_feed(int c) {
+  if (c == '\r' || c == '\n') {
+    char line[256]; int n = 0;
+    for (; n < AIPL_COLS && aui.ring[aui.ed_row][n]; n++) line[n] = aui.ring[aui.ed_row][n];
+    while (n > 0 && line[n - 1] == ' ') n--; line[n] = 0;
+    aui.col = aui.ed_col; aipl_putc(&aui, '\n');
+    aui.ed_row = aui.row; aui.ed_col = aui.col;
+    /* strip a leading "aipl> " prompt the editor returns (full-screen line) */
+    { const char *pfx = "aipl> "; int i = 0; const char *s = line;
+      while (pfx[i] && s[i] == pfx[i]) i++; if (pfx[i] == 0) aipl_enqueue(s + i); else aipl_enqueue(s); }
+    return;
+  }
+  if (c == 8 || c == 0x7f) {
+    if (aui.ed_col > 0) { aui.ed_col--; aui.ring[aui.ed_row][aui.ed_col] = 0;
+      if (aui.ed_row == aui.row && aui.col > 0) aui.col--; aui.dirty[aui.ed_row] = 1; }
+    return;
+  }
+  if (c >= 0x20 && c < 0x7f) {
+    if (aui.ed_col < AIPL_COLS - 1) {
+      aui.ring[aui.ed_row][aui.ed_col] = (char)c; aui.ed_col++; aui.ring[aui.ed_row][aui.ed_col] = 0;
+      if (aui.ed_row == aui.row && aui.ed_col > aui.col) aui.col = aui.ed_col;
+      aui.dirty[aui.ed_row] = 1;
+    }
+  }
+}
+static void aipl_exec_line(const char *line) {
+  const char *p = line; while (*p == ' ' || *p == '\t') p++;
+  if (*p == 0) { aipl_emit("aipl> "); return; }
+  if (0 == strncmp(p, "files", 5)) {
+    int i; aipl_emit("AIPL programs:\n");
+    for (i = 0; i < AIPL_NFILE; i++) { aipl_emit("  "); aipl_emit(aipl_files[i]); aipl_emit("\n"); }
+  } else if (0 == strncmp(p, "list", 4) || 0 == strncmp(p, "cat", 3)) {
+    int i; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
+  } else if (0 == strncmp(p, "run", 3)) {
+    aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
+    abcl_rotate4_init(); aui.running = 1;
+  } else if (0 == strncmp(p, "start", 5)) {
+    abcl_rotate4_start(); aui.running = 1; aipl_emit("started\n");
+  } else if (0 == strncmp(p, "stop", 4)) {
+    abcl_rotate4_stop(); aipl_emit("stopped\n");
+  } else if (0 == strncmp(p, "help", 4)) {
+    aipl_emit("cmds: files | list | run \"Rotate4Lines.abcl\" | start | stop\n");
+  } else {
+    aipl_emit("? unknown — try `help`\n");
+  }
+  aipl_emit("aipl> ");
+}
+thread aipl_win_main(void) {
+  char line[256];
+  aui.sem = semcreate(0);
+  aipl_emit("Xinu AIPL — actor-language dev window.\n");
+  aipl_emit("  files | list | run \"Rotate4Lines.abcl\" | start | stop | help\n");
+  aipl_emit("aipl> ");
+  for (;;) { aipl_getline(line, sizeof line); aipl_exec_line(line); }
+  return OK;
+}
+
+static int aipl_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static const struct { const char *label, *cmd; } aipl_btns[] = {
+  { "files", "files" }, { "list", "list" }, { "run", "run \"Rotate4Lines.abcl\"" },
+  { "start", "start" }, { "stop", "stop" },
+};
+#define AIPL_NBTN ((int)(sizeof(aipl_btns) / sizeof(aipl_btns[0])))
+static void aipl_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh) {
+  int left = self->x + 4, right = self->x + self->width - 2, x = left, row = 0, k;
+  for (k = 0; ; k++) {
+    int w = aipl_slen(aipl_btns[k].label) * FONT_WIDTH + 8;
+    if (x + w > right && x > left) { row++; x = left; }
+    if (k == i) { *bx = x; *by = self->y + WM_TITLEBAR_H + 3 + row * 16; *bw = w; *bh = 12; return; }
+    x += w + 4;
+  }
+}
+static void aipl_draw_toolbar(window_t *self) {
+  int i, bx, by, bw, bh;
+  fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, AIPL_TB_H, 0xFF1A0A2AU);
+  for (i = 0; i < AIPL_NBTN; i++) {
+    aipl_btn_rect(self, i, &bx, &by, &bw, &bh);
+    fill_rect(bx, by, bw, bh, 0xFF5E2E8EU);
+    fill_rect(bx, by, bw, 1, 0xFF8E5EC0U);
+    draw_string_at(bx + 4, by + 1, aipl_btns[i].label, 0xFFE8D8FFU, 0xFF5E2E8EU);
+  }
+}
+#define AIPL_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + AIPL_TB_H)
+static void aipl_draw(window_t *self, unsigned int frame) {
+  const int line_h = FONT_HEIGHT + 1;
+  struct aipl_ui *u = &aui;
+  (void)frame;
+  if (u->full) {
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+              self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
+    u->full = 0;
+  }
+  aipl_draw_toolbar(self);
+  /* text console — the top AIPL_TXT_N rows */
+  int txt_top = AIPL_TXT_TOP(self);
+  int rows = AIPL_TXT_N;
+  int have = u->filled ? AIPL_ROWS : u->row + 1;
+  int start = (u->row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;
+  if (have < rows) { rows = have; start = 0; }
+  for (int i = 0; i < rows; i++) {
+    int r = (start + i) % AIPL_ROWS;
+    if (g_force_redraw || u->dirty[r]) {
+      int ry = txt_top + i * line_h;
+      fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
+      draw_string_at(self->x + 4, ry, u->ring[r], 0xFFD8C0FFU, self->content_bg);
+      if (!g_force_redraw) u->dirty[r] = 0;
+    }
+  }
+  /* graphics area below the strip: clear + paint the rotating lines/buttons */
+  if (u->running) {
+    int gfx_top = txt_top + AIPL_TXT_N * line_h + 2;
+    int gfx_h = self->y + self->height - gfx_top - 2;
+    if (gfx_h > 0) {
+      fill_rect(self->x + 1, gfx_top, self->width - 2, gfx_h, self->content_bg);
+      abcl_gui_ox = self->x + 4;
+      abcl_gui_oy = gfx_top;
+      abcl_xinu_gui_render();
+    }
+  }
+}
+/* Open (idempotently) the AIPL window. */
+int aipl_window_open(void) {
+  if (aui.open) { active_win = &aui.win; wm_raise(&aui.win); g_need_full = 1; return OK; }
+  for (int r = 0; r < AIPL_ROWS; r++) aui.dirty[r] = 1;
+  if (aui.win.width == 0) { aui.win.x = 300; aui.win.y = 36; aui.win.width = 640; aui.win.height = 500; }
+  title_set(&aui.win, "AIPL");
+  aui.win.chrome_color = 0xFFB68AEEU;
+  aui.win.title_bg     = 0xFF3A1060U;
+  aui.win.title_fg     = 0xFFFFFFFFU;
+  aui.win.content_bg   = 0xFF0A0414U;
+  aui.win.draw_content = aipl_draw;
+  wm_add(&aui.win);
+  aui.open = 1; aui.full = 1;
+  active_win = &aui.win; wm_raise(&aui.win); g_need_full = 1;
+  return OK;
+}
+/* AIPL toolbar click test: button index under (sx,sy), or -1. */
+static int aipl_toolbar_hit(int sx, int sy) {
+  int dx = sx + vp_x, dy = sy + vp_y, i, bx, by, bw, bh;
+  if (window_at_point(sx, sy) != &aui.win) return -1;
+  for (i = 0; i < AIPL_NBTN; i++) {
+    aipl_btn_rect(&aui.win, i, &bx, &by, &bw, &bh);
+    if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) return i;
+  }
+  return -1;
+}
+static void aipl_run_button(int idx) {
+  if (idx < 0 || idx >= AIPL_NBTN) return;
+  aipl_emit(aipl_btns[idx].cmd); aipl_emit("\n");
+  aipl_enqueue(aipl_btns[idx].cmd);
+}
+
 /* Right-click menu action. */
 static void menu_exec(int sel)
 {
@@ -1741,6 +2008,8 @@ static void menu_exec(int sel)
         for (i = 0; i < NBASIC; i++)
             if (!bui[i].open) { basic_window_open_n(i); opened = 1; break; }
         if (!opened) basic_window_open_n(0);     /* all open -> raise BASIC 0 */
+    } else if (sel == 2) {                       /* AIPL */
+        aipl_window_open();
     }
     g_need_full = 1;
 }
@@ -1792,6 +2061,7 @@ void gwm_feed_key(int c)
 {
     extern void gwincon_feed(int, int);          /* (minor, char) */
     if (bas_active_index() >= 0)        basic_feed(c);
+    else if (active_win == &aui.win)    aipl_feed(c);
     else if (active_win == &shc[1].win) gwincon_feed(1, c);
     else                                gwincon_feed(0, c);
 }

@@ -413,6 +413,13 @@ thread main(void)
               RESCHED_NO);
         ready(create((void *)basic_main_n, 32768, INITPRIO, "BASIC1", 1, 1),
               RESCHED_NO);
+        /* AIPL dev window REPL (right-click menu -> AIPL); runs the
+         * Rotate4Lines actor program on demand. */
+        {
+            extern thread aipl_win_main(void);
+            ready(create((void *)aipl_win_main, 16384, INITPRIO, "AIPL", 0),
+                  RESCHED_NO);
+        }
         /* physical USB keyboard -> active window (shell or BASIC) */
         ready(create((void *)gwin_kbd_bridge, 8192, INITPRIO, "kbdbridge", 0),
               RESCHED_NO);

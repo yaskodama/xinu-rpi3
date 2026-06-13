@@ -549,6 +549,8 @@ static int _abcl_cap = 0;
 #define CLASS_DiningBench 6   /* 5 philosophers + 5 forks benchmark orchestrator */
 #define CLASS_ForkCM 7        /* Chandy-Misra hygienic fork (clean/dirty) */
 #define CLASS_PhilCM 8        /* Chandy-Misra philosopher (request/release) */
+#define CLASS_Spinner 9       /* Rotate4Lines: a rotating line-segment actor   */
+#define CLASS_Controller 10   /* Rotate4Lines: spawns 4 spinners + Start/Stop  */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
@@ -560,6 +562,8 @@ static int _abcl_cap = 0;
 #define ABCL_PRIO_DiningBench 24  /* between Dispatcher (25) and Worker (22) */
 #define ABCL_PRIO_ForkCM 20       /* same tier as old Fork */
 #define ABCL_PRIO_PhilCM 20       /* same tier as old Philosopher */
+#define ABCL_PRIO_Spinner 20      /* Rotate4Lines spinner actor */
+#define ABCL_PRIO_Controller 21   /* one above the spinners it drives */
 static int abcl_class_prio(int class_id) {
   switch (class_id) {
   case CLASS_Fork: return ABCL_PRIO_Fork;
@@ -571,6 +575,8 @@ static int abcl_class_prio(int class_id) {
   case CLASS_DiningBench: return ABCL_PRIO_DiningBench;
   case CLASS_ForkCM:     return ABCL_PRIO_ForkCM;
   case CLASS_PhilCM:     return ABCL_PRIO_PhilCM;
+  case CLASS_Spinner:    return ABCL_PRIO_Spinner;
+  case CLASS_Controller: return ABCL_PRIO_Controller;
   default: return INITPRIO;
   }
 }
@@ -585,6 +591,8 @@ const char* abcl_class_name(int class_id) {
   case CLASS_DiningBench: return "DiningBench";
   case CLASS_ForkCM:     return "ForkCM";
   case CLASS_PhilCM:     return "PhilCM";
+  case CLASS_Spinner:    return "Spinner";
+  case CLASS_Controller: return "Controller";
   default: return "?";
   }
 }
@@ -597,6 +605,8 @@ static void dispatch_Collector(int, int, const char*, value_t*, int);
 static void dispatch_DiningBench(int, int, const char*, value_t*, int);
 static void dispatch_ForkCM(int, int, const char*, value_t*, int);
 static void dispatch_PhilCM(int, int, const char*, value_t*, int);
+static void dispatch_Spinner(int, int, const char*, value_t*, int);
+static void dispatch_Controller(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -2563,6 +2573,129 @@ int abcl_dining_status(char *buf, int cap) {
     objects[d].fields[F_DB_max_phil].i);
 }
 
+/* ============================================================ *
+ *  Rotate4Lines — Spinner + Controller actor classes.          *
+ *  Translated from abclc/Rotate4LinesXinu.abcl by the host      *
+ *  abcl2c (--xinu) and hand-integrated here (the file is no     *
+ *  longer machine-regenerated — it carries RCU/GC changes).     *
+ *  GUI hooks (b_cos/b_sin/xinu_gui_*) live in abcl_xinu_gui.c.  *
+ * ============================================================ */
+extern value_t b_cos(int n_args, value_t *args);             /* deg -> cos*1024 */
+extern value_t b_sin(int n_args, value_t *args);             /* deg -> sin*1024 */
+extern value_t xinu_gui_set_line(int n_args, value_t *args); /* (idx,x1,y1,x2,y2[,r,g,b]) */
+extern value_t xinu_gui_register_ticker(int n_args, value_t *args); /* (actor) */
+extern value_t xinu_gui_add_button(int n_args, value_t *args);     /* (label,x,y,w,h,obj,method) */
+
+enum { F_Spinner_idx, F_Spinner_angle, F_Spinner_speed, F_Spinner_cx, F_Spinner_cy,
+       F_Spinner_radius, F_Spinner_running, F_Spinner_rr, F_Spinner_gg, F_Spinner_bb };
+
+static void init_fields_Spinner(int self_id) {
+  objects[self_id].fields[F_Spinner_idx]     = mk_int(0L);
+  objects[self_id].fields[F_Spinner_angle]   = mk_float(0.0);
+  objects[self_id].fields[F_Spinner_speed]   = mk_int(5L);
+  objects[self_id].fields[F_Spinner_cx]      = mk_int(0L);
+  objects[self_id].fields[F_Spinner_cy]      = mk_int(0L);
+  objects[self_id].fields[F_Spinner_radius]  = mk_int(60L);
+  objects[self_id].fields[F_Spinner_running] = mk_int(1L);
+  objects[self_id].fields[F_Spinner_rr]      = mk_int(200L);
+  objects[self_id].fields[F_Spinner_gg]      = mk_int(220L);
+  objects[self_id].fields[F_Spinner_bb]      = mk_int(255L);
+}
+static long fi(int self_id, int f) {     /* field-as-long helper (int or float) */
+  value_t v = objects[self_id].fields[f];
+  return (v.tag == V_INT) ? v.i : (long)v.f;
+}
+static double ff(int self_id, int f) {   /* field-as-double helper */
+  value_t v = objects[self_id].fields[f];
+  return (v.tag == V_FLOAT) ? v.f : (double)v.i;
+}
+static void Spinner_init(int self_id, int sender_id, value_t* args, int n_args) {
+  (void)sender_id;
+  objects[self_id].fields[F_Spinner_idx]     = mk_int((n_args > 0) ? (long)((args[0].tag==V_INT)?args[0].i:(long)args[0].f) : 0L);
+  objects[self_id].fields[F_Spinner_speed]   = mk_int((n_args > 1) ? (long)((args[1].tag==V_INT)?args[1].i:(long)args[1].f) : 0L);
+  objects[self_id].fields[F_Spinner_cx]      = mk_int((n_args > 2) ? (long)((args[2].tag==V_INT)?args[2].i:(long)args[2].f) : 0L);
+  objects[self_id].fields[F_Spinner_cy]      = mk_int((n_args > 3) ? (long)((args[3].tag==V_INT)?args[3].i:(long)args[3].f) : 0L);
+  objects[self_id].fields[F_Spinner_rr]      = mk_int((n_args > 4) ? (long)((args[4].tag==V_INT)?args[4].i:(long)args[4].f) : 0L);
+  objects[self_id].fields[F_Spinner_gg]      = mk_int((n_args > 5) ? (long)((args[5].tag==V_INT)?args[5].i:(long)args[5].f) : 0L);
+  objects[self_id].fields[F_Spinner_bb]      = mk_int((n_args > 6) ? (long)((args[6].tag==V_INT)?args[6].i:(long)args[6].f) : 0L);
+  objects[self_id].fields[F_Spinner_running] = mk_int(1L);
+  enqueue(self_id, self_id, "tick", 0, NULL);
+}
+static void Spinner_start(int self_id, int s, value_t* a, int n) { (void)s;(void)a;(void)n;
+  objects[self_id].fields[F_Spinner_running] = mk_int(1L); }
+static void Spinner_stop(int self_id, int s, value_t* a, int n)  { (void)s;(void)a;(void)n;
+  objects[self_id].fields[F_Spinner_running] = mk_int(0L); }
+static void Spinner_tick(int self_id, int sender_id, value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  if (fi(self_id, F_Spinner_running) == 1L) {
+    double a = ff(self_id, F_Spinner_angle) + (double)fi(self_id, F_Spinner_speed);
+    if (a >= 360.0) a -= 360.0;
+    objects[self_id].fields[F_Spinner_angle] = mk_float(a);
+  }
+  double ang = ff(self_id, F_Spinner_angle);
+  long c = b_cos(1, (value_t[]){ mk_float(ang) }).i;   /* cos*1024 */
+  long s = b_sin(1, (value_t[]){ mk_float(ang) }).i;   /* sin*1024 */
+  long radius = fi(self_id, F_Spinner_radius);
+  long dx = c * radius / 1024;
+  long dy = s * radius / 1024;
+  long cx = fi(self_id, F_Spinner_cx), cy = fi(self_id, F_Spinner_cy);
+  xinu_gui_set_line(8, (value_t[]){
+      mk_int(fi(self_id, F_Spinner_idx)),
+      mk_int(cx + dx), mk_int(cy + dy), mk_int(cx - dx), mk_int(cy - dy),
+      mk_int(fi(self_id, F_Spinner_rr)), mk_int(fi(self_id, F_Spinner_gg)), mk_int(fi(self_id, F_Spinner_bb)) });
+}
+static void dispatch_Spinner(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
+  if (strcmp(method, "init") == 0)  {Spinner_init(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "start") == 0) {Spinner_start(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "stop") == 0)  {Spinner_stop(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "tick") == 0)  { Spinner_tick(self_id, sender_id, args, n_args); return; }
+}
+
+enum { F_Controller_s1, F_Controller_s2, F_Controller_s3, F_Controller_s4 };
+
+static void init_fields_Controller(int self_id) {
+  objects[self_id].fields[F_Controller_s1] = mk_int(0L);
+  objects[self_id].fields[F_Controller_s2] = mk_int(0L);
+  objects[self_id].fields[F_Controller_s3] = mk_int(0L);
+  objects[self_id].fields[F_Controller_s4] = mk_int(0L);
+}
+static void Controller_init(int self_id, int sender_id, value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  objects[self_id].fields[F_Controller_s1] = mk_obj(create_obj(CLASS_Spinner, 7, (value_t[]){mk_int(0L),mk_int(3L),mk_int(200L),mk_int(160L),mk_int(255L),mk_int(100L),mk_int(100L)}));
+  objects[self_id].fields[F_Controller_s2] = mk_obj(create_obj(CLASS_Spinner, 7, (value_t[]){mk_int(1L),mk_int(5L),mk_int(440L),mk_int(160L),mk_int(100L),mk_int(220L),mk_int(130L)}));
+  objects[self_id].fields[F_Controller_s3] = mk_obj(create_obj(CLASS_Spinner, 7, (value_t[]){mk_int(2L),mk_int(7L),mk_int(200L),mk_int(320L),mk_int(100L),mk_int(150L),mk_int(255L)}));
+  objects[self_id].fields[F_Controller_s4] = mk_obj(create_obj(CLASS_Spinner, 7, (value_t[]){mk_int(3L),mk_int(9L),mk_int(440L),mk_int(320L),mk_int(240L),mk_int(200L),mk_int(100L)}));
+  xinu_gui_register_ticker(1, (value_t[]){objects[self_id].fields[F_Controller_s1]});
+  xinu_gui_register_ticker(1, (value_t[]){objects[self_id].fields[F_Controller_s2]});
+  xinu_gui_register_ticker(1, (value_t[]){objects[self_id].fields[F_Controller_s3]});
+  xinu_gui_register_ticker(1, (value_t[]){objects[self_id].fields[F_Controller_s4]});
+  xinu_gui_add_button(7, (value_t[]){mk_str("Start"), mk_int(40L), mk_int(26L), mk_int(90L), mk_int(30L), mk_obj(self_id), mk_str("start")});
+  xinu_gui_add_button(7, (value_t[]){mk_str("Stop"),  mk_int(510L),mk_int(26L), mk_int(90L), mk_int(30L), mk_obj(self_id), mk_str("stop")});
+}
+static void Controller_bcast(int self_id, const char *m) {
+  enqueue(self_id, objects[self_id].fields[F_Controller_s1].obj_id, m, 0, NULL);
+  enqueue(self_id, objects[self_id].fields[F_Controller_s2].obj_id, m, 0, NULL);
+  enqueue(self_id, objects[self_id].fields[F_Controller_s3].obj_id, m, 0, NULL);
+  enqueue(self_id, objects[self_id].fields[F_Controller_s4].obj_id, m, 0, NULL);
+}
+static void dispatch_Controller(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
+  (void)sender_id; (void)args; (void)n_args;
+  if (strcmp(method, "init") == 0)  {Controller_init(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "start") == 0) {Controller_bcast(self_id, "start"); return; }
+  if (strcmp(method, "stop") == 0)  {Controller_bcast(self_id, "stop"); return; }
+}
+
+/* Bootstrap: spawn the Controller (its init spawns 4 spinners + Start/Stop
+ * buttons + registers tickers).  Called on demand from the AIPL window's
+ * `run "Rotate4Lines.abcl"` (apps/gwm.c).  Idempotent-ish guard via g_rotate4. */
+static int g_rotate4 = -1;
+void abcl_rotate4_init(void) {
+  if (g_rotate4 >= 0) return;              /* already running */
+  g_rotate4 = create_obj(CLASS_Controller, 0, NULL);
+}
+void abcl_rotate4_start(void) { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "start", 0, NULL); }
+void abcl_rotate4_stop(void)  { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "stop",  0, NULL); }
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
@@ -2574,6 +2707,8 @@ static void dispatch(int self_id, int sender_id, const char* method, value_t* ar
   case CLASS_DiningBench: dispatch_DiningBench(self_id, sender_id, method, args, n_args); break;
   case CLASS_ForkCM:     dispatch_ForkCM(self_id, sender_id, method, args, n_args); break;
   case CLASS_PhilCM:     dispatch_PhilCM(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Spinner:    dispatch_Spinner(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Controller: dispatch_Controller(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -2589,6 +2724,8 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_DiningBench: init_fields_DiningBench(self_id); break;
   case CLASS_ForkCM:     init_fields_ForkCM(self_id);     break;
   case CLASS_PhilCM:     init_fields_PhilCM(self_id);     break;
+  case CLASS_Spinner:    init_fields_Spinner(self_id);    break;
+  case CLASS_Controller: init_fields_Controller(self_id); break;
   default: break;
   }
 }
