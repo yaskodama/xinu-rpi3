@@ -1033,6 +1033,13 @@ static int           bas_row, bas_col, bas_filled, bas_full;
 static int           bas_canvas;   /* 1 = top-aligned PLOT canvas, 0 = scroll */
 static window_t      basic_win;
 
+/* Full-screen editor cursor (classic micro-BASIC style): arrow keys roam it
+ * over the on-screen program text; Enter submits the logical line under it.
+ * It tracks the output position (bas_row/bas_col) while the interpreter is
+ * printing, then the user can move it up to re-edit a previous line. */
+static int           bas_ed_row, bas_ed_col;
+static int           bas_esc;      /* CSI parser: 0 idle, 1 saw ESC, 2 saw ESC[ */
+
 static void bas_newline(void)
 {
     bas_ring[bas_row][bas_col] = 0;
@@ -1056,7 +1063,14 @@ static void bas_putc(char c)
     if (bas_col >= BAS_COLS) bas_newline();
     bas_ring[bas_row][bas_col++] = c; bas_ring[bas_row][bas_col] = 0; bas_dirty[bas_row] = 1;
 }
-static void bas_emit(const char *s) { while (*s) bas_putc(*s++); }
+static void bas_emit(const char *s)
+{
+    while (*s) bas_putc(*s++);
+    /* Interpreter output lands at the bottom; keep the edit cursor there so
+     * the next keystroke continues from the live line (the user can still
+     * arrow up afterwards to re-edit history). */
+    bas_ed_row = bas_row; bas_ed_col = bas_col;
+}
 
 /* ---- CLS / PLOT / PAUSE: a simple top-aligned character canvas so a BASIC
  * program can clear the window and plot at (col,row) (rotate.bas). -------- */
@@ -1112,35 +1126,108 @@ static void basic_draw(window_t *self, unsigned int frame)
             if (!g_force_redraw) bas_dirty[r] = 0;
         }
     }
-    { int cr_y = self->y + WM_TITLEBAR_H + 4 + (rows - 1) * line_h;
-      int cr_x = self->x + 4 + bas_col * FONT_WIDTH;
-      if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
-          unsigned int col = ((frame >> 2) & 1) ? 0xFF66FF66U : self->content_bg;
-          fill_rect(cr_x, cr_y, FONT_WIDTH, FONT_HEIGHT, col); } }
+    if (!bas_canvas) {                   /* blinking underline at the edit cursor */
+        int i = (bas_ed_row - start + BAS_ROWS) % BAS_ROWS;
+        if (i >= 0 && i < rows) {
+            int cr_y = self->y + WM_TITLEBAR_H + 4 + i * line_h;
+            int cr_x = self->x + 4 + bas_ed_col * FONT_WIDTH;
+            if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
+                unsigned int col = ((frame >> 2) & 1) ? 0xFF66FF66U : self->content_bg;
+                fill_rect(cr_x, cr_y + FONT_HEIGHT - 2, FONT_WIDTH, 2, col);
+            }
+        }
+    }
 }
 
-/* input line queue: basic_feed (keyboard) enqueues, basic_main + INPUT dequeue */
+/* line queue: the editor (Enter) enqueues a logical line, basic_main + INPUT
+ * dequeue it.  Decoupling the keyboard thread from the interpreter thread. */
 #define BAS_QN 8
 static char      bas_q[BAS_QN][256];
 static int       bas_qh, bas_qt;
 static semaphore bas_sem;
-static char      bas_in[256];
-static int       bas_inlen;
 
+/* ---- screen-editor primitives (operate on the bas_ring grid) ---------- */
+
+static int bas_linelen(int r)
+{
+    int n = 0; while (n < BAS_COLS && bas_ring[r][n]) n++; return n;
+}
+/* Highest ring row the cursor may visit: the live output row (or the whole
+ * ring once it has wrapped). */
+static int bas_ed_maxrow(void) { return bas_filled ? BAS_ROWS - 1 : bas_row; }
+
+static void bas_ed_clampcol(void)
+{
+    int len = bas_linelen(bas_ed_row);
+    if (bas_ed_col > len) bas_ed_col = len;
+    if (bas_ed_col < 0)   bas_ed_col = 0;
+}
+
+static void bas_ed_putchar(char ch)        /* overwrite at the cursor, extend EOL */
+{
+    int len = bas_linelen(bas_ed_row);
+    if (bas_ed_col >= BAS_COLS) return;
+    if (bas_ed_col > len) { for (int k = len; k < bas_ed_col; k++) bas_ring[bas_ed_row][k] = ' '; len = bas_ed_col; }
+    bas_ring[bas_ed_row][bas_ed_col] = ch;
+    if (bas_ed_col == len) bas_ring[bas_ed_row][bas_ed_col + 1] = 0;   /* appended a char */
+    if (bas_ed_col < BAS_COLS - 1) bas_ed_col++;
+    /* keep the output cursor in step while editing the live bottom line so a
+     * later newline doesn't truncate the freshly typed text */
+    if (bas_ed_row == bas_row && bas_ed_col > bas_col) bas_col = bas_ed_col;
+    bas_dirty[bas_ed_row] = 1;
+}
+
+static void bas_ed_backspace(void)         /* destructive: delete left, shift up */
+{
+    if (bas_ed_col <= 0) return;
+    bas_ed_col--;
+    int len = bas_linelen(bas_ed_row);
+    for (int k = bas_ed_col; k < len; k++) bas_ring[bas_ed_row][k] = bas_ring[bas_ed_row][k + 1];
+    if (bas_ed_row == bas_row && bas_col > 0) bas_col--;
+    bas_dirty[bas_ed_row] = 1;
+}
+
+/* Submit the logical line under the cursor to the interpreter queue, then
+ * return the cursor to the live bottom line. */
+static void bas_ed_enter(void)
+{
+    char line[256]; int n = 0;
+    for (; n < BAS_COLS && bas_ring[bas_ed_row][n]; n++) line[n] = bas_ring[bas_ed_row][n];
+    while (n > 0 && line[n - 1] == ' ') n--;      /* trim trailing pad */
+    line[n] = 0;
+
+    if (bas_ed_row == bas_row) {                  /* editing the live line: scroll down */
+        bas_col = bas_linelen(bas_row);
+        bas_putc('\n');
+    }
+    bas_ed_row = bas_row; bas_ed_col = bas_col;    /* cursor home to the bottom */
+
+    { int k = 0; for (; line[k] && k < 255; k++) bas_q[bas_qt][k] = line[k]; bas_q[bas_qt][k] = 0; }
+    bas_qt = (bas_qt + 1) % BAS_QN;
+    if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
+}
+
+/* Route a keystroke into the editor.  Parses the ANSI arrow CSI sequences the
+ * USB keyboard emits (ESC [ A/B/C/D). */
 void basic_feed(int c)
 {
-    if (c == '\r' || c == '\n') {
-        bas_putc('\n');
-        bas_in[bas_inlen] = 0;
-        { int k = 0; for (; bas_in[k] && k < 255; k++) bas_q[bas_qt][k] = bas_in[k]; bas_q[bas_qt][k] = 0; }
-        bas_qt = (bas_qt + 1) % BAS_QN; bas_inlen = 0;
-        if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
-    } else if (c == 8 || c == 0x7f) {
-        if (bas_inlen > 0) { bas_inlen--; bas_putc((char)8); }
-    } else if (c >= 0x20 && c < 0x7f) {
-        if (bas_inlen < 255) { bas_in[bas_inlen++] = (char)c; bas_putc((char)c); }
+    if (bas_esc == 1) { bas_esc = (c == '[') ? 2 : 0; return; }
+    if (bas_esc == 2) {
+        bas_esc = 0;
+        switch (c) {
+            case 'A': if (bas_ed_row > 0)               { bas_dirty[bas_ed_row] = 1; bas_ed_row--; bas_ed_clampcol(); bas_dirty[bas_ed_row] = 1; } return; /* up    */
+            case 'B': if (bas_ed_row < bas_ed_maxrow()) { bas_dirty[bas_ed_row] = 1; bas_ed_row++; bas_ed_clampcol(); bas_dirty[bas_ed_row] = 1; } return; /* down  */
+            case 'C': { int len = bas_linelen(bas_ed_row); if (bas_ed_col < len && bas_ed_col < BAS_COLS - 1) { bas_ed_col++; bas_dirty[bas_ed_row] = 1; } } return; /* right */
+            case 'D': if (bas_ed_col > 0) { bas_ed_col--; bas_dirty[bas_ed_row] = 1; } return; /* left */
+            default:  return;
+        }
     }
+    if (c == 0x1b) { bas_esc = 1; return; }
+    if (c == '\r' || c == '\n') { bas_ed_enter(); return; }
+    if (c == 8 || c == 0x7f)    { bas_ed_backspace(); return; }
+    if (c >= 0x20 && c < 0x7f)  { bas_ed_putchar((char)c); return; }
 }
+
 static int basic_getline(char *buf, int max)
 {
     wait(bas_sem);
@@ -1163,11 +1250,11 @@ thread basic_main(void)
         basic_set_pause(bas_pause);
     }
     basic_init();
-    bas_emit("Xinu BASIC ready.\n"
-             "  e.g.   10 PRINT \"HELLO\"   /   20 GOTO 10   /   RUN   /   LIST   /   NEW\n"
-             "  FILES = list samples,  RUN \"hello.bas\" to run one.\n");
+    bas_emit("Xinu BASIC ready.  Full-screen editor:\n"
+             "  type a line + ENTER to enter it; arrow keys roam the screen,\n"
+             "  edit any line and press ENTER to re-register it.\n"
+             "  RUN / LIST / NEW / FILES / RUN \"hello.bas\".\n");
     for (;;) {
-        bas_emit("> ");
         basic_getline(line, sizeof line);
         basic_exec_line(line);
     }
