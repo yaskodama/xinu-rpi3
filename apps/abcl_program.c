@@ -6,6 +6,7 @@
 #include <clock.h>     /* P3: clkticks for throughput markers */
 #include <stdio.h>
 #include <string.h>
+#include <rcu.h>       /* RCU: lock-free actor-registry reads (concurrency_safety=rcu) */
 
 /* P3: bumped from 16 to 64 so the lock-free MPSC ring can sustain
    higher producer fan-in without back-pressure dropping messages. */
@@ -177,6 +178,12 @@ static object_t objects[MAX_OBJECTS];
 static int      n_objects = 0;
 static semaphore objects_mu;
 
+/* RCU reader: ordered load of the published actor count.  Pairs with the
+ * rcu_assign_pointer(n_objects, ...) in alloc_obj() — a reader that bounds its
+ * scan with this value is guaranteed to observe only fully-initialised slots,
+ * with no lock and no interrupt disable. */
+static int rcu_n_objects(void) { return rcu_dereference(n_objects); }
+
 static void mailbox_init(mailbox_t *mb) {
   int i;
   mb->enq   = 0;
@@ -187,8 +194,8 @@ static void mailbox_init(mailbox_t *mb) {
 }
 
 void wake_all_actors(void) {
-  int i;
-  for (i = 0; i < n_objects; i++) {
+  int i, total = rcu_n_objects();   /* ordered load: see only published slots */
+  for (i = 0; i < total; i++) {
     /* items を 1 増やすことで wait() しているアクターを起こす */
     signal(objects[i].mbox.items);
   }
@@ -206,21 +213,21 @@ void abcl_shutdown(void) {
 int abcl_object_field_count(void) { return MAX_FIELDS; }
 
 int abcl_object_field_get(int obj_id, int field_idx, value_t *out) {
-  if (obj_id < 0 || obj_id >= n_objects) return 0;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return 0;
   if (field_idx < 0 || field_idx >= MAX_FIELDS) return 0;
   *out = objects[obj_id].fields[field_idx];
   return 1;
 }
 
 int abcl_object_field_set(int obj_id, int field_idx, value_t v) {
-  if (obj_id < 0 || obj_id >= n_objects) return 0;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return 0;
   if (field_idx < 0 || field_idx >= MAX_FIELDS) return 0;
   objects[obj_id].fields[field_idx] = v;
   return 1;
 }
 
 int abcl_object_class_id(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return objects[obj_id].class_id;
 }
 
@@ -253,13 +260,13 @@ int abcl_object_field_render(int obj_id, int field_idx, char *buf, int cap) {
 
 /* H3 RPC: expose total live actor count so the dispatcher LIST command
    can answer without walking the table. */
-int abcl_n_objects(void) { return n_objects; }
+int abcl_n_objects(void) { return rcu_n_objects(); }
 
 /* S3 DeadlineHints: expose the Xinu tid_typ that backs an AIPL actor,
    so the set_deadline builtin can translate an obj_id into the
    actual thread id that the kernel's setdeadline() takes. */
 int abcl_object_tid(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return (int)objects[obj_id].tid;
 }
 
@@ -268,23 +275,23 @@ int abcl_object_tid(int obj_id) {
  * is the current backlog; drops = messages lost to a full mailbox;
  * started = 1 once the actor's consumer thread has been spawned. */
 int abcl_object_enq(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return (int)objects[obj_id].mbox.enq;
 }
 int abcl_object_deq(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return (int)objects[obj_id].mbox.deq;
 }
 int abcl_object_drops(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return (int)objects[obj_id].mbox.drops;
 }
 int abcl_object_started(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return objects[obj_id].started;
 }
 int abcl_object_dead(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   return objects[obj_id].dead;
 }
 
@@ -292,7 +299,7 @@ int abcl_object_dead(int obj_id) {
  * On the 100 Hz Xinu clock, each clkticks unit is 10 ms.  Returns -1
  * for an invalid id. */
 long abcl_object_age_ms(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return -1;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
   unsigned long now = clkticks;
   unsigned long e = objects[obj_id].last_enq_ticks;
   unsigned long d = objects[obj_id].last_deq_ticks;
@@ -301,12 +308,12 @@ long abcl_object_age_ms(int obj_id) {
 }
 
 void abcl_object_protect(int obj_id, int on) {
-  if (obj_id < 0 || obj_id >= n_objects) return;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return;
   objects[obj_id].protected_from_gc = on ? 1 : 0;
 }
 
 int abcl_object_protected(int obj_id) {
-  if (obj_id < 0 || obj_id >= n_objects) return 0;
+  if (obj_id < 0 || obj_id >= rcu_n_objects()) return 0;
   return objects[obj_id].protected_from_gc;
 }
 
@@ -315,8 +322,8 @@ int abcl_object_protected(int obj_id) {
  * count of kills. */
 int abcl_gc_sweep(long threshold_ms, int dry_run, int *out_scanned) {
   int killed = 0, scanned = 0;
-  int i;
-  for (i = 0; i < n_objects; i++) {
+  int i, total = rcu_n_objects();   /* ordered load: see only published slots */
+  for (i = 0; i < total; i++) {
     if (objects[i].dead) continue;
     if (!objects[i].started) continue;
     scanned++;
@@ -360,14 +367,19 @@ void abcl_rt_reset(void) {
   for (i = 0; i < total; i++) objects[i].dead = 1;
   for (i = 0; i < total; i++) signal(objects[i].mbox.items); /* wake blocked */
   sleep(100);                       /* let the worker threads exit their loops */
+  /* RCU reclaim: unpublish the registry FIRST so no new lock-free reader can
+   * start scanning the slots, then wait out a grace period so any reader still
+   * mid-scan has drained — only then is it safe to free the mailbox
+   * semaphores it might have been touching. */
+  wait(objects_mu);
+  rcu_assign_pointer(n_objects, 0);
+  signal(objects_mu);
+  synchronize_rcu();
   for (i = 0; i < total; i++) {
     semfree(objects[i].mbox.items); /* avoid a semaphore leak across resets */
     objects[i].started = 0;
     objects[i].dead    = 0;
   }
-  wait(objects_mu);
-  n_objects = 0;
-  signal(objects_mu);
   kprintf("[aipl] runtime reset — %d actors cleared, next id starts at 0\r\n",
           total);
 }
@@ -2584,9 +2596,18 @@ static void init_fields(int class_id, int self_id) {
 static int alloc_obj(int class_id, int n_args, value_t* args) {
   int id;
   int i;
+  /* RCU writer: reserve a slot index but DO NOT publish it yet.  Lock-free
+   * readers iterate `i < n_objects`, so the slot must be fully initialised
+   * BEFORE n_objects exposes it — otherwise a reader could see a half-built
+   * actor (garbage class_id / an uninitialised mailbox semaphore).  We hold
+   * objects_mu only to serialise concurrent registrations. */
   wait(objects_mu);
-  id = n_objects++;
-  signal(objects_mu);
+  id = n_objects;
+  if (id >= MAX_OBJECTS) {            /* table full — fail instead of overflowing */
+    signal(objects_mu);
+    kprintf("[aipl] alloc_obj: registry full (%d), actor dropped\r\n", MAX_OBJECTS);
+    return -1;
+  }
   objects[id].class_id = class_id;
   for (i = 0; i < MAX_FIELDS; i++) objects[id].fields[i] = mk_int(0L);
   init_fields(class_id, id);
@@ -2597,6 +2618,10 @@ static int alloc_obj(int class_id, int n_args, value_t* args) {
   objects[id].last_enq_ticks = clkticks;
   objects[id].last_deq_ticks = clkticks;
   objects[id].protected_from_gc = 0;
+  /* PUBLISH: the barrier guarantees every store above is visible before the
+   * new count, so a reader that observes id+1 also sees a complete slot. */
+  rcu_assign_pointer(n_objects, id + 1);
+  signal(objects_mu);
   enqueue(-1, id, "init", n_args, args);
   return id;
 }
@@ -2795,10 +2820,15 @@ thread aipl_main(void) {
   /* P3: aggregate mailbox-drop counters across all objects so a
      smoke can verify lock-free MPSC didn't lose messages. */
   {
-    int i;
+    /* RCU read side: walk the registry lock-free for a consistent snapshot of
+     * the per-actor drop counters, concurrent with actor registration. */
+    int i, total;
     uint32_t total_drops = 0;
-    for (i = 0; i < n_objects; i++)
+    rcu_read_lock();
+    total = rcu_n_objects();
+    for (i = 0; i < total; i++)
       total_drops += objects[i].mbox.drops;
+    rcu_read_unlock();
     kprintf("[abcl] done; messages=%d drops=%u tick=%d\r\n",
             messages_processed, (unsigned)total_drops, (int)clkticks);
   }
