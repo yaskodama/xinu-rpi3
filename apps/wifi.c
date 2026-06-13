@@ -1359,6 +1359,13 @@ static int wifi_scan(int *out_count)
                          bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], ch, rssi);
             }
         }
+        /* Directed join (`wifi on` with a known SSID): once the target AP's
+         * beacon arrives we already have its BSSID + channel, so stop the
+         * ~10 s collect-everything scan immediately and go to the join. */
+        if (wifi_tgt_set && wifi_tgt_found) {
+            wifi_log("[wifi] scan: target found early, stopping scan\r\n");
+            break;
+        }
     }
     wifi_log("[wifi] scan: frames=%d chan1=%d (collected %d AP)\r\n",
              nframes, nchan1, nseen);
