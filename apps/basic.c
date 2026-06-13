@@ -1946,6 +1946,11 @@ static void dbg_repl(void) {
         {
             const char *c = cmd;
             char k;
+            /* The windowed full-screen editor returns the whole on-screen line,
+             * which includes the "dbg> " prompt we just printed; skip it. */
+            { const char *pfx = "dbg> "; int i = 0;
+              while (pfx[i] && c[i] == pfx[i]) i++;
+              if (pfx[i] == 0) c += i; }
             while (*c == ' ' || *c == '\t') c++;
             k = b_up(*c);
             if (k == 0 || k == 'S' || k == 'N') { dbg_step = 1; return; }   /* step */
