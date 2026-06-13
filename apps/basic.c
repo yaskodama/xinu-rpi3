@@ -143,6 +143,12 @@ struct basic_state {
     int    gosubtop;
     struct { int rpc; const char *rip; } whilestk[WHILE_MAX];   /* WHILE cond  */
     int    whiletop;
+    /* line debugger (`debug` command): per-instance so two BASIC windows
+     * debug independently. */
+    int    dbg_on;                 /* 1 while a debug session is running   */
+    int    dbg_step;               /* 1 = stop at every line; 0 = run to bp */
+    int    dbg_bp[16];             /* breakpoint line numbers              */
+    int    dbg_nbp;
 };
 static struct basic_state bs[NBASIC];
 
@@ -196,6 +202,10 @@ void basic_bind_thread(int inst)
 #define gosubtop  (bs[basic_curi()].gosubtop)
 #define whilestk  (bs[basic_curi()].whilestk)
 #define whiletop  (bs[basic_curi()].whiletop)
+#define dbg_on    (bs[basic_curi()].dbg_on)
+#define dbg_step  (bs[basic_curi()].dbg_step)
+#define dbg_bp    (bs[basic_curi()].dbg_bp)
+#define dbg_nbp   (bs[basic_curi()].dbg_nbp)
 
 /* Ctrl-C: interrupt instance @inst's running program. */
 void basic_break_n(int inst) { if (inst >= 0 && inst < NBASIC) bs[inst].brk = 1; }
@@ -1858,6 +1868,102 @@ static void exec_stmt(void)
     berr("syntax error");
 }
 
+/* ---- line debugger (the `debug` command) -------------------------------
+ * `debug` runs the loaded program under the debugger, stopping before the
+ * first line.  At each stop a `dbg> ` prompt reads one command from the same
+ * input path as INPUT (the BASIC window's line queue):
+ *   s / <enter>  step one line        c   continue (run to a breakpoint)
+ *   b N          set breakpoint @N     b   list breakpoints
+ *   d N          clear breakpoint @N   d   clear all breakpoints
+ *   p <expr>     evaluate + print      l   list the program
+ *   q            stop the program      h   help
+ */
+static int dbg_atoi(const char *s, int *ok) {
+    int v = 0, any = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; any = 1; }
+    if (ok) *ok = any;
+    return v;
+}
+static int dbg_is_bp(int lineno) {
+    int i;
+    for (i = 0; i < dbg_nbp; i++) if (dbg_bp[i] == lineno) return 1;
+    return 0;
+}
+static void dbg_show_line(void) {
+    char nb[16];
+    emit("["); num_str((double)prog[pc].no, nb); emit(nb); emit("] ");
+    emit(prog[pc].text); emit("\n");
+}
+/* Evaluate an expression string (numeric or string) against the live program
+ * state and print it.  Saves/restores the interpreter cursor so inspecting a
+ * value never disturbs the paused program. */
+static void dbg_print_expr(const char *arg) {
+    const char *save_ip = ip;
+    int save_err = err, save_goto = g_goto;
+    ip = arg; err = 0;
+    skipsp();
+    if (*ip == 0) { emit("?usage: p <expr>\n"); }
+    else if (peek_is_string()) {
+        char s[SVAR_LEN]; seval(s, sizeof s);
+        if (err) emit("?eval error\n"); else { emit("= \""); emit(s); emit("\"\n"); }
+    } else {
+        double v = expr(); char nb[32];
+        if (err) emit("?eval error\n"); else { num_str(v, nb); emit("= "); emit(nb); emit("\n"); }
+    }
+    ip = save_ip; err = save_err; g_goto = save_goto;
+}
+static void dbg_bp_add(int lineno) {
+    char nb[16];
+    if (dbg_is_bp(lineno)) { emit("bp already set\n"); return; }
+    if (dbg_nbp >= 16) { emit("?too many breakpoints\n"); return; }
+    dbg_bp[dbg_nbp++] = lineno;
+    emit("bp set @"); num_str((double)lineno, nb); emit(nb); emit("\n");
+}
+static void dbg_bp_del(int lineno) {
+    int i, j;
+    for (i = 0; i < dbg_nbp; i++) if (dbg_bp[i] == lineno) {
+        for (j = i; j + 1 < dbg_nbp; j++) dbg_bp[j] = dbg_bp[j + 1];
+        dbg_nbp--; emit("bp cleared\n"); return;
+    }
+    emit("no such bp\n");
+}
+static void dbg_bp_list(void) {
+    int i; char nb[16];
+    if (dbg_nbp == 0) { emit("no breakpoints\n"); return; }
+    emit("breakpoints:");
+    for (i = 0; i < dbg_nbp; i++) { emit(" "); num_str((double)dbg_bp[i], nb); emit(nb); }
+    emit("\n");
+}
+/* Interactive prompt at a stop point.  Returns when the user resumes (step or
+ * continue); may set running = 0 to abort the program (`q`). */
+static void dbg_repl(void) {
+    char cmd[128];
+    for (;;) {
+        emit("dbg> ");
+        int n = g_input ? g_input(cmd, sizeof cmd) : -1;
+        if (n < 0) { dbg_on = 0; dbg_step = 0; return; }    /* input closed: detach */
+        {
+            const char *c = cmd;
+            char k;
+            while (*c == ' ' || *c == '\t') c++;
+            k = b_up(*c);
+            if (k == 0 || k == 'S' || k == 'N') { dbg_step = 1; return; }   /* step */
+            if (k == 'C') { dbg_step = 0; return; }                          /* continue */
+            if (k == 'Q') { running = 0; dbg_on = 0; dbg_step = 0; emit("[debug] stopped\n"); return; }
+            if (k == 'P') { dbg_print_expr(c + 1); continue; }              /* print expr */
+            if (k == 'L') { do_list(); continue; }
+            if (k == 'H' || k == '?') {
+                emit("dbg: s step  c cont  b N bp  d N del  p expr  l list  q quit\n");
+                continue;
+            }
+            if (k == 'B') { int ok; int ln = dbg_atoi(c + 1, &ok); if (ok) dbg_bp_add(ln); else dbg_bp_list(); continue; }
+            if (k == 'D') { int ok; int ln = dbg_atoi(c + 1, &ok); if (ok) dbg_bp_del(ln); else { dbg_nbp = 0; emit("all bp cleared\n"); } continue; }
+            emit("?dbg cmd — h for help\n");
+        }
+    }
+}
+
 /* ---- RUN ----------------------------------------------------------- */
 static void do_run(void)
 {
@@ -1871,6 +1977,16 @@ static void do_run(void)
         if (g_break) { g_break = 0; emit("\nBreak\n"); break; }   /* Ctrl-C */
         if (pc < 0 || pc >= nprog) break;
         if (++guard > 8000000L) { emit("\n?runaway stopped\n"); break; }
+
+        /* Debugger stop point: only at the start of a line (ip == line text),
+         * so :-separated statements run as one step.  Stop when single-stepping
+         * or when this line carries a breakpoint. */
+        if (dbg_on && ip == prog[pc].text &&
+            (dbg_step || dbg_is_bp(prog[pc].no))) {
+            dbg_show_line();
+            dbg_repl();
+            if (!running) break;              /* `q` aborted the program */
+        }
 
         g_goto = -1;
         exec_stmt();                          /* runs at the current ip */
@@ -1922,6 +2038,18 @@ void basic_exec_line(const char *line)
             if (!load_named(fn)) { emit("?file not found\n"); return; }
         } else { ip = save; }
         do_run(); return;
+    }
+    if (kw("DEBUG")) {                         /* run under the line debugger */
+        char fn[40]; const char *save = ip;
+        if (parse_quoted(fn, sizeof fn)) {
+            if (!load_named(fn)) { emit("?file not found\n"); return; }
+        } else { ip = save; }
+        if (nprog == 0) { emit("?no program — type some lines first\n"); return; }
+        emit("[debug] s step  c cont  b N bp  p expr  q quit  (h help)\n");
+        dbg_on = 1; dbg_step = 1;              /* stop before the first line */
+        do_run();
+        dbg_on = 0; dbg_step = 0;
+        return;
     }
     /* immediate statement(s) */
     for (;;) {
