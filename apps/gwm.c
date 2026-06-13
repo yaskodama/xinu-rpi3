@@ -692,11 +692,58 @@ static void wm_raise(window_t *w)
 static int  basic_toolbar_hit(int sx, int sy);   /* button index at screen pt, or -1 */
 static void basic_run_button(int idx);           /* run that button's command */
 
+/* ---- right-click pull-down menu --------------------------------------- */
+#define MENU_W  76
+#define MENU_IH 15
+static const char *menu_labels[] = { "Shell", "BASIC" };
+#define NMENU ((int)(sizeof(menu_labels) / sizeof(menu_labels[0])))
+static int menu_open, menu_x, menu_y;            /* desktop coords           */
+static void menu_exec(int sel);                  /* defined after the windows */
+
+/* Index of the menu item at desktop point (dx,dy), or -1. */
+static int menu_hit(int dx, int dy)
+{
+    int rel;
+    if (!menu_open) return -1;
+    if (dx < menu_x || dx >= menu_x + MENU_W) return -1;
+    rel = dy - (menu_y + 2);
+    if (rel < 0 || rel >= NMENU * MENU_IH) return -1;
+    return rel / MENU_IH;
+}
+static void draw_menu(void)
+{
+    int i, h;
+    if (!menu_open) return;
+    h = NMENU * MENU_IH + 4;
+    fill_rect(menu_x, menu_y, MENU_W, h, 0xFF202830U);
+    fill_rect(menu_x, menu_y, MENU_W, 1, 0xFF4878C0U);          /* top edge */
+    fill_rect(menu_x, menu_y, 1, h, 0xFF4878C0U);
+    for (i = 0; i < NMENU; i++)
+        draw_string_at(menu_x + 6, menu_y + 4 + i * MENU_IH, menu_labels[i],
+                       0xFFE6ECF4U, 0xFF202830U);
+}
+
 /* Process the left button each cursor poll: start / continue / end a drag. */
 static void wm_drag_tick(void)
 {
-    static int prev_left = 0;
-    int left = usbmouse_buttons & 1;
+    static int prev_left = 0, prev_right = 0;
+    int left  = usbmouse_buttons & 1;
+    int right = usbmouse_buttons & 2;
+
+    /* Right-click opens the pull-down menu at the cursor. */
+    if (right && !prev_right) {
+        menu_open = 1; menu_x = cursor_x + vp_x; menu_y = cursor_y + vp_y;
+        g_need_full = 1; prev_right = right; prev_left = left; return;
+    }
+    prev_right = right;
+
+    /* While the menu is open, a left click selects an item (or dismisses it). */
+    if (left && !prev_left && menu_open) {
+        int sel = menu_hit(cursor_x + vp_x, cursor_y + vp_y);
+        menu_open = 0; g_need_full = 1;
+        if (sel >= 0) menu_exec(sel);
+        prev_left = left; return;
+    }
 
     /* On a fresh press, a click on a BASIC toolbar button runs its command
      * (edge-triggered so holding doesn't fire it every frame). */
@@ -811,6 +858,7 @@ void wm_run(void)
         }
 
         draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
+        draw_menu();             /* right-click pull-down menu, if open    */
 
         /* Re-stash the patch under the cursor (the content pass may have
          * redrawn there) and draw the sprite on top. */
@@ -1444,6 +1492,19 @@ static void basic_run_button(int idx)
     bas_q[bas_qt][k] = 0;
     bas_qt = (bas_qt + 1) % BAS_QN;
     if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
+}
+
+/* Right-click menu action: open/raise the chosen window. */
+static void menu_exec(int sel)
+{
+    extern int gwin_shell_window_open(void);
+    if (sel == 0) {                              /* Shell */
+        gwin_shell_window_open();                /* show the shell window      */
+        active_win = &sh_win; wm_raise(&sh_win); /* (idempotent) bring to front */
+    } else if (sel == 1) {                       /* BASIC */
+        active_win = &basic_win; wm_raise(&basic_win);
+    }
+    g_need_full = 1;
 }
 
 thread basic_main(void)

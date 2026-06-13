@@ -1527,7 +1527,18 @@ static void norm_name(const char *raw, char *nm, int max)
 /* FILES — list the saved (sample) programs, one per line. */
 static void do_files(void)
 {
-    for (int s = 0; s < NSAMPLE; s++) { emit(samples[s].name); emit("\n"); }
+    /* Lay the names out in columns across the window width (60-char grid):
+     * 4 columns of 15 instead of one name per line. */
+    const int colw = 15, ncol = 4;
+    int col = 0;
+    for (int s = 0; s < NSAMPLE; s++) {
+        const char *nm = samples[s].name;
+        int len = 0; while (nm[len]) len++;
+        emit(nm);
+        if (++col >= ncol) { emit("\n"); col = 0; }
+        else { for (int p = len; p < colw; p++) emitc(' '); }
+    }
+    if (col != 0) emit("\n");
 }
 
 /* Load a named sample into the program buffer; returns 1 on success. */
