@@ -445,6 +445,11 @@ static void paint_scene(unsigned int frame)
 #define SHW_ROWS 56
 #define SHW_COLS 46
 #define NSHELL   2          /* GWINCON0 + GWINCON1 -> two independent shells */
+#define SH_TB_H  16         /* shell toolbar height (px) — one button row     */
+#define SH_BTN_H 12         /* one button's height                            */
+#define SH_ROW_H 16         /* row pitch                                      */
+/* Top of the shell text area, below the title bar + toolbar. */
+#define SH_TXT_TOP(self) ((self)->y + WM_TITLEBAR_H + 2 + SH_TB_H)
 
 /* All per-shell console state, one struct per windowed shell. */
 struct shcon {
@@ -461,6 +466,7 @@ static struct shcon shc[NSHELL];
 /* Forward decls: defined further down, used by gwin_shell_window_open_n(). */
 static void wm_raise(window_t *w);
 static int  g_need_full;
+static window_t *window_at_point(int sx, int sy);   /* topmost window @point */
 /* BASIC windows live in bui[] (full defs in the BASIC section); these
  * accessors let wm_close_window() dismiss one like a shell window. */
 static int  bas_index_of(window_t *w);   /* BASIC window -> instance, else -1 */
@@ -556,6 +562,44 @@ int gwin_shell_dump(char *buf, int max)
     return n;
 }
 
+/* ---- Shell window toolbar: clickable buttons that run a command -------- */
+static int sh_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static const struct { const char *label; const char *cmd; } sh_btns[] = {
+    { "ps",          "ps" },
+    { "wifi on",     "wifi on" },
+    { "wifi status", "wifi status" },
+    { "wifi off",    "wifi off" },
+};
+#define SH_NBTN ((int)(sizeof(sh_btns) / sizeof(sh_btns[0])))
+
+/* Button i's rectangle in desktop coords, laid out left-to-right and wrapped
+ * to a new row when it would overflow the window width. */
+static void sh_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh)
+{
+    int left = self->x + 4, right = self->x + self->width - 2;
+    int x = left, row = 0, k;
+    for (k = 0; ; k++) {
+        int w = sh_slen(sh_btns[k].label) * FONT_WIDTH + 8;
+        if (x + w > right && x > left) { row++; x = left; }   /* wrap */
+        if (k == i) {
+            *bx = x; *by = self->y + WM_TITLEBAR_H + 3 + row * SH_ROW_H;
+            *bw = w; *bh = SH_BTN_H; return;
+        }
+        x += w + 4;
+    }
+}
+static void sh_draw_toolbar(window_t *self)
+{
+    int i, bx, by, bw, bh;
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, SH_TB_H, 0xFF0A1A2AU);
+    for (i = 0; i < SH_NBTN; i++) {
+        sh_btn_rect(self, i, &bx, &by, &bw, &bh);
+        fill_rect(bx, by, bw, bh, 0xFF1E4E8EU);
+        fill_rect(bx, by, bw, 1, 0xFF2E78C0U);              /* top highlight  */
+        draw_string_at(bx + 4, by + 1, sh_btns[i].label, 0xFFE0ECFFU, 0xFF1E4E8EU);
+    }
+}
+
 static void sh_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
@@ -566,7 +610,8 @@ static void sh_draw(window_t *self, unsigned int frame)
                   self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
         s->full_clear = 0;
     }
-    int content_h = self->height - WM_TITLEBAR_H - 7;
+    sh_draw_toolbar(self);
+    int content_h = self->height - (SH_TXT_TOP(self) - self->y) - 3;
     int max_rows = content_h / line_h;
     if (max_rows < 1) return;
     if (max_rows > SHW_ROWS) max_rows = SHW_ROWS;
@@ -576,20 +621,48 @@ static void sh_draw(window_t *self, unsigned int frame)
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % SHW_ROWS;
         if (g_force_redraw || s->row_dirty[r]) {
-            int ry = self->y + WM_TITLEBAR_H + 4 + i * line_h;
+            int ry = SH_TXT_TOP(self) + i * line_h;
             fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
             draw_string_at(self->x + 4, ry, s->ring[r], 0xFFCCE0FFU, self->content_bg);
             if (!g_force_redraw) s->row_dirty[r] = 0;
         }
     }
     {
-        int cr_y = self->y + WM_TITLEBAR_H + 4 + (rows - 1) * line_h;
+        int cr_y = SH_TXT_TOP(self) + (rows - 1) * line_h;
         int cr_x = self->x + 4 + s->cur_col * FONT_WIDTH;
         if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
             unsigned int col = ((frame >> 2) & 1) ? 0xFFFFD23CU : self->content_bg;
             fill_rect(cr_x, cr_y, FONT_WIDTH, FONT_HEIGHT, col);
         }
     }
+}
+
+/* Click test (screen coords): index of the shell toolbar button under the
+ * point, or -1; *minor returns which shell window was hit. */
+static int sh_toolbar_hit(int sx, int sy, int *minor)
+{
+    int dx = sx + vp_x, dy = sy + vp_y, i, bx, by, bw, bh, mi;
+    window_t *top = window_at_point(sx, sy);
+    mi = sh_index_of_strict(top);
+    if (mi < 0) return -1;
+    if (minor) *minor = mi;
+    for (i = 0; i < SH_NBTN; i++) {
+        sh_btn_rect(top, i, &bx, &by, &bw, &bh);
+        if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) return i;
+    }
+    return -1;
+}
+/* Run a toolbar command on shell @minor by feeding it into that shell's stdin
+ * exactly as if typed (character by character + Enter). */
+static void sh_run_button(int minor, int idx)
+{
+    extern void gwincon_feed(int, int);
+    const char *cmd;
+    int k;
+    if (minor < 0 || minor >= NSHELL || idx < 0 || idx >= SH_NBTN) return;
+    cmd = sh_btns[idx].cmd;
+    for (k = 0; cmd[k]; k++) gwincon_feed(minor, (int)cmd[k]);
+    gwincon_feed(minor, '\n');
 }
 
 /* Open (idempotently) shell window @idx and add it to the WM. */
@@ -822,6 +895,12 @@ static void wm_drag_tick(void)
     if (left && !prev_left) {
         int bi = 0, b = basic_toolbar_hit(cursor_x, cursor_y, &bi);
         if (b >= 0) { basic_run_button(bi, b); prev_left = left; return; }
+    }
+    /* Likewise, a click on a Shell toolbar button feeds its command to that
+     * shell's stdin (ps / wifi on / wifi status / wifi off). */
+    if (left && !prev_left) {
+        int mi = 0, b = sh_toolbar_hit(cursor_x, cursor_y, &mi);
+        if (b >= 0) { sh_run_button(mi, b); prev_left = left; return; }
     }
     prev_left = left;
 
