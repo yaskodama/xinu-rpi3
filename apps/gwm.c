@@ -1168,6 +1168,64 @@ static void bas_line(int x1, int y1, int x2, int y2, int color)
         if (e2 <= dx) { err += dx; y1 += sy; }
     }
 }
+/* CIRCLE (cx,cy),r,color: outline circle (midpoint algorithm). */
+static void bas_circle(int cx, int cy, int r, int color)
+{
+    int gx0, gy0, gw, gh, x = r, y = 0, err = 1 - r;
+    unsigned int col = bas_palette(color);
+    bas_gfx_rect(&gx0, &gy0, &gw, &gh);
+    bas_gfx = 1;
+    if (r < 0) return;
+#define BAS_PX(px, py) do { int ax = (px), ay = (py); \
+        if (ax >= 0 && ax < gw && ay >= 0 && ay < gh) fill_rect(gx0 + ax, gy0 + ay, 1, 1, col); } while (0)
+    while (x >= y) {
+        BAS_PX(cx + x, cy + y); BAS_PX(cx - x, cy + y);
+        BAS_PX(cx + x, cy - y); BAS_PX(cx - x, cy - y);
+        BAS_PX(cx + y, cy + x); BAS_PX(cx - y, cy + x);
+        BAS_PX(cx + y, cy - x); BAS_PX(cx - y, cy - x);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+#undef BAS_PX
+}
+/* WIFI ON|OFF|STATUS from BASIC (mirrors the `wifi` shell command). */
+static void bas_wifi(int action)
+{
+    extern int   wifi_connected(void);
+    extern const char *wifi_ssid(void);
+    extern int   wifi_join(const char *, const char *);
+    extern int   wifi_dhcp(void);
+    extern void  wifi_disconnect(void);
+    extern void  wifi_serve_start(void);
+    extern void  wifi_dhcp_diag(unsigned char *, unsigned char *, int *);
+    extern int   wifi_load_cfg(char *, int, char *, int);
+    char line[80];
+
+    if (action == 0) { wifi_disconnect(); bas_emit("WiFi: disconnected\n"); return; }
+    if (action == 2) {
+        if (wifi_connected()) {
+            unsigned char ip[4], gw[4]; int have = 0;
+            bas_emit("WiFi: connected to "); bas_emit(wifi_ssid()); bas_emit("\n");
+            wifi_dhcp_diag(ip, gw, &have);
+            if (have) { sprintf(line, "  ip %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]); bas_emit(line); }
+        } else bas_emit("WiFi: not connected\n");
+        return;
+    }
+    /* action 1 = on: connect to the saved /microsd/wifi.txt network */
+    if (wifi_connected()) { bas_emit("WiFi: already connected\n"); return; }
+    {
+        char ssid[40], pass[68];
+        if (wifi_load_cfg(ssid, sizeof ssid, pass, sizeof pass) != 0) {
+            bas_emit("WiFi: no /microsd/wifi.txt\n"); return;
+        }
+        bas_emit("WiFi: connecting to "); bas_emit(ssid); bas_emit(" ...\n");
+        if (wifi_join(ssid, pass) != 0) { bas_emit("WiFi: join failed\n"); return; }
+        if (wifi_dhcp() != 0 || !wifi_connected()) { bas_emit("WiFi: DHCP failed\n"); return; }
+        wifi_serve_start();
+        bas_wifi(2);
+    }
+}
 static void bas_pause(int ms)
 {
     if (ms < 0) ms = 0;
@@ -1387,6 +1445,10 @@ thread basic_main(void)
         basic_set_plot(bas_plot);
         basic_set_pause(bas_pause);
         basic_set_line(bas_line);
+        { extern void basic_set_circle(void (*)(int, int, int, int));
+          extern void basic_set_wifi(void (*)(int));
+          basic_set_circle(bas_circle);
+          basic_set_wifi(bas_wifi); }
     }
     basic_init();
     bas_emit("Xinu BASIC ready.  Full-screen editor:\n"

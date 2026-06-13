@@ -35,7 +35,7 @@ static void wifi_rstrip(char *s)
 }
 /* Read /microsd/wifi.txt and parse `ssid=` / `pass=` (with '#' comments).
  * Returns 0 if at least an SSID was found, -1 otherwise. */
-static int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
+int wifi_load_cfg(char *ssid, int sl, char *pass, int pl)
 {
     struct fat_dirent e;
     char raw[640];
