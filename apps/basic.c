@@ -92,6 +92,24 @@ static struct { int no; char text[PLINELEN]; } prog[MAXPROG];
 static int    nprog;
 static double vars[26 * 11];          /* A..Z (col 0), A0..Z9 (cols 1..10) */
 
+/* String variables A$..Z$ and A0$..Z9$ — same 26*11 layout as vars[]. */
+#define SVAR_LEN 64
+static char svars[26 * 11][SVAR_LEN];
+
+/* Numeric arrays A(..)..Z(..), 1-D or 2-D, carved from a shared pool by
+ * DIM (or auto-dimensioned to (10) on first subscript, classic-BASIC
+ * style).  arrtab[L].ndim==0 means letter L has no array yet. */
+#define ARR_POOL 2048
+static double arrpool[ARR_POOL];
+static int    arrtop;
+static struct { int base, d1, d2, ndim; } arrtab[26];
+
+/* DATA/READ/RESTORE cursor: data_pc = prog[] index of the DATA line being
+ * read (-1 before the first READ / after RESTORE); data_ip walks its
+ * items, NULL forces a re-scan from data_pc+1. */
+static int         data_pc = -1;
+static const char *data_ip;
+
 /* ---- runtime state ------------------------------------------------- */
 static int         running;
 static int         pc;                /* current prog[] index while running */
@@ -106,6 +124,9 @@ static int fortop;
 #define GOSUB_MAX 24
 static struct { int pc; const char *ip; } gosubstk[GOSUB_MAX];   /* return addr */
 static int gosubtop;
+#define WHILE_MAX 16
+static struct { int pc; const char *ip; } whilestk[WHILE_MAX];   /* the WHILE's condition */
+static int whiletop;
 
 static void berr(const char *m)
 { if (err) return; err = 1; int i = 0; for (; m[i] && i < (int)sizeof errmsg - 1; i++) errmsg[i] = m[i]; errmsg[i] = 0; }
@@ -128,6 +149,10 @@ static int varidx(void)
 }
 
 static double expr(void);
+static void   seval(char *out, int max);   /* evaluate a string expression  */
+static int    peek_is_string(void);        /* does a string factor come next? */
+static double *arr_elem(int li);           /* &A(i[,j]); ip at '(' on entry  */
+static void   paren_sexpr(char *out, int max);
 static double factor(void)
 {
     skipsp();
@@ -149,6 +174,22 @@ static double factor(void)
         static unsigned long s = 22695477UL;
         s = s * 1103515245UL + 12345UL;
         return (double)((s >> 16) & 0x7FFF) / 32768.0; }
+    if (kw("LEN")) { char s[SVAR_LEN]; paren_sexpr(s, sizeof s);
+        int n = 0; while (s[n]) n++; return (double)n; }
+    if (kw("ASC")) { char s[SVAR_LEN]; paren_sexpr(s, sizeof s);
+        return (double)(unsigned char)s[0]; }
+    if (kw("VAL")) { char s[SVAR_LEN]; paren_sexpr(s, sizeof s);
+        const char *q = s; while (*q == ' ') q++;
+        int neg = 0; if (*q == '-') { neg = 1; q++; } else if (*q == '+') q++;
+        double v = 0, f; while (b_isdigit(*q)) v = v * 10 + (*q++ - '0');
+        if (*q == '.') { q++; f = 0.1; while (b_isdigit(*q)) { v += (*q++ - '0') * f; f *= 0.1; } }
+        return neg ? -v : v; }
+    /* A(i[,j]) array element — a single letter immediately followed by '('
+     * (multi-letter names were matched as functions above). */
+    { const char *save = ip; skipsp();
+      if (b_isalpha(*ip) && ip[1] == '(') { int li = b_up(*ip) - 'A'; ip++;
+          double *e = arr_elem(li); return e ? *e : 0; }
+      ip = save; }
     { const char *save = ip; int vi = varidx(); if (vi >= 0) return vars[vi]; ip = save; berr("syntax"); return 0; }
 }
 static double power(void)
@@ -160,8 +201,15 @@ static double power(void)
 static double term(void)
 {
     double v = power(); skipsp();
-    while (*ip == '*' || *ip == '/') { char op = *ip++; double r = power();
-        if (op == '*') v *= r; else { if (r == 0) berr("div0"); else v /= r; } skipsp(); }
+    for (;;) {
+        if (*ip == '*' || *ip == '/') { char op = *ip++; double r = power();
+            if (op == '*') v *= r; else { if (r == 0) berr("div0"); else v /= r; } }
+        else if (kw("MOD")) { double r = power();
+            long a = (long)v, b = (long)r; if (b == 0) { berr("div0"); }
+            else v = (double)(a - (a / b) * b); }
+        else break;
+        skipsp();
+    }
     return v;
 }
 static double addsub(void)
@@ -172,6 +220,22 @@ static double addsub(void)
 }
 static double relexpr(void)
 {
+    if (peek_is_string()) {                      /* string relational compare */
+        char l[SVAR_LEN]; seval(l, sizeof l); skipsp();
+        char a = *ip, b = ip[1]; int op = 0;
+        if (a == '<' && b == '=') { op = 4; ip += 2; }
+        else if (a == '>' && b == '=') { op = 5; ip += 2; }
+        else if (a == '<' && b == '>') { op = 6; ip += 2; }
+        else if (a == '<') { op = 1; ip++; }
+        else if (a == '>') { op = 2; ip++; }
+        else if (a == '=') { op = 3; ip++; }
+        if (!op) { berr("string relop"); return 0; }
+        char r[SVAR_LEN]; seval(r, sizeof r);
+        const char *x = l, *y = r; while (*x && *x == *y) { x++; y++; }
+        int c = (int)(unsigned char)*x - (int)(unsigned char)*y;
+        switch (op) { case 1: return c < 0; case 2: return c > 0; case 3: return c == 0;
+                      case 4: return c <= 0; case 5: return c >= 0; default: return c != 0; }
+    }
     double v = addsub(); skipsp();
     char a = *ip, b = ip[1]; int op = 0;
     if (a == '<' && b == '=') { op = 4; ip += 2; }
@@ -192,6 +256,168 @@ static double expr(void)
                else if (kw("OR")) { double r = relexpr(); v = (v != 0 || r != 0); }
                else break; skipsp(); }
     return v;
+}
+
+/* ---- string variables, string expressions ------------------------- */
+
+/* Parse a string-variable name (letter, optional digit, '$') at ip.
+ * Returns the 0..285 slot index and consumes it, or -1 (ip unchanged). */
+static int svaridx(void)
+{
+    skipsp(); const char *p = ip;
+    if (!b_isalpha(*p)) return -1;
+    int base = b_up(*p) - 'A', col = 0; p++;
+    if (b_isdigit(*p)) { col = (*p - '0') + 1; p++; }
+    if (*p != '$') return -1;
+    ip = p + 1;
+    return base * 11 + col;
+}
+
+/* True if the next factor is a string (literal, A$/A1$ var, or a $-suffixed
+ * function like MID$): a run of letters [+ one digit] ending in '$'. */
+static int peek_is_string(void)
+{
+    skipsp();
+    if (*ip == '"') return 1;
+    const char *p = ip;
+    if (!b_isalpha(*p)) return 0;
+    while (b_isalpha(*p)) p++;
+    if (b_isdigit(*p)) p++;
+    return *p == '$';
+}
+
+static void scopy(char *out, int max, const char *src)
+{
+    int n = 0; while (src[n] && n < max - 1) { out[n] = src[n]; n++; } out[n] = 0;
+}
+
+/* string '(' numeric-or-string ')' helper used by LEN/ASC/VAL/CHR$/STR$ */
+static void paren_sexpr(char *out, int max)
+{
+    skipsp(); int par = 0; if (*ip == '(') { ip++; par = 1; }
+    seval(out, max);
+    skipsp(); if (par) { if (*ip == ')') ip++; else berr("expected )"); }
+}
+static double paren_num(void)
+{
+    skipsp(); int par = 0; if (*ip == '(') { ip++; par = 1; }
+    double v = expr();
+    skipsp(); if (par) { if (*ip == ')') ip++; else berr("expected )"); }
+    return v;
+}
+
+static void sfactor(char *out, int max)
+{
+    skipsp(); out[0] = 0;
+    if (*ip == '"') { int n = 0; ip++; while (*ip && *ip != '"' && n < max - 1) out[n++] = *ip++;
+                      out[n] = 0; if (*ip == '"') ip++; return; }
+    if (*ip == '(') { ip++; seval(out, max); skipsp(); if (*ip == ')') ip++; else berr("expected )"); return; }
+    if (kw("MID$")) {                                   /* MID$(s, start [, len]) */
+        char s[SVAR_LEN]; skipsp(); if (*ip == '(') ip++; else berr("MID$ (");
+        seval(s, sizeof s); skipsp(); if (*ip == ',') ip++; else berr("MID$ ,");
+        int start = (int)expr(); int len = max; skipsp();
+        if (*ip == ',') { ip++; len = (int)expr(); skipsp(); }
+        if (*ip == ')') ip++; else berr("MID$ )");
+        int slen = 0; while (s[slen]) slen++;
+        int i = start - 1; if (i < 0) i = 0; int n = 0;
+        while (i < slen && n < len && n < max - 1) out[n++] = s[i++]; out[n] = 0; return;
+    }
+    if (kw("LEFT$")) {                                  /* LEFT$(s, n) */
+        char s[SVAR_LEN]; skipsp(); if (*ip == '(') ip++; else berr("LEFT$ (");
+        seval(s, sizeof s); skipsp(); if (*ip == ',') ip++; else berr("LEFT$ ,");
+        int len = (int)expr(); skipsp(); if (*ip == ')') ip++; else berr("LEFT$ )");
+        int n = 0; while (s[n] && n < len && n < max - 1) { out[n] = s[n]; n++; } out[n] = 0; return;
+    }
+    if (kw("RIGHT$")) {                                 /* RIGHT$(s, n) */
+        char s[SVAR_LEN]; skipsp(); if (*ip == '(') ip++; else berr("RIGHT$ (");
+        seval(s, sizeof s); skipsp(); if (*ip == ',') ip++; else berr("RIGHT$ ,");
+        int len = (int)expr(); skipsp(); if (*ip == ')') ip++; else berr("RIGHT$ )");
+        int slen = 0; while (s[slen]) slen++;
+        int i = slen - len; if (i < 0) i = 0; int n = 0;
+        while (s[i] && n < max - 1) out[n++] = s[i++]; out[n] = 0; return;
+    }
+    if (kw("CHR$")) { int c = (int)paren_num(); out[0] = (char)c; out[1] = 0; return; }
+    if (kw("STR$")) { double v = paren_num(); num_str(v, out); return; }
+    { const char *save = ip; int si = svaridx(); if (si >= 0) { scopy(out, max, svars[si]); return; } ip = save; }
+    berr("string expr"); out[0] = 0;
+}
+
+static void seval(char *out, int max)                   /* '+' concatenation */
+{
+    sfactor(out, max); skipsp();
+    while (*ip == '+') { ip++; char rhs[SVAR_LEN]; sfactor(rhs, sizeof rhs);
+        int n = 0; while (out[n]) n++;
+        for (int i = 0; rhs[i] && n < max - 1; i++) out[n++] = rhs[i]; out[n] = 0; skipsp(); }
+}
+
+/* ---- arrays -------------------------------------------------------- */
+
+/* Return &A(i[,j]).  ip is positioned at '(' on entry.  Auto-dimensions an
+ * undeclared letter to (10).  Sets err + returns NULL on overflow / bad
+ * subscript. */
+static double *arr_elem(int li)
+{
+    if (arrtab[li].ndim == 0) {                         /* auto-DIM to (10) */
+        if (arrtop + 11 > ARR_POOL) { berr("array space"); return 0; }
+        arrtab[li].base = arrtop; arrtab[li].d1 = 11; arrtab[li].d2 = 1; arrtab[li].ndim = 1;
+        for (int k = 0; k < 11; k++) arrpool[arrtop + k] = 0; arrtop += 11;
+    }
+    if (*ip == '(') ip++; else { berr("array ("); return 0; }
+    int i1 = (int)expr(), i2 = 0; skipsp();
+    if (*ip == ',') { ip++; i2 = (int)expr(); skipsp(); }
+    if (*ip == ')') ip++; else { berr("array )"); return 0; }
+    if (i1 < 0 || i1 >= arrtab[li].d1 || i2 < 0 || i2 >= arrtab[li].d2) { berr("subscript"); return 0; }
+    return &arrpool[arrtab[li].base + i1 * arrtab[li].d2 + i2];
+}
+
+/* ---- DATA / READ --------------------------------------------------- */
+
+/* Does text t begin with keyword k (case-insensitive), not glued to more
+ * letters/digits?  Used to scan ahead for WHILE/WEND nesting. */
+static int b_streqi_kw(const char *t, const char *k)
+{
+    int i = 0; while (k[i]) { if (b_up(t[i]) != k[i]) return 0; i++; }
+    return !(b_isalpha(t[i]) || b_isdigit(t[i]));
+}
+
+/* Is prog[i].text a DATA statement?  (leading spaces then DATA keyword) */
+static int line_is_data(const char *t)
+{
+    while (*t == ' ' || *t == '\t') t++;
+    const char *k = "DATA"; int i = 0;
+    while (k[i]) { if (b_up(*t) != k[i]) return 0; t++; i++; }
+    return !(b_isalpha(*t) || b_isdigit(*t));
+}
+
+/* Fetch the next DATA item into out[].  Returns 0 when DATA is exhausted. */
+static int data_next(char *out, int max)
+{
+    for (;;) {
+        if (data_ip == 0 || *data_ip == 0) {
+            int start = (data_pc < 0) ? 0 : data_pc + 1, found = -1;
+            for (int i = start; i < nprog; i++) if (line_is_data(prog[i].text)) { found = i; break; }
+            if (found < 0) return 0;
+            data_pc = found; const char *t = prog[found].text;
+            while (*t == ' ' || *t == '\t') t++; t += 4;     /* skip "DATA" */
+            data_ip = t;
+        }
+        while (*data_ip == ' ' || *data_ip == '\t' || *data_ip == ',') data_ip++;
+        if (*data_ip == 0) continue;
+        int n = 0;
+        if (*data_ip == '"') { data_ip++; while (*data_ip && *data_ip != '"' && n < max - 1) out[n++] = *data_ip++;
+                               if (*data_ip == '"') data_ip++; }
+        else { while (*data_ip && *data_ip != ',' && n < max - 1) out[n++] = *data_ip++;
+               while (n > 0 && (out[n-1] == ' ' || out[n-1] == '\t')) n--; }
+        out[n] = 0; return 1;
+    }
+}
+static double str_to_num(const char *q)
+{
+    while (*q == ' ') q++; int neg = 0;
+    if (*q == '-') { neg = 1; q++; } else if (*q == '+') q++;
+    double v = 0, f; while (b_isdigit(*q)) v = v * 10 + (*q++ - '0');
+    if (*q == '.') { q++; f = 0.1; while (b_isdigit(*q)) { v += (*q++ - '0') * f; f *= 0.1; } }
+    return neg ? -v : v;
 }
 
 /* ---- program edit -------------------------------------------------- */
@@ -249,6 +475,32 @@ static const char *S_rotate[] = {
     "130 END"
 };
 
+/* New-feature demos: strings, arrays (DIM), WHILE/WEND + MOD, DATA/READ. */
+static const char *S_strings[] = {
+    "10 A$=\"HELLO\"", "20 B$=\"WORLD\"", "30 C$=A$+\", \"+B$+\"!\"",
+    "40 PRINT C$", "50 PRINT \"LENGTH=\";LEN(C$)",
+    "60 PRINT \"UPPER 5: \";LEFT$(C$,5)", "70 PRINT \"MID: \";MID$(C$,8,5)" };
+static const char *S_bsort[] = {                 /* bubble sort an array */
+    "10 DIM A(7)", "20 FOR I=0 TO 7", "30 READ A(I)", "40 NEXT",
+    "50 DATA 5,2,9,1,7,3,8,4",
+    "60 FOR I=0 TO 6", "70 FOR J=0 TO 6-I",
+    "80 IF A(J)<=A(J+1) THEN GOTO 120",
+    "90 T=A(J) : A(J)=A(J+1) : A(J+1)=T",
+    "120 NEXT", "130 NEXT",
+    "140 FOR I=0 TO 7 : PRINT A(I);\" \"; : NEXT : PRINT" };
+static const char *S_fizz[] = {                  /* FizzBuzz: MOD + multi-stmt */
+    "10 FOR N=1 TO 20",
+    "20 IF N MOD 15=0 THEN PRINT \"FIZZBUZZ\" : GOTO 60",
+    "30 IF N MOD 3=0 THEN PRINT \"FIZZ\" : GOTO 60",
+    "40 IF N MOD 5=0 THEN PRINT \"BUZZ\" : GOTO 60",
+    "50 PRINT N", "60 NEXT" };
+static const char *S_table[] = {                 /* DATA/READ name=value table */
+    "10 FOR I=1 TO 3", "20 READ N$,V", "30 PRINT N$;\" = \";V", "40 NEXT",
+    "50 DATA \"APPLE\",10,\"BANANA\",20,\"CHERRY\",30" };
+static const char *S_count[] = {                 /* WHILE/WEND countdown */
+    "10 N=10", "20 WHILE N>0", "30 PRINT N;\" \";", "40 N=N-1", "50 WEND",
+    "60 PRINT \"LIFTOFF!\"" };
+
 static const struct { const char *name; const char *const *line; int n; } samples[] = {
     { "hello.bas",   S_hello,   2 },
     { "forloop.bas", S_forloop, 3 },
@@ -258,6 +510,11 @@ static const struct { const char *name; const char *const *line; int n; } sample
     { "fibon.bas",   S_fibon,   8 },
     { "squares.bas", S_squares, 4 },
     { "rotate.bas",  S_rotate,  15 },
+    { "strings.bas", S_strings, 7 },
+    { "bsort.bas",   S_bsort,   12 },
+    { "fizz.bas",    S_fizz,    6 },
+    { "table.bas",   S_table,   5 },
+    { "count.bas",   S_count,   6 },
 };
 #define NSAMPLE ((int)(sizeof(samples) / sizeof(samples[0])))
 
@@ -327,7 +584,7 @@ static void do_print(void)
     for (;;) {
         skipsp();
         if (*ip == 0 || *ip == ':') break;
-        if (*ip == '"') { ip++; while (*ip && *ip != '"') emitc(*ip++); if (*ip == '"') ip++; }
+        if (peek_is_string()) { char s[SVAR_LEN]; seval(s, sizeof s); emit(s); }
         else { double v = expr(); char nb[40]; num_str(v, nb); emit(nb); }
         skipsp(); trailing = 0;
         if (*ip == ';') { ip++; trailing = 1; }
@@ -345,6 +602,12 @@ static void do_input(void)
     if (n < 0) { berr("no input"); return; }
     const char *src = inbuf;
     for (;;) {
+        const char *save = ip; int si = svaridx();
+        if (si >= 0) { while (*src == ' ' || *src == ',') src++;
+            int n = 0; while (*src && *src != ',' && n < SVAR_LEN - 1) svars[si][n++] = *src++;
+            while (n > 0 && svars[si][n-1] == ' ') n--; svars[si][n] = 0;
+            skipsp(); if (*ip == ',') { ip++; continue; } break; }
+        ip = save;
         int vi = varidx(); if (vi < 0) { berr("INPUT var"); return; }
         while (*src == ' ' || *src == ',') src++;
         int neg = 0; double v = 0, f;
@@ -365,7 +628,9 @@ static void exec_stmt(void)
     if (*ip == '?') { ip++; do_print(); return; }
     if (kw("PRINT")) { do_print(); return; }
     if (kw("LIST")) { do_list(); return; }
-    if (kw("NEW"))  { nprog = 0; for (int i = 0; i < 26 * 11; i++) vars[i] = 0; emit("Ok\n"); return; }
+    if (kw("NEW"))  { nprog = 0; for (int i = 0; i < 26 * 11; i++) { vars[i] = 0; svars[i][0] = 0; }
+                      arrtop = 0; for (int i = 0; i < 26; i++) arrtab[i].ndim = 0;
+                      whiletop = 0; data_pc = -1; data_ip = 0; emit("Ok\n"); return; }
     if (kw("END") || kw("STOP")) { running = 0; return; }
     if (kw("GOTO"))  { g_goto = (int)expr(); return; }
     if (kw("GOSUB")) { int tgt = (int)expr();
@@ -419,7 +684,72 @@ static void exec_stmt(void)
         return;
     }
     if (kw("PAUSE")) { int ms = (int)expr(); if (g_pause) g_pause(ms); return; }
+    if (kw("DIM")) {
+        for (;;) { skipsp(); if (!b_isalpha(*ip)) { berr("DIM var"); return; }
+            int li = b_up(*ip) - 'A'; ip++; skipsp();
+            if (*ip != '(') { berr("DIM ("); return; } ip++;
+            int d1 = (int)expr() + 1, d2 = 1, nd = 1; skipsp();
+            if (*ip == ',') { ip++; d2 = (int)expr() + 1; nd = 2; skipsp(); }
+            if (*ip != ')') { berr("DIM )"); return; } ip++;
+            int sz = d1 * d2;
+            if (d1 < 1 || d2 < 1 || arrtop + sz > ARR_POOL) { berr("array space"); return; }
+            arrtab[li].base = arrtop; arrtab[li].d1 = d1; arrtab[li].d2 = d2; arrtab[li].ndim = nd;
+            for (int k = 0; k < sz; k++) arrpool[arrtop + k] = 0; arrtop += sz;
+            skipsp(); if (*ip == ',') { ip++; continue; } break; }
+        return;
+    }
+    if (kw("DATA")) { while (*ip) ip++; return; }        /* inert when reached */
+    if (kw("RESTORE")) { data_pc = -1; data_ip = 0; skipsp();
+        if (b_isdigit(*ip)) { int idx = find_line((int)expr()); if (idx >= 0) data_pc = idx - 1; }
+        return;
+    }
+    if (kw("READ")) {
+        for (;;) { char tok[SVAR_LEN]; skipsp(); const char *save = ip; int si = svaridx();
+            if (si >= 0) { if (!data_next(tok, sizeof tok)) { berr("out of DATA"); return; } scopy(svars[si], SVAR_LEN, tok); }
+            else if (b_isalpha(*ip) && ip[1] == '(') {       /* READ into A(i[,j]) */
+                int li = b_up(*ip) - 'A'; ip++; double *e = arr_elem(li);
+                if (!data_next(tok, sizeof tok)) { berr("out of DATA"); return; } if (e) *e = str_to_num(tok); }
+            else { ip = save; int vi = varidx(); if (vi < 0) { berr("READ var"); return; }
+                   if (!data_next(tok, sizeof tok)) { berr("out of DATA"); return; } vars[vi] = str_to_num(tok); }
+            skipsp(); if (*ip == ',') { ip++; continue; } break; }
+        return;
+    }
+    if (kw("WHILE")) {
+        const char *cond_ip = ip; int cond_pc = pc;
+        double c = expr();
+        if (c != 0) {
+            if (whiletop < WHILE_MAX) { whilestk[whiletop].pc = cond_pc; whilestk[whiletop].ip = cond_ip; whiletop++; }
+            else berr("WHILE overflow");
+        } else {                                          /* skip to matching WEND */
+            int depth = 1;
+            for (int i = pc + 1; i < nprog; i++) {
+                const char *t = prog[i].text; while (*t == ' ' || *t == '\t') t++;
+                if (b_streqi_kw(t, "WHILE")) depth++;
+                else if (b_streqi_kw(t, "WEND")) { if (--depth == 0) { pc = i; ip = prog[i].text;
+                    while (*ip) ip++; g_goto = -2; return; } }
+            }
+            berr("WHILE without WEND");
+        }
+        return;
+    }
+    if (kw("WEND")) {
+        if (whiletop == 0) { berr("WEND without WHILE"); return; }
+        int t = whiletop - 1; const char *after_ip = ip; int after_pc = pc;
+        ip = whilestk[t].ip; pc = whilestk[t].pc;
+        double c = expr();
+        if (c != 0) { g_goto = -2; }                      /* loop: resume body after cond */
+        else { whiletop--; ip = after_ip; pc = after_pc; }/* exit: continue after WEND */
+        return;
+    }
     (void)kw("LET");
+    { const char *save = ip; int si = svaridx(); skipsp();           /* A$ = strexpr */
+      if (si >= 0 && *ip == '=') { ip++; seval(svars[si], SVAR_LEN); return; }
+      ip = save; }
+    { const char *save = ip; skipsp();                               /* A(i[,j]) = expr */
+      if (b_isalpha(*ip) && ip[1] == '(') { int li = b_up(*ip) - 'A'; ip++;
+          double *e = arr_elem(li); skipsp();
+          if (e && *ip == '=') { ip++; *e = expr(); return; } }
+      ip = save; }
     { const char *save = ip; int vi = varidx(); skipsp();
       if (vi >= 0 && *ip == '=') { ip++; vars[vi] = expr(); return; }
       ip = save; }
@@ -429,7 +759,9 @@ static void exec_stmt(void)
 /* ---- RUN ----------------------------------------------------------- */
 static void do_run(void)
 {
-    running = 1; fortop = 0; gosubtop = 0; err = 0;
+    running = 1; fortop = 0; gosubtop = 0; whiletop = 0; err = 0;
+    data_pc = -1; data_ip = 0;                 /* rewind DATA          */
+    arrtop = 0; for (int i = 0; i < 26; i++) arrtab[i].ndim = 0;   /* clear arrays (re-DIM) */
     if (nprog == 0) { running = 0; emit("Ok\n"); return; }
     pc = 0; ip = prog[0].text;
     long guard = 0;
@@ -499,7 +831,9 @@ void basic_exec_line(const char *line)
     emit("Ok\n");
 }
 
-void basic_init(void) { nprog = 0; for (int i = 0; i < 26 * 11; i++) vars[i] = 0; running = 0; }
+void basic_init(void) { nprog = 0; for (int i = 0; i < 26 * 11; i++) { vars[i] = 0; svars[i][0] = 0; }
+    arrtop = 0; for (int i = 0; i < 26; i++) arrtab[i].ndim = 0;
+    whiletop = 0; data_pc = -1; data_ip = 0; running = 0; }
 
 #ifdef BASIC_HOST_TEST
 static void host_emit(const char *s) { fputs(s, stdout); }
