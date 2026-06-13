@@ -3150,11 +3150,20 @@ int wifi_scan_ssids(char ssids[][40], int max)
 void wifi_disconnect(void)
 {
     /* Bare WLC_DOWN: simple + reliable (a WLC_DISASSOC here wedged the SDIO
-     * control path on real hardware).  The reconnect's clean-association reset
-     * is handled in wifi_do_join() instead, with the MAC already down. */
+     * control path on real hardware). */
     wifi_cmd_int(WLC_DOWN, 1);
     wifi_have_ip = 0;
     wifi_cur_ssid[0] = 0;
+    /* Force a FULL chip re-bring-up on the next wifi_join().  The shared Arasan
+     * EMMC controller + SDIO backplane/clock state do not survive a disconnect
+     * intact, so a bare re-join finds the control path dead (every ioctl rc=-1,
+     * zero firmware events — see `wifi diag`).  wifi_bringup() replays the exact
+     * sequence that worked at first connect: WL_REG_ON reset, GPIO34-39->ALT3,
+     * Arasan host init, F1 enable, firmware download (RAM-embedded — no SD), and
+     * the SDPCM 'ver' check.  Re-running wifi_radio_up() too (event_msgs / clm /
+     * country / mpc=0). */
+    wifi_ready = 0;
+    wifi_radio_done = 0;
 }
 
 /* Join (connect to) an access point. */
