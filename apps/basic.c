@@ -125,6 +125,8 @@ static const char *ip;                /* statement cursor                   */
 static int         err;
 static char        errmsg[64];
 static int         g_goto;            /* -1 none, -2 pc/ip already set, >=0 target line */
+static volatile int g_break;          /* set by Ctrl-C to interrupt a running program */
+void basic_break(void) { g_break = 1; }
 
 #define FOR_MAX 32
 static struct { int var; double limit, step; int idx; const char *stmt; } forstk[FOR_MAX];
@@ -1785,13 +1787,14 @@ static void exec_stmt(void)
 /* ---- RUN ----------------------------------------------------------- */
 static void do_run(void)
 {
-    running = 1; fortop = 0; gosubtop = 0; whiletop = 0; err = 0;
+    running = 1; fortop = 0; gosubtop = 0; whiletop = 0; err = 0; g_break = 0;
     data_pc = -1; data_ip = 0;                 /* rewind DATA          */
     var_clear_all();                                              /* clear vars/arrays */
     if (nprog == 0) { running = 0; emit("Ok\n"); return; }
     pc = 0; ip = prog[0].text;
     long guard = 0;
     while (running) {
+        if (g_break) { g_break = 0; emit("\nBreak\n"); break; }   /* Ctrl-C */
         if (pc < 0 || pc >= nprog) break;
         if (++guard > 8000000L) { emit("\n?runaway stopped\n"); break; }
 

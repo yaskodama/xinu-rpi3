@@ -163,6 +163,13 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
                 uchar c = keymap[usage_id][mod_idx];
                 if (0 == c)
                     continue;
+                /* Ctrl-<letter> -> control code (Ctrl-C = 0x03), so a running
+                 * program can be interrupted and the shell sees Ctrl-P/N etc. */
+                if (data[0] & (HID_BOOT_LEFT_CTRL | HID_BOOT_RIGHT_CTRL))
+                {
+                    if (c >= 'a' && c <= 'z')      c = c - 'a' + 1;
+                    else if (c >= 'A' && c <= 'Z') c = c - 'A' + 1;
+                }
                 seq[0] = (char)c; slen = 1;
             }
 

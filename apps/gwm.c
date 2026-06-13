@@ -1049,7 +1049,9 @@ extern void basic_exec_line(const char *);
 
 #define BAS_ROWS 56
 #define BAS_COLS 60
-#define BAS_TB_H 16                 /* toolbar height (px)                    */
+#define BAS_TB_H  32                /* toolbar height (px) — two button rows  */
+#define BAS_BTN_H 12                /* one button's height                    */
+#define BAS_ROW_H 16                /* row pitch (button + gap)               */
 static char          bas_ring[BAS_ROWS][BAS_COLS + 1];
 static unsigned char bas_dirty[BAS_ROWS];
 static int           bas_row, bas_col, bas_filled, bas_full;
@@ -1236,24 +1238,38 @@ static void bas_pause(int ms)
 /* ---- BASIC window toolbar: clickable buttons that run a command --------- */
 static int bas_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static const struct { const char *label; const char *cmd; } bas_btns[] = {
-    { "FILES",      "files" },
-    { "LIST",       "list" },
-    { "RUN hello",  "run \"hello.bas\"" },
-    { "RUN rotate", "run \"rotate.bas\"" },
-    { "CLS 3",      "cls 3" },
+    { "FILES",  "files" },
+    { "LIST",   "list" },
+    { "CLS3",   "cls 3" },
+    { "hello",  "run \"hello.bas\"" },
+    { "rotate", "run \"rotate.bas\"" },
+    { "koch",   "run \"koch.bas\"" },
+    { "dragon", "run \"dragon.bas\"" },
+    { "bubble", "run \"bubble.bas\"" },
+    { "qsort",  "run \"qsort.bas\"" },
+    { "hanoi",  "run \"hanoi.bas\"" },
+    { "maze",   "run \"maze.bas\"" },
+    { "glass",  "run \"glass.bas\"" },
+    { "flight", "run \"flight.bas\"" },
+    { "rescue", "run \"rescue.bas\"" },
 };
 #define BAS_NBTN ((int)(sizeof(bas_btns) / sizeof(bas_btns[0])))
 
-/* Button i's rectangle in desktop coords (what basic_draw paints + what the
- * click test compares against). */
+/* Button i's rectangle in desktop coords, laid out left-to-right and wrapped
+ * to a new row when it would overflow the window width. */
 static void bas_btn_rect(int i, int *bx, int *by, int *bw, int *bh)
 {
-    int x = basic_win.x + 4, k;
-    for (k = 0; k < i; k++) x += bas_slen(bas_btns[k].label) * FONT_WIDTH + 8 + 4;
-    *bx = x;
-    *by = basic_win.y + WM_TITLEBAR_H + 3;
-    *bw = bas_slen(bas_btns[i].label) * FONT_WIDTH + 8;
-    *bh = BAS_TB_H - 4;
+    int left = basic_win.x + 4, right = basic_win.x + basic_win.width - 2;
+    int x = left, row = 0, k;
+    for (k = 0; ; k++) {
+        int w = bas_slen(bas_btns[k].label) * FONT_WIDTH + 8;
+        if (x + w > right && x > left) { row++; x = left; }   /* wrap */
+        if (k == i) {
+            *bx = x; *by = basic_win.y + WM_TITLEBAR_H + 3 + row * BAS_ROW_H;
+            *bw = w; *bh = BAS_BTN_H; return;
+        }
+        x += w + 4;
+    }
 }
 static void basic_draw_toolbar(window_t *self)
 {
@@ -1261,7 +1277,6 @@ static void basic_draw_toolbar(window_t *self)
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, BAS_TB_H, 0xFF0A2A12U);
     for (i = 0; i < BAS_NBTN; i++) {
         bas_btn_rect(i, &bx, &by, &bw, &bh);
-        if (bx + bw > self->x + self->width - 2) break;     /* clip to window */
         fill_rect(bx, by, bw, bh, 0xFF1E6E38U);
         fill_rect(bx, by, bw, 1, 0xFF2EA050U);              /* top highlight  */
         draw_string_at(bx + 4, by + 1, bas_btns[i].label, 0xFFEFFFE0U, 0xFF1E6E38U);
@@ -1391,6 +1406,7 @@ static void bas_ed_enter(void)
  * USB keyboard emits (ESC [ A/B/C/D). */
 void basic_feed(int c)
 {
+    if (c == 3) { extern void basic_break(void); basic_break(); return; }  /* Ctrl-C */
     if (bas_esc == 1) { bas_esc = (c == '[') ? 2 : 0; return; }
     if (bas_esc == 2) {
         bas_esc = 0;
