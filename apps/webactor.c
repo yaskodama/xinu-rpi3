@@ -1326,6 +1326,37 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/buddy:
+             *   Report the buddy allocator (Xinu Kernel Evolution Round 2
+             *   champion axis memory_alloc=buddy): the boot self-test
+             *   verdict plus the live per-order free-block counts.  Lets a
+             *   Mac-side script confirm a freshly /kexec'd or SD-booted
+             *   buddy kernel passed without reading the serial console. */
+            if (0 == strncmp(reqbuf, "GET /api/buddy", 14) ||
+                0 == strncmp(reqbuf, "POST /api/buddy", 15))
+            {
+                extern const char *buddy_report(void);
+                extern uint        buddy_freecount(uint);
+                static char bresp[600];
+                int blen = sprintf(bresp + 100, "%s\nfree:", buddy_report());
+                uint o;
+                for (o = 5 /*BUDDY_MIN_ORDER*/; o <= 18 /*BUDDY_MAX_ORDER*/; o++)
+                {
+                    blen += sprintf(bresp + 100 + blen, " o%u=%u",
+                                    o, buddy_freecount(o));
+                }
+                blen += sprintf(bresp + 100 + blen, "\n");
+                int hlen = sprintf(bresp,
+                                   "HTTP/1.0 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n", blen);
+                memcpy(bresp + hlen, bresp + 100, blen);
+                write(tcpdev, bresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/loadbal/jit?n=K&prog=P:
              *   Like /api/loadbal/submit but the worker JIT-compiles a
              *   small C source and executes it (no sleep — wall-clock

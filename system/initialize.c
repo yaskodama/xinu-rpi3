@@ -91,6 +91,17 @@ void nulluser(void)
     /* General initialization  */
     sysinit();
 
+    /* Buddy allocator (Xinu Kernel Evolution Round 2 champion axis
+     * memory_alloc=buddy).  Bring up the arena and run its boot
+     * self-test now that the classic heap (memget) is live but before
+     * interrupts/threads start, so the [Buddy] PASS/FAIL line lands on
+     * the console early.  The result is also retrievable at runtime via
+     * the webactor /api/buddy route. */
+    {
+        extern int buddy_selftest(void);
+        buddy_selftest();
+    }
+
     /* Enable interrupts  */
     enable();
 

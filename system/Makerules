@@ -22,6 +22,8 @@ C_FILES += moncreate.c monfree.c moncount.c lock.c unlock.c
 
 # Files for memory management
 C_FILES += memget.c memfree.c stkget.c bfpalloc.c bfpfree.c bufget.c buffree.c
+# Buddy allocator (Xinu Kernel Evolution Round 2 champion: memory_alloc=buddy)
+C_FILES += buddy.c
 
 # Files for interprocess communication
 C_FILES += send.c receive.c recvclr.c recvtime.c
