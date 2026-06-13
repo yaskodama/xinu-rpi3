@@ -16,9 +16,9 @@
  */
 devcall gwinconInit(device *devptr)
 {
-    (void)devptr;
-    /* Bring up the keystroke-injection ring used for the shell's stdin
-     * (fed over HTTP by apps/webactor.c -> gwincon_feed()). */
-    gwincon_input_init();
+    /* Bring up the keystroke-injection ring used for this shell's stdin
+     * (fed by apps/webactor.c -> gwincon_feed() or the USB keyboard via
+     * apps/gwm.c gwm_feed_key()).  One ring per minor. */
+    gwincon_input_init(devptr->minor);
     return OK;
 }

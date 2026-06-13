@@ -424,167 +424,135 @@ static void paint_scene(unsigned int frame)
 
 #define SHW_ROWS 56
 #define SHW_COLS 46
+#define NSHELL   2          /* GWINCON0 + GWINCON1 -> two independent shells */
 
-static char          sh_ring[SHW_ROWS][SHW_COLS + 1];
-static unsigned char sh_row_dirty[SHW_ROWS];
-static int           sh_cur_row;
-static int           sh_cur_col;
-static int           sh_filled;   /* have we wrapped past the bottom? */
-static int           sh_esc;       /* CSI parser: 0 normal, 1 ESC, 2 ESC[ */
-static int           sh_cr;        /* pending carriage return (\r seen)   */
-static char          sh_csi[8];    /* CSI parameter bytes (e.g. "2" of 2J)*/
-static int           sh_csi_n;
-static int           sh_full_clear; /* clear: wipe the whole content area    */
+/* All per-shell console state, one struct per windowed shell. */
+struct shcon {
+    char          ring[SHW_ROWS][SHW_COLS + 1];
+    unsigned char row_dirty[SHW_ROWS];
+    int           cur_row, cur_col, filled;
+    int           esc, cr, csi_n, full_clear;
+    char          csi[8];
+    window_t      win;
+    int           opened;
+};
+static struct shcon shc[NSHELL];
 
-static window_t sh_win;
+/* Forward decls: defined further down, used by gwin_shell_window_open_n(). */
+static void wm_raise(window_t *w);
+static int  g_need_full;
 
-static void sh_newline(void)
+/* Which shell index a window pointer belongs to (0 if not a shell window). */
+static int sh_index_of(window_t *self)
 {
-    sh_ring[sh_cur_row][sh_cur_col] = 0;
-    sh_cur_row = (sh_cur_row + 1) % SHW_ROWS;
-    sh_cur_col = 0;
-    sh_ring[sh_cur_row][0] = 0;
-    if (sh_cur_row == 0) sh_filled = 1;
-    /* The whole visible tail shifts up a line, so everything must
-     * be repainted on the next frame. */
-    for (int r = 0; r < SHW_ROWS; r++) sh_row_dirty[r] = 1;
+    int i;
+    for (i = 0; i < NSHELL; i++) if (self == &shc[i].win) return i;
+    return 0;
 }
 
-/* Clear the shell window: blank every ring row and home the cursor.
- * Driven by the `clear` command, which prints ESC[2J (erase display). */
-static void gwin_shell_clear(void)
+static void sh_newline(struct shcon *s)
 {
-    for (int r = 0; r < SHW_ROWS; r++) { sh_ring[r][0] = 0; sh_row_dirty[r] = 1; }
-    sh_cur_row = 0;
-    sh_cur_col = 0;
-    sh_filled  = 0;
-    sh_full_clear = 1;   /* next sh_draw wipes the entire content area, not
-                          * just the (now single) live row — otherwise the
-                          * previously-displayed lines stay on screen. */
+    s->ring[s->cur_row][s->cur_col] = 0;
+    s->cur_row = (s->cur_row + 1) % SHW_ROWS;
+    s->cur_col = 0;
+    s->ring[s->cur_row][0] = 0;
+    if (s->cur_row == 0) s->filled = 1;
+    for (int r = 0; r < SHW_ROWS; r++) s->row_dirty[r] = 1;
 }
 
-/* Append one character to the shell text ring.  Acts as a tiny VT100:
- *   - strips CSI escape sequences (ESC '[' ... final) emitted by the
- *     line editor's redraw (ESC[K clear-to-EOL, ESC[nD cursor-left) so
- *     they don't show up as literal "[K" / "[3D" garbage;
- *   - distinguishes a normal line ending "\r\n" (newline) from the line
- *     editor's "\r"+reprint (carriage return -> rewrite from column 0);
- *   - '\b'/0x7F backspace, other control chars dropped, printable
- *     appended (wrapping at SHW_COLS).
- * The per-char auto-null after each printable means a shorter rewrite
- * truncates any stale tail, so ESC[K need not be emulated explicitly. */
-void gwin_shell_record(char c)
+static void sh_clear(struct shcon *s)
 {
-    /* --- CSI escape sequence stripping --- */
-    if (sh_esc == 1) {                       /* saw ESC */
-        if (c == '[') { sh_esc = 2; sh_csi_n = 0; } else sh_esc = 0;
-        return;
-    }
-    if (sh_esc == 2) {                       /* inside ESC[ ... */
-        if ((c >= '0' && c <= '9') || c == ';') {     /* accumulate params */
-            if (sh_csi_n < (int)sizeof sh_csi - 1) sh_csi[sh_csi_n++] = c;
+    for (int r = 0; r < SHW_ROWS; r++) { s->ring[r][0] = 0; s->row_dirty[r] = 1; }
+    s->cur_row = 0; s->cur_col = 0; s->filled = 0; s->full_clear = 1;
+}
+
+/* Append one character to shell @m's text ring (tiny VT100; see history). */
+void gwin_shell_record_m(int m, char c)
+{
+    struct shcon *s;
+    if (m < 0 || m >= NSHELL) return;
+    s = &shc[m];
+
+    if (s->esc == 1) { if (c == '[') { s->esc = 2; s->csi_n = 0; } else s->esc = 0; return; }
+    if (s->esc == 2) {
+        if ((c >= '0' && c <= '9') || c == ';') {
+            if (s->csi_n < (int)sizeof s->csi - 1) s->csi[s->csi_n++] = c;
             return;
         }
-        if (c >= 0x40 && c <= 0x7E) {         /* final byte ends the CSI */
-            sh_csi[sh_csi_n] = 0;
-            if (c == 'J') gwin_shell_clear(); /* ESC[2J / ESC[J = clear screen */
-            sh_esc = 0; sh_csi_n = 0;
-        }
-        return;                               /* swallow the whole sequence */
-    }
-    if (c == 0x1B) { sh_esc = 1; return; }   /* ESC */
-
-    /* --- carriage return: "\r\n" vs "\r"+rewrite --- */
-    if (sh_cr) {
-        sh_cr = 0;
-        if (c == '\n') { sh_newline(); return; }
-        sh_cur_col = 0;                      /* rewrite this line in place */
-        sh_row_dirty[sh_cur_row] = 1;
-        /* fall through to handle c at column 0 */
-    }
-    if (c == '\r') { sh_cr = 1; return; }
-    if (c == '\n') { sh_newline(); return; }
-    if (c == 0x08 || c == 0x7F) {            /* BS / DEL */
-        if (sh_cur_col > 0) {
-            sh_cur_col--;
-            sh_ring[sh_cur_row][sh_cur_col] = 0;
-            sh_row_dirty[sh_cur_row] = 1;
+        if (c >= 0x40 && c <= 0x7E) {
+            s->csi[s->csi_n] = 0;
+            if (c == 'J') sh_clear(s);
+            s->esc = 0; s->csi_n = 0;
         }
         return;
     }
-    if (c < 0x20) return;                    /* drop other control chars */
-
-    if (sh_cur_col >= SHW_COLS) sh_newline();
-    sh_ring[sh_cur_row][sh_cur_col++] = c;
-    sh_ring[sh_cur_row][sh_cur_col] = 0;
-    sh_row_dirty[sh_cur_row] = 1;
+    if (c == 0x1B) { s->esc = 1; return; }
+    if (s->cr) {
+        s->cr = 0;
+        if (c == '\n') { sh_newline(s); return; }
+        s->cur_col = 0; s->row_dirty[s->cur_row] = 1;
+    }
+    if (c == '\r') { s->cr = 1; return; }
+    if (c == '\n') { sh_newline(s); return; }
+    if (c == 0x08 || c == 0x7F) {
+        if (s->cur_col > 0) { s->cur_col--; s->ring[s->cur_row][s->cur_col] = 0; s->row_dirty[s->cur_row] = 1; }
+        return;
+    }
+    if (c < 0x20) return;
+    if (s->cur_col >= SHW_COLS) sh_newline(s);
+    s->ring[s->cur_row][s->cur_col++] = c;
+    s->ring[s->cur_row][s->cur_col] = 0;
+    s->row_dirty[s->cur_row] = 1;
 }
+/* Back-compat: the GWINCON0 putc path (kept for any minor-0-only callers). */
+void gwin_shell_record(char c) { gwin_shell_record_m(0, c); }
 
-/* Diagnostic: copy the visible shell ring (oldest..newest) into buf as
- * newline-separated rows.  Returns the number of bytes written.  Used by
- * the /api/wifi/shellring HTTP endpoint to inspect what the shell has
- * actually emitted, independent of on-screen rendering. */
+/* Diagnostic: dump shell 0's visible ring (the /api/wifi/shellring route). */
 int gwin_shell_dump(char *buf, int max)
 {
+    struct shcon *s = &shc[0];
     int n = 0;
-    int have = sh_filled ? SHW_ROWS : sh_cur_row + 1;
-    int start = (sh_cur_row - have + 1 + SHW_ROWS) % SHW_ROWS;
+    int have = s->filled ? SHW_ROWS : s->cur_row + 1;
+    int start = (s->cur_row - have + 1 + SHW_ROWS) % SHW_ROWS;
     for (int i = 0; i < have && n < max - 2; i++) {
         int r = (start + i) % SHW_ROWS;
-        const char *s = sh_ring[r];
-        for (int k = 0; s[k] && n < max - 2; k++) buf[n++] = s[k];
+        const char *t = s->ring[r];
+        for (int k = 0; t[k] && n < max - 2; k++) buf[n++] = t[k];
         buf[n++] = '\n';
     }
     buf[n] = 0;
     return n;
 }
 
-/* Content callback: repaint only dirty rows (or all rows when
- * g_force_redraw is set, e.g. during the clipped cursor-erase). */
 static void sh_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
+    struct shcon *s = &shc[sh_index_of(self)];
 
-    /* `clear` requested: wipe the whole content area once (the row loop only
-     * repaints the live rows, which after a clear is just one). */
-    if (sh_full_clear) {
+    if (s->full_clear) {
         fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
-                  self->width - 2, self->height - WM_TITLEBAR_H - 3,
-                  self->content_bg);
-        sh_full_clear = 0;
+                  self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
+        s->full_clear = 0;
     }
-
-    /* Cap visible rows to what physically fits, newest tail first. */
     int content_h = self->height - WM_TITLEBAR_H - 7;
     int max_rows = content_h / line_h;
     if (max_rows < 1) return;
     if (max_rows > SHW_ROWS) max_rows = SHW_ROWS;
-
-    int have = sh_filled ? SHW_ROWS : sh_cur_row + 1;
+    int have = s->filled ? SHW_ROWS : s->cur_row + 1;
     int rows = have < max_rows ? have : max_rows;
-
-    /* `start` = oldest ring row to display (rows ending at sh_cur_row). */
-    int start = (sh_cur_row - rows + 1 + SHW_ROWS) % SHW_ROWS;
-
+    int start = (s->cur_row - rows + 1 + SHW_ROWS) % SHW_ROWS;
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % SHW_ROWS;
-        if (g_force_redraw || sh_row_dirty[r]) {
+        if (g_force_redraw || s->row_dirty[r]) {
             int ry = self->y + WM_TITLEBAR_H + 4 + i * line_h;
-            /* Erase the row strip, then draw its text. */
-            fill_rect(self->x + 4, ry, self->width - 8, line_h,
-                      self->content_bg);
-            draw_string_at(self->x + 4, ry, sh_ring[r],
-                           0xFFCCE0FFU, self->content_bg);
-            if (!g_force_redraw) sh_row_dirty[r] = 0;
+            fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
+            draw_string_at(self->x + 4, ry, s->ring[r], 0xFFCCE0FFU, self->content_bg);
+            if (!g_force_redraw) s->row_dirty[r] = 0;
         }
     }
-
-    /* Blinking block caret at the input position (the newest visible row,
-     * column sh_cur_col).  Drawn every frame so it blinks; the input cell is
-     * always blank, so the "off" phase just repaints the content background. */
     {
         int cr_y = self->y + WM_TITLEBAR_H + 4 + (rows - 1) * line_h;
-        int cr_x = self->x + 4 + sh_cur_col * FONT_WIDTH;
+        int cr_x = self->x + 4 + s->cur_col * FONT_WIDTH;
         if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
             unsigned int col = ((frame >> 2) & 1) ? 0xFFFFD23CU : self->content_bg;
             fill_rect(cr_x, cr_y, FONT_WIDTH, FONT_HEIGHT, col);
@@ -592,40 +560,37 @@ static void sh_draw(window_t *self, unsigned int frame)
     }
 }
 
-/* Open (idempotently) the on-screen shell window and reset its ring.
- * Declared in gwm.h; called by the `win` shell command. */
-int gwin_shell_window_open(void)
+/* Open (idempotently) shell window @idx and add it to the WM. */
+int gwin_shell_window_open_n(int idx)
 {
-    static int opened = 0;
-    if (opened) return OK;
+    struct shcon *s;
+    if (idx < 0 || idx >= NSHELL) return SYSERR;
+    s = &shc[idx];
+    if (s->opened) { active_win = &s->win; wm_raise(&s->win); g_need_full = 1; return OK; }
 
-    /* Do NOT clear the ring here: the shell bound to GWINCON0 starts
-     * before gwm_main opens this window and may already have printed its
-     * banner + first prompt into the ring.  The ring is static (zero-
-     * initialised at boot), so just mark every row dirty so the first
-     * frame paints whatever is already there. */
-    for (int r = 0; r < SHW_ROWS; r++) sh_row_dirty[r] = 1;
-
-    sh_win.x = 824;
-    sh_win.y = 18;
-    sh_win.width  = 456;
-    sh_win.height = 476;
+    for (int r = 0; r < SHW_ROWS; r++) s->row_dirty[r] = 1;
+    s->win.x = (idx == 0) ? 824 : 690;
+    s->win.y = (idx == 0) ? 18  : 120;
+    s->win.width  = 456;
+    s->win.height = 476;
     {
-        const char *t = "Shell";
+        const char *t = (idx == 0) ? "Shell" : "Shell 2";
         int i;
-        for (i = 0; i < WM_TITLE_MAX && t[i]; i++) sh_win.title[i] = t[i];
-        sh_win.title[i] = 0;
+        for (i = 0; i < WM_TITLE_MAX && t[i]; i++) s->win.title[i] = t[i];
+        s->win.title[i] = 0;
     }
-    sh_win.chrome_color = 0xFFAACCEEU;
-    sh_win.title_bg     = 0xFF0040A0U;
-    sh_win.title_fg     = 0xFFFFFFFFU;
-    sh_win.content_bg   = 0xFF000010U;
-    sh_win.draw_content = sh_draw;
-
-    wm_add(&sh_win);
-    opened = 1;
+    s->win.chrome_color = 0xFFAACCEEU;
+    s->win.title_bg     = 0xFF0040A0U;
+    s->win.title_fg     = 0xFFFFFFFFU;
+    s->win.content_bg   = 0xFF000010U;
+    s->win.draw_content = sh_draw;
+    wm_add(&s->win);
+    s->opened = 1;
+    active_win = &s->win; g_need_full = 1;
     return OK;
 }
+/* Back-compat: the `win` shell command + gwm_main open shell 0. */
+int gwin_shell_window_open(void) { return gwin_shell_window_open_n(0); }
 
 /* ---- title-bar drag (move) + corner drag (resize) -----------------
  * Hold the LEFT mouse button (usbmouse_buttons bit 0, USB boot protocol):
@@ -1494,13 +1459,11 @@ static void basic_run_button(int idx)
     if (bas_sem != (semaphore)SYSERR) signaln(bas_sem, 1);
 }
 
-/* Right-click menu action: open/raise the chosen window. */
+/* Right-click menu action. */
 static void menu_exec(int sel)
 {
-    extern int gwin_shell_window_open(void);
-    if (sel == 0) {                              /* Shell */
-        gwin_shell_window_open();                /* show the shell window      */
-        active_win = &sh_win; wm_raise(&sh_win); /* (idempotent) bring to front */
+    if (sel == 0) {                              /* Shell: open the 2nd shell */
+        gwin_shell_window_open_n(1);             /* independent shell window 2 */
     } else if (sel == 1) {                       /* BASIC */
         active_win = &basic_win; wm_raise(&basic_win);
     }
@@ -1542,9 +1505,10 @@ thread basic_main(void)
 /* Route a keystroke to the active window's input (shell or BASIC). */
 void gwm_feed_key(int c)
 {
-    extern void gwincon_feed(int);
-    if (active_win == &basic_win) basic_feed(c);
-    else                          gwincon_feed(c);
+    extern void gwincon_feed(int, int);          /* (minor, char) */
+    if (active_win == &basic_win)      basic_feed(c);
+    else if (active_win == &shc[1].win) gwincon_feed(1, c);
+    else                                gwincon_feed(0, c);
 }
 
 /* Restore every window to its default (boot) position and size, undoing any
@@ -1558,7 +1522,7 @@ void wm_reset_layout(void)
     actor_win.x = 19;     actor_win.y = 143;    actor_win.width = 412;  actor_win.height = 270;
     graphics_win.x = 444; graphics_win.y = 15;  graphics_win.width = 374; graphics_win.height = 402;
     basic_win.x = 23;     basic_win.y = 421;    basic_win.width = 560;  basic_win.height = 360;
-    sh_win.x = 824;       sh_win.y = 18;        sh_win.width = 456;     sh_win.height = 476;
+    shc[0].win.x = 824;   shc[0].win.y = 18;    shc[0].win.width = 456; shc[0].win.height = 476;
     active_win = 0;
     g_need_full = 1;          /* force a full repaint at the next frame */
 }
@@ -1576,7 +1540,7 @@ int wm_dump_layout(char *buf, int max)
         { "actor_win",    &actor_win    },
         { "graphics_win", &graphics_win },
         { "basic_win",    &basic_win    },
-        { "sh_win",       &sh_win       },
+        { "sh_win",       &shc[0].win   },
     };
     int n = 0, i;
     for (i = 0; i < (int)(sizeof(tab) / sizeof(tab[0])); i++) {

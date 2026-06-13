@@ -1907,11 +1907,11 @@ thread webactor_server(void)
              *   (GWINCON0 -> gwinconGetc); the shell echoes + runs it, and
              *   gwm renders the Shell window from the output ring. */
             if (0 == strncmp(reqbuf, "GET /api/wifi/key", 17)) {
-                extern void gwincon_feed(int);
+                extern void gwincon_feed(int, int);
                 extern int atoi(const char *);
                 const char *qc = strstr(reqbuf, "c=");
                 static char kh2[80]; int hlen;
-                if (qc) gwincon_feed(atoi(qc+2));
+                if (qc) gwincon_feed(0, atoi(qc+2));
                 hlen = sprintf(kh2, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: 0\r\n\r\n");
                 write(tcpdev, kh2, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;

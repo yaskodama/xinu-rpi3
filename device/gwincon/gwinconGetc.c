@@ -18,84 +18,89 @@
 #include <interrupt.h>
 
 #define GWIN_IBLEN 256
+#define NGWIN      2               /* GWINCON0 + GWINCON1 */
 
-static volatile uchar gwin_inbuf[GWIN_IBLEN];
-static volatile uint  gwin_ihead;          /* next write index (feed) */
-static volatile uint  gwin_itail;          /* next read index  (getc) */
-static semaphore      gwin_isema = 0;      /* count of bytes ready    */
-static int            gwin_iready = 0;     /* set once initialised    */
+static volatile uchar gwin_inbuf[NGWIN][GWIN_IBLEN];
+static volatile uint  gwin_ihead[NGWIN];   /* next write index (feed) */
+static volatile uint  gwin_itail[NGWIN];   /* next read index  (getc) */
+static semaphore      gwin_isema[NGWIN];   /* count of bytes ready    */
+static int            gwin_iready[NGWIN];  /* set once initialised    */
 
 /**
- * Initialise the input ring + its semaphore.  Called from gwinconInit()
- * (i.e. when GWINCON0 is opened in main()), after sysinit() so that
+ * Initialise one input ring + its semaphore.  Called from gwinconInit()
+ * (i.e. when GWINCONx is opened in main()), after sysinit() so that
  * semcreate() is usable.
+ *
+ * @param m  minor number (0..NGWIN-1)
  */
-void gwincon_input_init(void)
+void gwincon_input_init(int m)
 {
-    if (gwin_iready) return;
-    gwin_ihead = 0;
-    gwin_itail = 0;
-    gwin_isema = semcreate(0);
-    gwin_iready = 1;
+    if (m < 0 || m >= NGWIN) return;
+    if (gwin_iready[m]) return;
+    gwin_ihead[m] = 0;
+    gwin_itail[m] = 0;
+    gwin_isema[m] = semcreate(0);
+    gwin_iready[m] = 1;
 }
 
 /**
- * Inject one keystroke into the shell's input stream.  Safe to call
+ * Inject one keystroke into a shell's input stream.  Safe to call
  * from any thread; drops the key if the device is not yet open or the
  * ring is full.
  *
+ * @param m  minor number (which shell window)
  * @param c  character code (0..255)
  */
-void gwincon_feed(int c)
+void gwincon_feed(int m, int c)
 {
     irqmask im;
     uint nh;
 
-    if (!gwin_iready) return;
+    if (m < 0 || m >= NGWIN || !gwin_iready[m]) return;
 
     im = disable();
-    nh = (gwin_ihead + 1) % GWIN_IBLEN;
-    if (nh == gwin_itail) {            /* ring full — drop */
+    nh = (gwin_ihead[m] + 1) % GWIN_IBLEN;
+    if (nh == gwin_itail[m]) {         /* ring full — drop */
         restore(im);
         return;
     }
-    gwin_inbuf[gwin_ihead] = (uchar)c;
-    gwin_ihead = nh;
+    gwin_inbuf[m][gwin_ihead[m]] = (uchar)c;
+    gwin_ihead[m] = nh;
     restore(im);
 
-    signal(gwin_isema);
+    signal(gwin_isema[m]);
 }
 
 /**
- * Read a single character (blocking) for the windowed shell's stdin.
- *
- * @param devptr  device table entry (unused)
- * @return        the character read, or SYSERR if not initialised
- */
-/**
- * Diagnostic: report the input-ring state so the HTTP layer can tell
- * whether injected keys are being consumed by the shell.
+ * Diagnostic: report the input-ring state (minor 0) so the HTTP layer
+ * can tell whether injected keys are being consumed by the shell.
  */
 void gwincon_input_stat(int *head, int *tail, int *ready)
 {
-    if (head)  *head  = (int)gwin_ihead;
-    if (tail)  *tail  = (int)gwin_itail;
-    if (ready) *ready = gwin_iready;
+    if (head)  *head  = (int)gwin_ihead[0];
+    if (tail)  *tail  = (int)gwin_itail[0];
+    if (ready) *ready = gwin_iready[0];
 }
 
+/**
+ * Read a single character (blocking) for a windowed shell's stdin.
+ *
+ * @param devptr  device table entry (minor selects the window)
+ * @return        the character read, or SYSERR if not initialised
+ */
 devcall gwinconGetc(device *devptr)
 {
     irqmask im;
     uchar ch;
+    int   m = devptr->minor;
 
-    (void)devptr;
-    if (!gwin_iready) return SYSERR;
+    if (m < 0 || m >= NGWIN || !gwin_iready[m]) return SYSERR;
 
-    wait(gwin_isema);                 /* block until a key is fed */
+    wait(gwin_isema[m]);              /* block until a key is fed */
 
     im = disable();
-    ch = gwin_inbuf[gwin_itail];
-    gwin_itail = (gwin_itail + 1) % GWIN_IBLEN;
+    ch = gwin_inbuf[m][gwin_itail[m]];
+    gwin_itail[m] = (gwin_itail[m] + 1) % GWIN_IBLEN;
     restore(im);
 
     return ch;

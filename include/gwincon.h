@@ -17,10 +17,15 @@ devcall gwinconPutc(device *devptr, char ch);
 devcall gwinconWrite(device *devptr, const void *buf, uint len);
 devcall gwinconGetc(device *devptr);
 
-/* Input ring: apps/webactor.c injects keys via gwincon_feed(); the
- * windowed xsh shell consumes them through gwinconGetc(). */
-void gwincon_input_init(void);
-void gwincon_feed(int c);
+/* Input ring (one per minor / shell window): apps/webactor.c and the
+ * USB keyboard inject keys via gwincon_feed(); the windowed xsh shell
+ * consumes them through gwinconGetc(). */
+void gwincon_input_init(int m);
+void gwincon_feed(int m, int c);
 void gwincon_input_stat(int *head, int *tail, int *ready);
+
+/* Stdout side, per minor: defined in apps/gwm.c. */
+void gwin_shell_record_m(int m, char c);
+void gwin_shell_record(char c);
 
 #endif /* _GWINCON_H_ */

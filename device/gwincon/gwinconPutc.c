@@ -10,19 +10,18 @@
 #include <gwincon.h>
 
 /* Defined in apps/gwm.c (only built for arm-rpi3). */
-extern void gwin_shell_record(char);
+extern void gwin_shell_record_m(int m, char c);
 
 /**
  * Append the character to the shell window's ring buffer.
  *
- * @param devptr  device table entry (unused)
+ * @param devptr  device table entry (minor selects the window)
  * @param ch      character to record
  * @return        the character written, as an unsigned char
  */
 devcall gwinconPutc(device *devptr, char ch)
 {
-    (void)devptr;
-    gwin_shell_record(ch);
+    gwin_shell_record_m(devptr->minor, ch);
     return (uchar)ch;
 }
 
@@ -41,7 +40,7 @@ devcall gwinconWrite(device *devptr, const void *buf, uint len)
 {
     const uchar *p = (const uchar *)buf;
     uint i;
-    (void)devptr;
-    for (i = 0; i < len; i++) gwin_shell_record((char)p[i]);
+    int  m = devptr->minor;
+    for (i = 0; i < len; i++) gwin_shell_record_m(m, (char)p[i]);
     return (devcall)len;
 }

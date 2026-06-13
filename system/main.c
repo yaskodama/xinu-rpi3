@@ -361,6 +361,23 @@ thread main(void)
         kprintf("WARNING: Can't open GWINCON0\r\n");
     }
 #endif
+    /* GWINCON1 — second windowed shell (right-click menu -> "Shell" opens
+     * its window via gwin_shell_window_open_n(1)).  A real shell() is
+     * forked here too so the 2nd window is interactive from the start;
+     * its output ring just isn't drawn until the window is opened. */
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && defined(GWINCON1) && HAVE_SHELL
+    if (OK == open(GWINCON1))
+    {
+        shelldevs[nshells][0] = GWINCON1;
+        shelldevs[nshells][1] = GWINCON1;
+        shelldevs[nshells][2] = GWINCON1;
+        nshells++;
+    }
+    else
+    {
+        kprintf("WARNING: Can't open GWINCON1\r\n");
+    }
+#endif
 
     /* Start shells  */
 #if HAVE_SHELL
