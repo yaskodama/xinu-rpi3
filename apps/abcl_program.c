@@ -551,6 +551,8 @@ static int _abcl_cap = 0;
 #define CLASS_PhilCM 8        /* Chandy-Misra philosopher (request/release) */
 #define CLASS_Spinner 9       /* Rotate4Lines: a rotating line-segment actor   */
 #define CLASS_Controller 10   /* Rotate4Lines: spawns 4 spinners + Start/Stop  */
+#define CLASS_Pinger 11       /* PingPong: prints + bounces a message to Ponger */
+#define CLASS_Ponger 12       /* PingPong: bounces it back to Pinger            */
 
 /* P2: AIPL class -> Xinu priority */
 #define ABCL_PRIO_Fork 20
@@ -577,6 +579,8 @@ static int abcl_class_prio(int class_id) {
   case CLASS_PhilCM:     return ABCL_PRIO_PhilCM;
   case CLASS_Spinner:    return ABCL_PRIO_Spinner;
   case CLASS_Controller: return ABCL_PRIO_Controller;
+  case CLASS_Pinger:     return ABCL_PRIO_Spinner;
+  case CLASS_Ponger:     return ABCL_PRIO_Spinner;
   default: return INITPRIO;
   }
 }
@@ -593,6 +597,8 @@ const char* abcl_class_name(int class_id) {
   case CLASS_PhilCM:     return "PhilCM";
   case CLASS_Spinner:    return "Spinner";
   case CLASS_Controller: return "Controller";
+  case CLASS_Pinger:     return "Pinger";
+  case CLASS_Ponger:     return "Ponger";
   default: return "?";
   }
 }
@@ -607,6 +613,8 @@ static void dispatch_ForkCM(int, int, const char*, value_t*, int);
 static void dispatch_PhilCM(int, int, const char*, value_t*, int);
 static void dispatch_Spinner(int, int, const char*, value_t*, int);
 static void dispatch_Controller(int, int, const char*, value_t*, int);
+static void dispatch_Pinger(int, int, const char*, value_t*, int);
+static void dispatch_Ponger(int, int, const char*, value_t*, int);
 static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
@@ -2696,6 +2704,43 @@ void abcl_rotate4_init(void) {
 void abcl_rotate4_start(void) { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "start", 0, NULL); }
 void abcl_rotate4_stop(void)  { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "stop",  0, NULL); }
 
+/* ============================================================ *
+ *  PingPong — two actors bounce a message back and forth,      *
+ *  printing each hop.  Translated from abclc/PingPong.abcl by   *
+ *  abcl2c.  print() routes to v_print -> the AIPL console window.*
+ *  Bounded by PP_MAX so the (otherwise infinite) loop stops.    *
+ * ============================================================ */
+#define PP_MAX 40
+static int g_pinger = -1, g_ponger = -1, g_pp_count = 0;
+static void init_fields_Pinger(int self_id) { (void)self_id; }
+static void init_fields_Ponger(int self_id) { (void)self_id; }
+static void Pinger_init(int self_id, int s, value_t* a, int n) { (void)s;(void)a;(void)n;
+  v_print(mk_str("Pinger starting"));
+  if (g_pp_count++ < PP_MAX) enqueue(self_id, g_ponger, "ping", 0, NULL);
+}
+static void Pinger_pong(int self_id, int sender_id, value_t* a, int n) { (void)a;(void)n;
+  v_print(mk_str("Pinger got pong"));
+  if (g_pp_count++ < PP_MAX) enqueue(self_id, sender_id, "ping", 0, NULL);
+}
+static void dispatch_Pinger(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
+  if (strcmp(method, "init") == 0) { Pinger_init(self_id, sender_id, args, n_args); return; }
+  if (strcmp(method, "pong") == 0) { Pinger_pong(self_id, sender_id, args, n_args); return; }
+}
+static void Ponger_ping(int self_id, int sender_id, value_t* a, int n) { (void)a;(void)n;
+  v_print(mk_str("Ponger got ping"));
+  if (g_pp_count++ < PP_MAX) enqueue(self_id, sender_id, "pong", 0, NULL);
+}
+static void dispatch_Ponger(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
+  if (strcmp(method, "ping") == 0) { Ponger_ping(self_id, sender_id, args, n_args); return; }
+}
+/* Bootstrap: create Ponger first (Pinger.init sends to g_ponger), then Pinger.
+ * Re-runnable: resets the message counter each time. */
+void abcl_pingpong_init(void) {
+  g_pp_count = 0;
+  g_ponger = create_obj(CLASS_Ponger, 0, NULL);
+  g_pinger = create_obj(CLASS_Pinger, 0, NULL);
+}
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
@@ -2709,6 +2754,8 @@ static void dispatch(int self_id, int sender_id, const char* method, value_t* ar
   case CLASS_PhilCM:     dispatch_PhilCM(self_id, sender_id, method, args, n_args); break;
   case CLASS_Spinner:    dispatch_Spinner(self_id, sender_id, method, args, n_args); break;
   case CLASS_Controller: dispatch_Controller(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Pinger:     dispatch_Pinger(self_id, sender_id, method, args, n_args); break;
+  case CLASS_Ponger:     dispatch_Ponger(self_id, sender_id, method, args, n_args); break;
   default: kprintf("unknown class %d\r\n", objects[self_id].class_id);
   }
 }
@@ -2726,6 +2773,8 @@ static void init_fields(int class_id, int self_id) {
   case CLASS_PhilCM:     init_fields_PhilCM(self_id);     break;
   case CLASS_Spinner:    init_fields_Spinner(self_id);    break;
   case CLASS_Controller: init_fields_Controller(self_id); break;
+  case CLASS_Pinger:     init_fields_Pinger(self_id);     break;
+  case CLASS_Ponger:     init_fields_Ponger(self_id);     break;
   default: break;
   }
 }

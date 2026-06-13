@@ -476,7 +476,7 @@ static int  aipl_is_win(window_t *w);    /* 1 if w is the AIPL window */
 static void aipl_mark_closed(void);      /* mark the AIPL window off-screen */
 
 /* AIPL window state — declared early (used by wm_drag_tick / the frame loop). */
-#define AIPL_ROWS 44
+#define AIPL_ROWS 56
 #define AIPL_COLS 72
 #define AIPL_QN   8
 struct aipl_ui {
@@ -490,7 +490,8 @@ struct aipl_ui {
   semaphore sem;
   window_t win;
   int  open;
-  volatile int running;       /* a program is live -> draw + tick graphics */
+  volatile int running;       /* a graphics program is live (Rotate4Lines)  */
+  int  gfx;                   /* 1 = graphics mode (fill window with lines)  */
 };
 static struct aipl_ui aui;
 static int  aipl_toolbar_hit(int sx, int sy);
@@ -1784,12 +1785,13 @@ static void basic_run_button(int inst, int idx)
 extern void abcl_rotate4_init(void);
 extern void abcl_rotate4_start(void);
 extern void abcl_rotate4_stop(void);
+extern void abcl_pingpong_init(void);
 extern void abcl_xinu_gui_render(void);
 extern void abcl_xinu_gui_tick_all(void);
 extern int  abcl_xinu_gui_handle_click(int, int);
 extern int  abcl_gui_ox, abcl_gui_oy;
 
-static const char *aipl_files[] = { "Rotate4Lines.abcl" };
+static const char *aipl_files[] = { "Rotate4Lines.abcl", "PingPong.abcl" };
 #define AIPL_NFILE ((int)(sizeof(aipl_files) / sizeof(aipl_files[0])))
 static const char *aipl_src[] = {
   "// Rotate4LinesXinu.abcl  (abcl2c -> C -> kernel actors)",
@@ -1892,19 +1894,29 @@ static void aipl_exec_line(const char *line) {
   const char *p = line; while (*p == ' ' || *p == '\t') p++;
   if (*p == 0) { aipl_emit("aipl> "); return; }
   if (0 == strncmp(p, "files", 5)) {
-    int i; aipl_emit("AIPL programs:\n");
+    int i; aui.gfx = 0; aui.full = 1; aipl_emit("AIPL programs:\n");
     for (i = 0; i < AIPL_NFILE; i++) { aipl_emit("  "); aipl_emit(aipl_files[i]); aipl_emit("\n"); }
   } else if (0 == strncmp(p, "list", 4) || 0 == strncmp(p, "cat", 3)) {
-    int i; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
+    int i; aui.gfx = 0; aui.full = 1; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
   } else if (0 == strncmp(p, "run", 3)) {
-    aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
-    abcl_rotate4_init(); aui.running = 1;
+    /* pick the program by name (default Rotate4Lines); PingPong is text-only. */
+    if (strstr(p, "Ping") || strstr(p, "ping")) {
+      aipl_emit("running PingPong.abcl (output in the AIPL console window)...\n");
+      aui.gfx = 0; aui.running = 0;
+      abcl_pingpong_init();
+    } else {
+      aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
+      aui.gfx = 1; aui.running = 1;
+      abcl_rotate4_init();
+    }
   } else if (0 == strncmp(p, "start", 5)) {
-    abcl_rotate4_start(); aui.running = 1; aipl_emit("started\n");
+    abcl_rotate4_start(); aui.gfx = 1; aui.running = 1; aipl_emit("started\n");
   } else if (0 == strncmp(p, "stop", 4)) {
     abcl_rotate4_stop(); aipl_emit("stopped\n");
+  } else if (0 == strncmp(p, "text", 4)) {        /* leave graphics mode -> editor */
+    aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_emit("text mode\n");
   } else if (0 == strncmp(p, "help", 4)) {
-    aipl_emit("cmds: files | list | run \"Rotate4Lines.abcl\" | start | stop\n");
+    aipl_emit("cmds: files | list | run \"Rotate4Lines.abcl\" | run \"PingPong.abcl\" | start | stop | text\n");
   } else {
     aipl_emit("? unknown — try `help`\n");
   }
@@ -1922,8 +1934,8 @@ thread aipl_win_main(void) {
 
 static int aipl_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static const struct { const char *label, *cmd; } aipl_btns[] = {
-  { "files", "files" }, { "list", "list" }, { "run", "run \"Rotate4Lines.abcl\"" },
-  { "start", "start" }, { "stop", "stop" },
+  { "files", "files" }, { "list", "list" }, { "rotate", "run \"Rotate4Lines.abcl\"" },
+  { "pingpong", "run \"PingPong.abcl\"" }, { "start", "start" }, { "stop", "stop" }, { "text", "text" },
 };
 #define AIPL_NBTN ((int)(sizeof(aipl_btns) / sizeof(aipl_btns[0])))
 static void aipl_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh) {
@@ -1956,25 +1968,46 @@ static void aipl_draw(window_t *self, unsigned int frame) {
     u->full = 0;
   }
   aipl_draw_toolbar(self);
-  /* text console — AIPL_TXT_N rows, scrolled so the edit cursor stays visible
-   * (so arrow-up reveals earlier lines instead of losing the cursor). */
   int txt_top = AIPL_TXT_TOP(self);
-  int rows = AIPL_TXT_N;
+
+  /* Graphics mode (Rotate4Lines): clear the content + paint the rotating
+   * lines/buttons (offset to the window).  Like the BASIC window's gfx mode. */
+  if (u->gfx) {
+    int gfx_h = self->y + self->height - txt_top - 2;
+    if (gfx_h > 0) {
+      fill_rect(self->x + 1, txt_top, self->width - 2, gfx_h, self->content_bg);
+      abcl_gui_ox = self->x + 4;
+      abcl_gui_oy = txt_top;
+      abcl_xinu_gui_render();
+    }
+    return;
+  }
+
+  /* Text mode: the console fills the whole content area, so the edit cursor
+   * roams the full window (BASIC-style).  Scroll so the cursor stays visible. */
+  int content_h = self->y + self->height - txt_top - 3;
+  int max_rows = content_h / line_h;
+  if (max_rows < 1) return;
+  if (max_rows > AIPL_ROWS) max_rows = AIPL_ROWS;
   int have = u->filled ? AIPL_ROWS : u->row + 1;
-  if (have < rows) rows = have;
+  int rows = have < max_rows ? have : max_rows;
   int start = (u->row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;   /* latest window */
-  if (have < rows) start = 0;
-  {                                       /* if the cursor row is above the
-                                           * window, scroll up to show it. */
+  {                                       /* keep the cursor row on screen */
     int ei = (u->ed_row - start + AIPL_ROWS) % AIPL_ROWS;
     if (ei >= rows) start = (u->ed_row - rows + 1 + AIPL_ROWS) % AIPL_ROWS;
   }
+  {                                       /* a scroll forces a full repaint */
+    static int last_start = -1;
+    if (start != last_start) { for (int r = 0; r < AIPL_ROWS; r++) u->dirty[r] = 1; last_start = start; }
+  }
   for (int i = 0; i < rows; i++) {
     int r = (start + i) % AIPL_ROWS;
-    int ry = txt_top + i * line_h;
-    fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
-    draw_string_at(self->x + 4, ry, u->ring[r], 0xFFD8C0FFU, self->content_bg);
-    u->dirty[r] = 0;
+    if (g_force_redraw || u->dirty[r]) {
+      int ry = txt_top + i * line_h;
+      fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
+      draw_string_at(self->x + 4, ry, u->ring[r], 0xFFD8C0FFU, self->content_bg);
+      if (!g_force_redraw) u->dirty[r] = 0;
+    }
   }
   {                                       /* blinking underline at the cursor */
     int ci = (u->ed_row - start + AIPL_ROWS) % AIPL_ROWS;
@@ -1983,19 +2016,8 @@ static void aipl_draw(window_t *self, unsigned int frame) {
       int cr_x = self->x + 4 + u->ed_col * FONT_WIDTH;
       if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
         unsigned int col = ((frame >> 2) & 1) ? 0xFFE0B0FFU : self->content_bg;
-        fill_rect(cr_x, cr_y + FONT_HEIGHT - 1, FONT_WIDTH, 2, col);
+        fill_rect(cr_x, cr_y + FONT_HEIGHT - 2, FONT_WIDTH, 2, col);
       }
-    }
-  }
-  /* graphics area below the strip: clear + paint the rotating lines/buttons */
-  if (u->running) {
-    int gfx_top = txt_top + AIPL_TXT_N * line_h + 2;
-    int gfx_h = self->y + self->height - gfx_top - 2;
-    if (gfx_h > 0) {
-      fill_rect(self->x + 1, gfx_top, self->width - 2, gfx_h, self->content_bg);
-      abcl_gui_ox = self->x + 4;
-      abcl_gui_oy = gfx_top;
-      abcl_xinu_gui_render();
     }
   }
 }
