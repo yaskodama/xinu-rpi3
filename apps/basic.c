@@ -54,6 +54,8 @@ static void (*g_pause)(int ms);              /* PAUSE n: sleep n ms */
 static void (*g_line)(int x1, int y1, int x2, int y2, int color); /* LINE seg */
 static void (*g_circle)(int cx, int cy, int r, int color);        /* CIRCLE  */
 static void (*g_wifi)(int action);           /* WIFI: 1=on 0=off 2=status   */
+static int  (*g_gfx_active)(void);           /* 1 if the window is in gfx mode */
+void basic_set_gfx_active(int (*fn)(void))           { g_gfx_active = fn; }
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
@@ -1039,7 +1041,7 @@ static const char *S_koch[] = {
 static const char *S_dragon[] = {
     "10 CLS 3",
     "20 X = 200",
-    "30 Y = 250",
+    "30 Y = 160",
     "40 A = 0",
     "50 L = 15",
     "60 D = 8",
@@ -2027,7 +2029,10 @@ static void do_run(void)
         if (pc < nprog) ip = prog[pc].text;
     }
     running = 0;
-    if (!err) emit("Ok\n");
+    /* Keep a drawn picture on screen: emitting "Ok" would print text, and the
+     * windowed BASIC wipes the graphics layer on the first text after drawing.
+     * So skip the "Ok" when the program left the window in graphics mode. */
+    if (!err && !(g_gfx_active && g_gfx_active())) emit("Ok\n");
 }
 
 /* ---- public: process one typed line ------------------------------- */

@@ -2089,6 +2089,9 @@ static void menu_exec(int sel)
 
 /* Set the interpreter hooks (global function pointers — idempotent; both
  * BASIC threads call this, the last write wins and they're identical). */
+/* 1 while the current BASIC window is showing pixel graphics — do_run() uses
+ * this to skip the "Ok" print (which would wipe a finished drawing). */
+static int bas_gfx_active(void) { return bui[basic_curi()].gfx; }
 static void basic_install_hooks(void)
 {
     extern void basic_set_cls(void (*)(int));
@@ -2097,6 +2100,7 @@ static void basic_install_hooks(void)
     extern void basic_set_line(void (*)(int, int, int, int, int));
     extern void basic_set_circle(void (*)(int, int, int, int));
     extern void basic_set_wifi(void (*)(int));
+    extern void basic_set_gfx_active(int (*)(void));
     basic_set_emit(bas_emit);
     basic_set_input(basic_getline);
     basic_set_cls(bas_cls);
@@ -2105,6 +2109,7 @@ static void basic_install_hooks(void)
     basic_set_line(bas_line);
     basic_set_circle(bas_circle);
     basic_set_wifi(bas_wifi);
+    basic_set_gfx_active(bas_gfx_active);
 }
 
 /* One REPL thread per BASIC window (apps/basic.c instance @inst). */
