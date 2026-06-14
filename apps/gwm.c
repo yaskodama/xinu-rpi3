@@ -2678,11 +2678,12 @@ static const unsigned char sg_kanji[16][112] = {
   /* 15 龍 */ {0x01,0x80,0x00,0x00,0x01,0xc1,0x80,0x00,0x1f,0xf9,0xff,0x80,0x1f,0xf9,0xff,0x80,0x0e,0x71,0xc0,0x00,0x0e,0x71,0x80,0x00,0x06,0x71,0xff,0x80,0x3f,0xfd,0xff,0x80,0x3f,0xfc,0x03,0x80,0x00,0x01,0xff,0x80,0x00,0x01,0xff,0x80,0x1f,0xf9,0x80,0x00,0x1f,0xf9,0xff,0x80,0x1c,0x39,0xff,0x80,0x1c,0x39,0x80,0x00,0x1f,0xf9,0x80,0x00,0x1f,0xf9,0xff,0x80,0x1c,0x39,0xff,0x80,0x1f,0xf9,0x80,0x00,0x1f,0xf9,0xff,0x80,0x1c,0x39,0xff,0x80,0x1c,0x39,0x80,0xc0,0x1c,0xb9,0xc1,0xc0,0x1c,0xf9,0xff,0xc0,0x1c,0xf1,0xff,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 };
 /* Draw a 28x28 1bpp kanji at (px,py) in colour col; flip = rotate 180 (gote). */
-static void dev_kanji(int px, int py, const unsigned char *bm, unsigned int col, int flip)
+static void dev_kanji(int px, int py, const unsigned char *bm, unsigned int col, int flip, int sz)
 {
     int r, c;
-    for (r = 0; r < 28; r++) for (c = 0; c < 28; c++) {
-        int sr = flip ? 27 - r : r, sc = flip ? 27 - c : c;
+    for (r = 0; r < sz; r++) for (c = 0; c < sz; c++) {
+        int sr0 = r * 28 / sz, sc0 = c * 28 / sz;          /* nearest-neighbour scale */
+        int sr = flip ? 27 - sr0 : sr0, sc = flip ? 27 - sc0 : sc0;
         if (bm[sr * 4 + (sc >> 3)] & (0x80 >> (sc & 7))) fill_rect(px + c, py + r, 1, 1, col);
     }
 }
@@ -2690,6 +2691,16 @@ static signed char sg_b[9][9];
 static int sg_hp[8], sg_ha[8];                 /* hands: base-type counts 1..7 */
 static int sg_turn = 1, sg_over = 0, sg_win = 0;
 static int sg_sx = -1, sg_sy = -1, sg_sh = 0;  /* selection: board cell, or hand type */
+static char sg_log_you[20] = "", sg_log_cpu[20] = "";   /* last move of each side */
+/* Format a move into buf in shogi-ish coords: file 9..1 left->right, rank 1..9.
+ * piece-letter, "* " for a drop, e.g. "P 77-76" or "P* 55". */
+static char sg_letter(int a);
+static void sg_fmt_move(char *buf, int pt, int fx, int fy, int tx, int ty, int drop)
+{
+    char p = sg_letter(pt < 0 ? -pt : pt);
+    if (drop) sprintf(buf, "%c* %d%d", p, 9 - tx, ty + 1);
+    else      sprintf(buf, "%c %d%d-%d%d", p, 9 - fx, fy + 1, 9 - tx, ty + 1);
+}
 static int sg_base(int a){ return a > 8 ? (a == 14 ? 6 : a == 15 ? 7 : a - 8) : a; }
 static int sg_val(int a){ static const int v[16] = {0,1,3,3,5,6,8,10,999,7,6,6,6,0,11,13};
                           return a < 16 ? v[a] : 0; }
@@ -2813,6 +2824,8 @@ static void sg_ai_move(void)
         if (sc > best) { best = sc; bi = i; }
     }
     if (bi >= 0) {
+        int pt = mv[bi][4] > 0 ? -mv[bi][4] : sg_b[mv[bi][1]][mv[bi][0]];
+        sg_fmt_move(sg_log_cpu, pt, mv[bi][0], mv[bi][1], mv[bi][2], mv[bi][3], mv[bi][4]);
         sg_apply(sg_b, sg_hp, sg_ha, -1, mv[bi][0], mv[bi][1], mv[bi][2], mv[bi][3], mv[bi][4]);
         if (!sg_has_king(sg_b, 1)) { sg_over = 1; sg_win = 2; }
     }
@@ -2827,11 +2840,12 @@ static void sg_init(void)
     sg_b[7][7] = 7;  sg_b[7][1] = 6;                           /* sente R,B */
     for (x = 0; x < 9; x++) { sg_b[2][x] = -1; sg_b[6][x] = 1; }  /* pawns */
     sg_turn = 1; sg_over = 0; sg_win = 0; sg_sx = -1; sg_sy = -1; sg_sh = 0;
+    sg_log_you[0] = 0; sg_log_cpu[0] = 0;
 }
 static void sg_board_geom(int *bx, int *by, int *cell)
 {
     *cell = 30; *bx = dev_win.x + (dev_win.width - 9 * 30) / 2;
-    *by = dev_win.y + WM_TITLEBAR_H + 64;
+    *by = dev_win.y + WM_TITLEBAR_H + 78;          /* leave room for status + move log */
 }
 
 static void dev_draw(window_t *self, unsigned int frame)
@@ -2941,22 +2955,30 @@ static void dev_draw_shogi(window_t *self)
         int t = sg_b[y][x];
         if (t != 0) { int a = t > 0 ? t : -t;          /* kanji; gote rotated 180 */
             dev_kanji(px + (cell - 28) / 2, py + (cell - 28) / 2, sg_kanji[a],
-                      a >= 9 ? 0xFFC01010U : (t > 0 ? 0xFF101010U : 0xFF402010U), t < 0); }
+                      a >= 9 ? 0xFFC01010U : (t > 0 ? 0xFF101010U : 0xFF402010U), t < 0, 28); }
         for (i = 0; i < nsel; i++) if (sel[i][0] == x && sel[i][1] == y)
             fill_rect(px + cell / 2 - 2, py + cell / 2 - 2, 4, 4, 0xFF1060E0U);
         if (sg_sh > 0 && sg_turn == 1 && !sg_over && sg_drop_ok(sg_b, 1, sg_sh, x, y))
             fill_rect(px + cell / 2 - 2, py + cell / 2 - 2, 4, 4, 0xFF10A030U);
     }
-    /* hands (your slots below, device's above) */
+    /* hands (your slots below, device's above) — captured pieces in kanji + count */
     int who2, type;
     for (who2 = 0; who2 < 2; who2++) { int *hand = who2 ? sg_hp : sg_ha; int wh = who2 ? 1 : -1;
         for (type = 1; type <= 7; type++) {
             int hx, hy, hw, hh; sg_handslot_rect(type, wh, &hx, &hy, &hw, &hh);
             unsigned int hc = (wh > 0 && sg_sh == type) ? 0xFF305878U : 0xFF182838U;
             fill_rect(hx, hy, hw - 1, hh, hc);
-            char s[8]; s[0] = sg_letter(type); s[1] = hand[type] > 9 ? '+' : (char)('0' + hand[type]); s[2] = 0;
-            draw_string_at(hx + 4, hy + 5, s, hand[type] ? 0xFFFFFFFFU : 0xFF607080U, hc);
+            unsigned int kc = hand[type] ? (wh > 0 ? 0xFFE8F0F8U : 0xFFE0A848U) : 0xFF38485AU;
+            dev_kanji(hx + 1, hy + 1, sg_kanji[type], kc, 0, 16);
+            if (hand[type] > 0) { char cb[2]; cb[0] = hand[type] > 9 ? '+' : (char)('0' + hand[type]); cb[1] = 0;
+                draw_string_at(hx + 19, hy + 5, cb, 0xFFFFFFFFU, hc); }
         } }
+    /* move log: where you and the device last moved/dropped */
+    { char l1[28], l2[28];
+      sprintf(l1, "You: %s", sg_log_you[0] ? sg_log_you : "-");
+      sprintf(l2, "CPU: %s", sg_log_cpu[0] ? sg_log_cpu : "-");
+      draw_string_at(gx, self->y + WM_TITLEBAR_H + 28, l1, 0xFF90E0FFU, screen);
+      draw_string_at(gx, self->y + WM_TITLEBAR_H + 40, l2, 0xFFFFC090U, screen); }
     { int b, bx, by, bw, bh; const char *lbl[2] = { "Home", "New Game" };
       for (b = 0; b < 2; b++) { sg_btn_rect(b, &bx, &by, &bw, &bh);
           fill_rect(bx, by, bw, bh, 0xFF205088U); fill_rect(bx, by, bw, 1, 0xFF3A78C8U);
@@ -2977,6 +2999,7 @@ static void dev_click_shogi(int dx, int dy)
     if (!sg_inb(cx, cy)) return;
     if (sg_sh > 0) {                                     /* drop */
         if (sg_drop_ok(sg_b, 1, sg_sh, cx, cy)) {
+            sg_fmt_move(sg_log_you, sg_sh, 0, 0, cx, cy, 1);
             sg_apply(sg_b, sg_hp, sg_ha, 1, -1, -1, cx, cy, sg_sh); sg_sh = 0;
             if (!sg_has_king(sg_b, -1)) { sg_over = 1; sg_win = 1; return; }
             sg_turn = 2; sg_ai_move();
@@ -2987,6 +3010,7 @@ static void dev_click_shogi(int dx, int dy)
         int out[40][2], m = sg_moves(sg_b, sg_sx, sg_sy, out), i, ok = 0;
         for (i = 0; i < m; i++) if (out[i][0] == cx && out[i][1] == cy) ok = 1;
         if (ok) {
+            sg_fmt_move(sg_log_you, sg_b[sg_sy][sg_sx], sg_sx, sg_sy, cx, cy, 0);
             sg_apply(sg_b, sg_hp, sg_ha, 1, sg_sx, sg_sy, cx, cy, 0); sg_sx = -1;
             if (!sg_has_king(sg_b, -1)) { sg_over = 1; sg_win = 1; return; }
             sg_turn = 2; sg_ai_move();
