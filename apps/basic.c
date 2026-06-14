@@ -58,6 +58,12 @@ static int  (*g_gfx_active)(void);           /* 1 if the window is in gfx mode *
 void basic_set_gfx_active(int (*fn)(void))           { g_gfx_active = fn; }
 static void (*g_fullscreen)(int on);         /* maximize/restore the window */
 void basic_set_fullscreen(void (*fn)(int))           { g_fullscreen = fn; }
+static void (*g_button)(int n, const char *label);   /* BUTTON n,"label" */
+static int  (*g_btn)(int n);                  /* BTN(n): clicks since last read */
+static void (*g_buttons_reset)(void);         /* clear program buttons (on RUN) */
+void basic_set_button(void (*fn)(int, const char *)) { g_button = fn; }
+void basic_set_btn(int (*fn)(int))                   { g_btn = fn; }
+void basic_set_buttons_reset(void (*fn)(void))       { g_buttons_reset = fn; }
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
@@ -269,6 +275,7 @@ static void   seval(char *out, int max);   /* evaluate a string expression  */
 static int    peek_is_string(void);        /* does a string factor come next? */
 static double *arr_elem(int li);           /* &A(i[,j]); ip at '(' on entry  */
 static void   paren_sexpr(char *out, int max);
+static double paren_num(void);             /* '(' expr ')' -> number */
 static double factor(void)
 {
     skipsp();
@@ -297,6 +304,8 @@ static double factor(void)
     if (kw("RED"))     return 4;  if (kw("MAGENTA")) return 5;
     if (kw("YELLOW"))  return 6;  if (kw("WHITE"))   return 7;
     if (kw("LIME"))    return 10; if (kw("GRAY") || kw("GREY")) return 8;
+    if (kw("BTN")) { double n = paren_num();      /* BTN(n): clicks on button n */
+        return g_btn ? (double)g_btn((int)n) : 0; }
     if (kw("LEN")) { char s[SVAR_LEN]; paren_sexpr(s, sizeof s);
         int n = 0; while (s[n]) n++; return (double)n; }
     if (kw("ASC")) { char s[SVAR_LEN]; paren_sexpr(s, sizeof s);
@@ -1042,37 +1051,56 @@ static const char *S_bubble[] = {
 };
 static const char *S_koch[] = {
     "10 CLS 3",
-    "20 X = 50",
-    "30 Y = 280",
-    "40 A = 0",
-    "50 L = 486",
-    "60 D = 4",
-    "70 GOSUB *KOCH",
-    "80 END",
-    "100 *KOCH",
-    "110 IF D > 0 THEN GOTO 200",
-    "120 GOSUB *DRAW",
-    "130 RETURN",
-    "200 D = D - 1",
-    "210 L = L / 3",
-    "220 GOSUB *KOCH",
-    "230 A = A + 60",
-    "240 GOSUB *KOCH",
-    "250 A = A - 120",
+    "20 D = 4",
+    "30 BUTTON 0, \"Level -\"",
+    "40 BUTTON 1, \"Level +\"",
+    "50 GOSUB *SHOW",
+    "60 GOSUB *REDRAW",
+    "70 *LOOP",
+    "80 P = BTN(1) - BTN(0)",
+    "90 IF P = 0 THEN GOTO 150",
+    "100 D = D + P",
+    "110 IF D < 1 THEN D = 1",
+    "120 IF D > 10 THEN D = 10",
+    "130 GOSUB *SHOW",
+    "140 GOSUB *REDRAW",
+    "150 WAIT 0.05",
+    "160 GOTO *LOOP",
+    "170 *SHOW",
+    "180 BUTTON 2, \"LEVEL \" + STR$(D)",
+    "190 RETURN",
+    "200 *REDRAW",
+    "210 CLS 3",
+    "220 X = 50",
+    "230 Y = 280",
+    "240 A = 0",
+    "250 L = 486",
     "260 GOSUB *KOCH",
-    "270 A = A + 60",
-    "280 GOSUB *KOCH",
-    "290 D = D + 1",
-    "300 L = L * 3",
-    "310 RETURN",
-    "500 *DRAW",
-    "510 RAD = A * 0.01745329",
-    "520 X2 = X + L * COS(RAD)",
-    "530 Y2 = Y - L * SIN(RAD)",
-    "540 LINE (X,Y)-(X2,Y2),CYAN",
-    "550 X = X2",
-    "560 Y = Y2",
-    "570 RETURN"
+    "270 RETURN",
+    "300 *KOCH",
+    "310 IF D > 0 THEN GOTO 400",
+    "320 GOSUB *DRAW",
+    "330 RETURN",
+    "400 D = D - 1",
+    "410 L = L / 3",
+    "420 GOSUB *KOCH",
+    "430 A = A + 60",
+    "440 GOSUB *KOCH",
+    "450 A = A - 120",
+    "460 GOSUB *KOCH",
+    "470 A = A + 60",
+    "480 GOSUB *KOCH",
+    "490 D = D + 1",
+    "500 L = L * 3",
+    "510 RETURN",
+    "600 *DRAW",
+    "610 RAD = A * 0.01745329",
+    "620 X2 = X + L * COS(RAD)",
+    "630 Y2 = Y - L * SIN(RAD)",
+    "640 LINE (X,Y)-(X2,Y2),CYAN",
+    "650 X = X2",
+    "660 Y = Y2",
+    "670 RETURN",
 };
 static const char *S_dragon[] = {
     "10 CLS 3",
@@ -1613,7 +1641,7 @@ static const struct { const char *name; const char *const *line; int n; } sample
     { "fizz.bas",    S_fizz,    6 },
     { "table.bas",   S_table,   5 },
     { "count.bas",   S_count,   6 },
-    { "koch.bas",     S_koch,     32 },
+    { "koch.bas",     S_koch,     (int)(sizeof(S_koch)/sizeof(S_koch[0])) },
     { "dragon.bas",   S_dragon,   36 },
     { "bubble.bas",   S_bubble,   32 },
     { "qsort.bas",    S_qsort,    60 },
@@ -1811,6 +1839,13 @@ static void exec_stmt(void)
         int mode = 1; skipsp();
         if (b_isdigit(*ip)) mode = (int)expr();
         if (g_cls) g_cls(mode);
+        return;
+    }
+    if (kw("BUTTON")) {                       /* BUTTON n, "label" — GUI button */
+        int n = (int)expr(); skipsp();
+        if (*ip != ',') { berr("BUTTON ,"); return; } ip++;
+        char lbl[SVAR_LEN]; seval(lbl, sizeof lbl);
+        if (g_button) g_button(n, lbl);
         return;
     }
     if (kw("PLOT")) {                         /* PLOT x,y[,charcode] */
@@ -2036,6 +2071,7 @@ static void do_run(void)
     running = 1; fortop = 0; gosubtop = 0; whiletop = 0; err = 0; g_break = 0;
     data_pc = -1; data_ip = 0;                 /* rewind DATA          */
     var_clear_all();                                              /* clear vars/arrays */
+    if (g_buttons_reset) g_buttons_reset();                       /* drop program buttons */
     if (nprog == 0) { running = 0; emit("Ok\n"); return; }
     pc = 0; ip = prog[0].text;
     long guard = 0;

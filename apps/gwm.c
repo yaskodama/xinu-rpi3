@@ -1385,6 +1385,7 @@ extern void basic_break_n(int inst);       /* Ctrl-C a specific window         *
  * recorded here so CLS 2 can erase JUST those (in the bg colour) instead of
  * blanking the whole area each frame (the full-area dark fill was the flicker). */
 #define BAS_GOPS 384
+#define UBTN_MAX 5      /* max program-defined GUI buttons per BASIC window */
 struct bas_gop { unsigned char type, color; short a, b, c, d; }; /* 1=line 2=plot 3=circle */
 struct basic_ui {
     char          ring[BAS_ROWS][BAS_COLS + 1];
@@ -1403,6 +1404,10 @@ struct basic_ui {
     int           ngops, gops_over; /* count + "too many to track" flag       */
     struct bas_gop pgops[BAS_GOPS]; /* the PREVIOUS frame's primitives (on screen) */
     int           png, perase;      /* prev count + how many paired-erased so far  */
+    char          ubtn[UBTN_MAX][16]; /* program-defined GUI button labels ("" off) */
+    int           ubtn_press[UBTN_MAX]; /* pending click counts (read by BTN())      */
+    int           ubtn_on;          /* 1 = show program buttons in the toolbar       */
+    int           tb_dirty;         /* toolbar needs a redraw (a label changed)      */
 };
 static struct basic_ui bui[NBASIC];
 static void          basic_draw(window_t *self, unsigned int frame);
@@ -1725,14 +1730,58 @@ static const struct { const char *label; const char *cmd; } bas_btns[] = {
 };
 #define BAS_NBTN ((int)(sizeof(bas_btns) / sizeof(bas_btns[0])))
 
+/* ---- program-defined GUI buttons (BASIC BUTTON / BTN) -------------------
+ * When a running program declares buttons, the BASIC window's toolbar shows
+ * those instead of the sample-launch buttons; a click bumps a counter that the
+ * program reads with BTN(n).  Used by koch (level +/-), the flight view toggle,
+ * etc.  All called on the BASIC thread (basic_curi picks the instance). */
+static void bas_button_set(int n, const char *label)
+{
+    int i = basic_curi();
+    if (i < 0 || i >= NBASIC || n < 0 || n >= UBTN_MAX) return;
+    struct basic_ui *u = &bui[i];
+    int k = 0; for (; label[k] && k < 15; k++) u->ubtn[n][k] = label[k];
+    u->ubtn[n][k] = 0;
+    u->ubtn_on = 1; u->tb_dirty = 1;
+}
+static int bas_btn_read(int n)
+{
+    int i = basic_curi();
+    if (i < 0 || i >= NBASIC || n < 0 || n >= UBTN_MAX) return 0;
+    struct basic_ui *u = &bui[i];
+    int c = u->ubtn_press[n]; u->ubtn_press[n] = 0; return c;
+}
+static void bas_buttons_reset(void)
+{
+    int i = basic_curi();
+    if (i < 0 || i >= NBASIC) return;
+    struct basic_ui *u = &bui[i];
+    for (int n = 0; n < UBTN_MAX; n++) { u->ubtn[n][0] = 0; u->ubtn_press[n] = 0; }
+    u->ubtn_on = 0; u->tb_dirty = 1;
+}
+static int bas_ubtn_count(struct basic_ui *u)
+{
+    int c = 0; for (int n = 0; n < UBTN_MAX; n++) if (u->ubtn[n][0]) c = n + 1; return c;
+}
+/* The toolbar's active button set: program buttons when on, else samples. */
+static const char *bas_tb_label(struct basic_ui *u, int i)
+{
+    return u->ubtn_on ? u->ubtn[i] : bas_btns[i].label;
+}
+static int bas_tb_count(struct basic_ui *u)
+{
+    return u->ubtn_on ? bas_ubtn_count(u) : BAS_NBTN;
+}
+
 /* Button i's rectangle in desktop coords, laid out left-to-right and wrapped
  * to a new row when it would overflow the window width. */
 static void bas_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh)
 {
+    struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
     int left = self->x + 4, right = self->x + self->width - 2;
     int x = left, row = 0, k;
     for (k = 0; ; k++) {
-        int w = bas_slen(bas_btns[k].label) * FONT_WIDTH + 8;
+        int w = bas_slen(bas_tb_label(u, k)) * FONT_WIDTH + 8;
         if (x + w > right && x > left) { row++; x = left; }   /* wrap */
         if (k == i) {
             *bx = x; *by = self->y + WM_TITLEBAR_H + 3 + row * BAS_ROW_H;
@@ -1743,13 +1792,16 @@ static void bas_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *
 }
 static void basic_draw_toolbar(window_t *self)
 {
-    int i, bx, by, bw, bh;
+    struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
+    int i, bx, by, bw, bh, n = bas_tb_count(u);
+    unsigned int face = u->ubtn_on ? 0xFF205088U : 0xFF1E6E38U;
+    unsigned int hi   = u->ubtn_on ? 0xFF3A78C8U : 0xFF2EA050U;
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, BAS_TB_H, 0xFF0A2A12U);
-    for (i = 0; i < BAS_NBTN; i++) {
+    for (i = 0; i < n; i++) {
         bas_btn_rect(self, i, &bx, &by, &bw, &bh);
-        fill_rect(bx, by, bw, bh, 0xFF1E6E38U);
-        fill_rect(bx, by, bw, 1, 0xFF2EA050U);              /* top highlight  */
-        draw_string_at(bx + 4, by + 1, bas_btns[i].label, 0xFFEFFFE0U, 0xFF1E6E38U);
+        fill_rect(bx, by, bw, bh, face);
+        fill_rect(bx, by, bw, 1, hi);                       /* top highlight  */
+        draw_string_at(bx + 4, by + 1, bas_tb_label(u, i), 0xFFEFFFE0U, face);
     }
 }
 
@@ -1759,7 +1811,7 @@ static void basic_draw(window_t *self, unsigned int frame)
     struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
     if (u->full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                              self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); u->full = 0; }
-    if (g_force_redraw) basic_draw_toolbar(self);   /* gate: avoid bleeding on top */
+    if (g_force_redraw || u->tb_dirty) { basic_draw_toolbar(self); u->tb_dirty = 0; }
     /* Graphics mode: CLS/PLOT/LINE paint the content directly; leave it be. */
     if (u->gfx) return;
     int content_h = self->height - (BAS_TXT_TOP(self) - self->y) - 3;
@@ -1814,7 +1866,7 @@ static int basic_toolbar_hit(int sx, int sy, int *inst)
     bi = bas_index_of(top);
     if (bi < 0) return -1;
     if (inst) *inst = bi;
-    for (i = 0; i < BAS_NBTN; i++) {
+    for (i = 0; i < bas_tb_count(&bui[bi]); i++) {
         bas_btn_rect(top, i, &bx, &by, &bw, &bh);
         if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) return i;
     }
@@ -1930,8 +1982,13 @@ static void basic_run_button(int inst, int idx)
 {
     const char *cmd;
     struct basic_ui *u;
-    if (inst < 0 || inst >= NBASIC || idx < 0 || idx >= BAS_NBTN) return;
+    if (inst < 0 || inst >= NBASIC || idx < 0) return;
     u = &bui[inst];
+    if (u->ubtn_on) {                 /* program button: record the click for BTN() */
+        if (idx < UBTN_MAX) u->ubtn_press[idx]++;
+        return;
+    }
+    if (idx >= BAS_NBTN) return;
     cmd = bas_btns[idx].cmd;
     bas_emit_u(u, cmd); bas_emit_u(u, "\n");
     bas_enqueue(u, cmd);
@@ -2306,6 +2363,14 @@ static void basic_install_hooks(void)
     basic_set_wifi(bas_wifi);
     basic_set_gfx_active(bas_gfx_active);
     basic_set_fullscreen(bas_fullscreen);
+    {
+        extern void basic_set_button(void (*)(int, const char *));
+        extern void basic_set_btn(int (*)(int));
+        extern void basic_set_buttons_reset(void (*)(void));
+        basic_set_button(bas_button_set);
+        basic_set_btn(bas_btn_read);
+        basic_set_buttons_reset(bas_buttons_reset);
+    }
 }
 
 /* One REPL thread per BASIC window (apps/basic.c instance @inst). */
