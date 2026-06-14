@@ -599,7 +599,7 @@ const char* abcl_class_name(int class_id) {
   case CLASS_Controller: return "Controller";
   case CLASS_Pinger:     return "Pinger";
   case CLASS_Ponger:     return "Ponger";
-  default: return "?";
+  default: return class_id >= 200 ? "VM" : "?";   /* 200 = VM_CLASS_BASE (dynamic) */
   }
 }
 
@@ -2758,7 +2758,146 @@ void abcl_pingpong_init(void) {
   g_pinger = create_obj(CLASS_Pinger, 0, NULL);
 }
 
+/* ====================================================================
+ * Dynamic actor bytecode VM.  An "actor binary" (.avm module) is sent to the
+ * running kernel over HTTP (/actor/loadvm), parsed into a dynamic class table,
+ * created with create_obj() and run on the EXISTING actor runtime (mailboxes,
+ * scheduler, GC, monitor) — no kernel recompile.  VM class ids start at
+ * VM_CLASS_BASE so dispatch()'s default case routes them to abcl_vm_dispatch().
+ *
+ * .avm module layout (little-endian):
+ *   "AVM1" | u16 nstr | nstr*( u16 len, len bytes ) |
+ *   u16 nclass | nclass*( u16 nameIdx, u16 nfields, u16 nmethods |
+ *      nmethods*( u16 nameIdx, u8 nparams, u16 codeLen, codeLen bytes ) )
+ * Opcodes: 01 PUSHI(i32) 02 LDF(u8) 03 STF(u8) 04 LDA(u8) 05 SELF
+ *   10..14 ADD SUB MUL DIV MOD   20..25 LT LE GT GE EQ NE
+ *   30 JMP(u16) 31 JZ(u16)   40 SEND(u16 mIdx,u8 nargs) 41 SPAWN(u16 cIdx)
+ *   42 PRINT   43 RET
+ * ==================================================================== */
+#define VM_CLASS_BASE  200
+#define VM_MAX_CLASSES 16
+#define VM_MAX_METHODS 16
+#define VM_STR_MAX     64
+#define VM_MODULE_MAX  8192
+#define VM_STRBUF_MAX  2048
+#define VM_VSTACK      64
+typedef struct { int name, n_params, code_off, code_len; } vmmethod_t;
+typedef struct { int name, n_fields, n_methods; vmmethod_t m[VM_MAX_METHODS]; } vmclass_t;
+static unsigned char vm_mod[VM_MODULE_MAX]; static int vm_mod_len = 0;
+static char          vm_strbuf[VM_STRBUF_MAX];
+static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
+static vmclass_t     vm_class[VM_MAX_CLASSES]; static int vm_n_class = 0;
+static int  vm_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
+static long vm_i32(const unsigned char *p) {
+  return (long)(int)((unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24)); }
+
+int abcl_vm_load(const unsigned char *buf, int len) {
+  if (len < 6 || len > VM_MODULE_MAX) return -1;
+  if (buf[0]!='A'||buf[1]!='V'||buf[2]!='M'||buf[3]!='1') return -1;
+  memcpy(vm_mod, buf, len); vm_mod_len = len;
+  const unsigned char *p = vm_mod + 4, *end = vm_mod + len;
+  int ns = vm_u16(p); p += 2, vm_n_str = 0; int sb = 0, i;
+  for (i = 0; i < ns && i < VM_STR_MAX; i++) {
+    if (p + 2 > end) return -1;
+    int l = vm_u16(p); p += 2;
+    if (p + l > end || sb + l + 1 > VM_STRBUF_MAX) return -1;
+    vm_str[i] = &vm_strbuf[sb]; memcpy(&vm_strbuf[sb], p, l); vm_strbuf[sb+l] = 0; sb += l+1; p += l;
+  }
+  vm_n_str = i;
+  if (p + 2 > end) return -1;
+  int nc = vm_u16(p); p += 2; vm_n_class = 0;
+  int c, mi;
+  for (c = 0; c < nc && c < VM_MAX_CLASSES; c++) {
+    if (p + 6 > end) return -1;
+    vmclass_t *cl = &vm_class[c];
+    cl->name = vm_u16(p); p += 2; cl->n_fields = vm_u16(p); p += 2; cl->n_methods = vm_u16(p); p += 2;
+    for (mi = 0; mi < cl->n_methods && mi < VM_MAX_METHODS; mi++) {
+      if (p + 5 > end) return -1;
+      cl->m[mi].name = vm_u16(p); p += 2; cl->m[mi].n_params = *p++;
+      cl->m[mi].code_len = vm_u16(p); p += 2; cl->m[mi].code_off = (int)(p - vm_mod);
+      if (p + cl->m[mi].code_len > end) return -1;
+      p += cl->m[mi].code_len;
+    }
+    vm_n_class++;
+  }
+  return vm_n_class > 0 ? VM_CLASS_BASE : -1;
+}
+int abcl_vm_class_count(void) { return vm_n_class; }
+const char *abcl_vm_class_name(int ci) {
+  if (ci < 0 || ci >= vm_n_class) return "?";
+  int s = vm_class[ci].name; return (s >= 0 && s < vm_n_str) ? vm_str[s] : "?";
+}
+int abcl_vm_spawn(int ci) {
+  if (ci < 0 || ci >= vm_n_class) return -1;
+  int id = create_obj(VM_CLASS_BASE + ci, 0, NULL), i;
+  if (id >= 0) for (i = 0; i < MAX_FIELDS; i++) { objects[id].fields[i].tag = V_INT; objects[id].fields[i].i = 0; }
+  return id;
+}
+void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, int n_args) {
+  (void)sender;
+  int ci = objects[self].class_id - VM_CLASS_BASE, k;
+  if (ci < 0 || ci >= vm_n_class) return;
+  vmclass_t *cl = &vm_class[ci]; vmmethod_t *mt = NULL;
+  for (k = 0; k < cl->n_methods; k++) {
+    const char *mn = vm_str[cl->m[k].name];
+    if (mn && 0 == strcmp(mn, method)) { mt = &cl->m[k]; break; }
+  }
+  if (!mt) return;
+  const unsigned char *code = vm_mod + mt->code_off; int clen = mt->code_len;
+  long stk[VM_VSTACK]; int sp = 0, pc = 0; long guard = 0;
+#define VPUSH(v) do { if (sp < VM_VSTACK) stk[sp++] = (long)(v); } while (0)
+#define VPOP()   (sp > 0 ? stk[--sp] : 0)
+  while (pc < clen) {
+    if (++guard > 2000000L) break;
+    unsigned char op = code[pc++];
+    switch (op) {
+    case 0x01: VPUSH(vm_i32(code + pc)); pc += 4; break;
+    case 0x02: { int f = code[pc++]; VPUSH(f < MAX_FIELDS ? objects[self].fields[f].i : 0); } break;
+    case 0x03: { int f = code[pc++]; long v = VPOP();
+                 if (f < MAX_FIELDS) { objects[self].fields[f].tag = V_INT; objects[self].fields[f].i = v; } } break;
+    case 0x04: { int a = code[pc++]; VPUSH(a < n_args ? args[a].i : 0); } break;
+    case 0x05: VPUSH(self); break;
+    case 0x10: { long b = VPOP(), a = VPOP(); VPUSH(a + b); } break;
+    case 0x11: { long b = VPOP(), a = VPOP(); VPUSH(a - b); } break;
+    case 0x12: { long b = VPOP(), a = VPOP(); VPUSH(a * b); } break;
+    case 0x13: { long b = VPOP(), a = VPOP(); VPUSH(b ? a / b : 0); } break;
+    case 0x14: { long b = VPOP(), a = VPOP(); VPUSH(b ? a % b : 0); } break;
+    case 0x20: { long b = VPOP(), a = VPOP(); VPUSH(a <  b); } break;
+    case 0x21: { long b = VPOP(), a = VPOP(); VPUSH(a <= b); } break;
+    case 0x22: { long b = VPOP(), a = VPOP(); VPUSH(a >  b); } break;
+    case 0x23: { long b = VPOP(), a = VPOP(); VPUSH(a >= b); } break;
+    case 0x24: { long b = VPOP(), a = VPOP(); VPUSH(a == b); } break;
+    case 0x25: { long b = VPOP(), a = VPOP(); VPUSH(a != b); } break;
+    case 0x30: pc = vm_u16(code + pc); break;
+    case 0x31: { int t = vm_u16(code + pc); pc += 2; if (VPOP() == 0) pc = t; } break;
+    case 0x40: { int mn = vm_u16(code + pc); pc += 2; int na = code[pc++], i;
+                 value_t va[8]; if (na > 8) na = 8;
+                 for (i = na - 1; i >= 0; i--) { va[i].tag = V_INT; va[i].i = VPOP(); }
+                 int recv = (int)VPOP();
+                 if (mn >= 0 && mn < vm_n_str) abcl_enqueue(self, recv, vm_str[mn], na, va); } break;
+    case 0x41: { int ci2 = vm_u16(code + pc); pc += 2; VPUSH(abcl_vm_spawn(ci2)); } break;
+    case 0x42: { long v = VPOP(); kprintf("[vm] a%d: %ld\r\n", self, v); } break;
+    case 0x43: pc = clen; break;
+    default:   pc = clen; break;
+    }
+  }
+#undef VPUSH
+#undef VPOP
+}
+/* HTTP entry: load a .avm, spawn its first class, kick it with "tick". */
+int abcl_vm_loadrun(const unsigned char *buf, int len) {
+  int base = abcl_vm_load(buf, len);
+  if (base < 0) return -1;
+  int id = abcl_vm_spawn(0);
+  if (id >= 0) abcl_enqueue(-1, id, "tick", 0, NULL);
+  return id;
+}
+
 static void dispatch(int self_id, int sender_id, const char* method, value_t* args, int n_args) {
+  if (objects[self_id].class_id >= VM_CLASS_BASE) {     /* dynamically-loaded VM actor */
+    abcl_vm_dispatch(self_id, sender_id, method, args, n_args);
+    return;
+  }
   switch (objects[self_id].class_id) {
   case CLASS_Fork: dispatch_Fork(self_id, sender_id, method, args, n_args); break;
   case CLASS_Philosopher: dispatch_Philosopher(self_id, sender_id, method, args, n_args); break;

@@ -758,6 +758,32 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /actor/loadvm — POST a .avm actor bytecode module in the body.
+             * Loads it into the dynamic class table, spawns its first class as
+             * a live actor on the existing runtime, and kicks it with "tick".
+             * Returns the new actor id (or -1).  This is the dynamic-actor
+             * loading path: an actor binary is sent and run without a kernel
+             * rebuild. */
+            if (0 == strncmp(reqbuf, "POST /actor/loadvm", 18) ||
+                0 == strncmp(reqbuf, "GET /actor/loadvm",  17))
+            {
+                extern int abcl_vm_loadrun(const unsigned char *, int);
+                int he = -1; char *hp = strstr(reqbuf, "\r\n\r\n");
+                if (NULL != hp) he = (int)(hp - reqbuf) + 4;
+                int id = -1, blen = 0;
+                if (he >= 0 && he <= n) {
+                    blen = n - he;
+                    id = abcl_vm_loadrun((const unsigned char *)(reqbuf + he), blen);
+                }
+                static char vresp[256];
+                int bl = sprintf(vresp + 100, "loadvm: body=%d spawned actor id=%d\r\n", blen, id);
+                int hl = sprintf(vresp, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                        "Content-Length: %d\r\n\r\n", bl);
+                memcpy(vresp + hl, vresp + 100, bl);
+                write(tcpdev, vresp, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1;
+                continue;
+            }
             /* /upload?dst=NAME — receive a binary file POST body and
              * store in the upload slot.  Pi 4 has nothing equivalent;
              * this is the Pi 3-side groundwork for eventual kernel.img

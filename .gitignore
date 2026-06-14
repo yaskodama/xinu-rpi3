@@ -52,3 +52,4 @@ docs/*.synctex.gz
 # Benchmark run logs / generated result dumps
 docs/*-log.txt
 docs/dining_results_clean.json
+tools/counter.avm
