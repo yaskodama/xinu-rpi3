@@ -1433,7 +1433,7 @@ static const char *S_flight[] = {
     "2114 RY = SY - 200",
     "2116 SX = 320 + RX * CBA - RY * SBA",
     "2118 SY = 200 + RX * SBA + RY * CBA",
-    "2120 RETURN"
+    "2120 RETURN",
     "2200 *BODY",
     "2210 CLS 2",
     "2220 LINE (20, 250)-(540, 250), GREEN",

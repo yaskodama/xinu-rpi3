@@ -2350,20 +2350,28 @@ static void pres_btn_rect(window_t *self, int which, int *bx,int *by,int *bw,int
     *by = self->y + self->height - *bh - 8;
     *bx = which == 0 ? self->x + 12 : self->x + self->width - *bw - 12;
 }
+extern void draw_string_scaled(int, int, const char *, unsigned int, unsigned int, int);
 static void pres_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     if (!g_force_redraw && !pres_dirty) return;
     pres_dirty = 0;
     unsigned int bg = self->content_bg;
-    int cx = self->x + 18, cy = self->y + WM_TITLEBAR_H + 14, i, y;
+    const char **sl = pres_slides[pres_slide];
+    int i, maxlen = 1, nlines = 0;
+    for (i = 0; sl[i]; i++) { int n = (int)strlen(sl[i]); if (n > maxlen) maxlen = n; nlines++; }
+    /* Scale the 8x8 font to fill the window (default ~3x), reflowing on resize. */
+    int avail_w = self->width - 36, avail_h = self->height - WM_TITLEBAR_H - 60;
+    int sw = avail_w / (maxlen * 8), sh = avail_h / ((nlines + 1) * 10);
+    int sc = sw < sh ? sw : sh; if (sc < 1) sc = 1; if (sc > 8) sc = 8;
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1,
               self->width - 2, self->height - WM_TITLEBAR_H - 2, bg);
-    const char **sl = pres_slides[pres_slide];
-    draw_string_at(cx, cy, sl[0], 0xFF7FE0FFU, bg);            /* title */
-    fill_rect(cx, cy + 11, self->width - 36, 1, 0xFF3A6CB8U);
-    y = cy + 26;
-    for (i = 1; sl[i]; i++) { draw_string_at(cx, y, sl[i], 0xFFE8F0F8U, bg); y += 14; }
+    int cx = self->x + 18, y = self->y + WM_TITLEBAR_H + 12;
+    draw_string_scaled(cx, y, sl[0], 0xFF7FE0FFU, bg, sc);          /* title */
+    y += 8 * sc + 4;
+    fill_rect(cx, y, self->width - 36, sc < 3 ? 1 : 2, 0xFF3A6CB8U);
+    y += 6 + sc;
+    for (i = 1; sl[i]; i++) { draw_string_scaled(cx, y, sl[i], 0xFFE8F0F8U, bg, sc); y += 8 * sc + 4; }
     { char pg[24]; sprintf(pg, "%d / %d", pres_slide + 1, PRES_NSLIDE);
       draw_string_at(self->x + self->width / 2 - 12, self->y + self->height - 24, pg,
                      0xFFA0C0E0U, bg); }
@@ -2393,7 +2401,7 @@ static void pres_mark_closed(window_t *w) { if (w == &pres_win) pres_open_flag =
 static void pres_open(void)
 {
     if (!pres_open_flag) {
-        pres_win.x = 120; pres_win.y = 70; pres_win.width = 470; pres_win.height = 300;
+        pres_win.x = 80; pres_win.y = 60; pres_win.width = 840; pres_win.height = 340;
         title_set(&pres_win, "Presentation");
         pres_win.chrome_color = 0xFFAACCEEU; pres_win.title_bg = 0xFF402080U;
         pres_win.title_fg = 0xFFFFFFFFU; pres_win.content_bg = 0xFF0C1422U;

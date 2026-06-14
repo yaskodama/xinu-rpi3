@@ -324,6 +324,28 @@ void draw_string_at(int px, int py, const char *s,
     }
 }
 
+/* Like draw_glyph_at but each 8x8 font pixel becomes an sc x sc block, so text
+ * can be scaled up (sc=1 == normal).  Used by the presentation window. */
+void draw_glyph_scaled(int px, int py, char c, unsigned int fg, unsigned int bg, int sc)
+{
+    if (!fb_ready || sc < 1) return;
+    unsigned char ci = (unsigned char)c;
+    if (ci < 0x20 || ci > 0x7F) ci = '?';
+    const unsigned char *glyph = font8x8[ci - 0x20];
+    for (int gy = 0; gy < FONT_HEIGHT; gy++) {
+        unsigned char bits = glyph[gy];
+        for (int gx = 0; gx < FONT_WIDTH; gx++)
+            fill_rect(px + gx * sc, py + gy * sc, sc, sc,
+                      (bits & (0x80 >> gx)) ? fg : bg);
+    }
+}
+void draw_string_scaled(int px, int py, const char *s,
+                        unsigned int fg, unsigned int bg, int sc)
+{
+    if (sc < 1) sc = 1;
+    while (*s) { draw_glyph_scaled(px, py, *s, fg, bg, sc); px += FONT_WIDTH * sc; s++; }
+}
+
 /* Sleep `ms` milliseconds via the Xinu syscall (yields the thread).
  * Used by wm_run() between frame redraws for animation pacing. */
 void delay_ms(unsigned int ms)
