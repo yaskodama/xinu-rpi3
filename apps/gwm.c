@@ -493,16 +493,6 @@ static void paint_scene(unsigned int frame)
     }
 }
 
-/* Deferred clipped repaint: a window move/resize only needs the union of the
- * old and new window rectangles redrawn, not the whole screen — repainting the
- * full desktop every drag frame is what makes dragging flicker. */
-static int g_cr_pending = 0, g_cr_x0, g_cr_y0, g_cr_x1, g_cr_y1;
-static void cr_add(int x0, int y0, int x1, int y1)
-{
-    if (!g_cr_pending) { g_cr_x0 = x0; g_cr_y0 = y0; g_cr_x1 = x1; g_cr_y1 = y1; g_cr_pending = 1; }
-    else { if (x0 < g_cr_x0) g_cr_x0 = x0; if (y0 < g_cr_y0) g_cr_y0 = y0;
-           if (x1 > g_cr_x1) g_cr_x1 = x1; if (y1 > g_cr_y1) g_cr_y1 = y1; }
-}
 /* Repaint the whole scene but clipped to (world) rect [x0,y0..x1,y1]. */
 static void wm_paint_region(int x0, int y0, int x1, int y1, unsigned int frame)
 {
@@ -511,6 +501,34 @@ static void wm_paint_region(int x0, int y0, int x1, int y1, unsigned int frame)
     paint_scene(frame);
     g_force_redraw = 0;
     video_clear_clip();
+}
+
+/* Outline (ghost) drag: while moving/resizing a window we don't redraw the
+ * window itself (that flickers); we draw only a thin rectangle outline that
+ * follows the cursor and commit the real move/resize on release. */
+#define OL_T 3                              /* outline thickness */
+static int g_ol_on = 0, g_ol_x, g_ol_y, g_ol_w, g_ol_h;
+static int g_drag_ghx, g_drag_ghy, g_drag_ghw, g_drag_ghh, g_drag_pending = 0;
+static void wm_outline_clear(void)
+{
+    if (!g_ol_on) return;
+    int x = g_ol_x, y = g_ol_y, w = g_ol_w, h = g_ol_h;
+    wm_paint_region(x, y, x + w, y + OL_T, 0);              /* restore the 4 strips */
+    wm_paint_region(x, y + h - OL_T, x + w, y + h, 0);
+    wm_paint_region(x, y, x + OL_T, y + h, 0);
+    wm_paint_region(x + w - OL_T, y, x + w, y + h, 0);
+    g_ol_on = 0;
+}
+static void wm_outline_set(int x, int y, int w, int h)
+{
+    wm_outline_clear();
+    video_set_viewport(vp_x, vp_y);
+    unsigned int c = 0xFF80C8FFU;
+    fill_rect(x, y, w, OL_T, c);
+    fill_rect(x, y + h - OL_T, w, OL_T, c);
+    fill_rect(x, y, OL_T, h, c);
+    fill_rect(x + w - OL_T, y, OL_T, h, c);
+    g_ol_on = 1; g_ol_x = x; g_ol_y = y; g_ol_w = w; g_ol_h = h;
 }
 
 /* ===================================================================
@@ -1056,35 +1074,40 @@ static void wm_drag_tick(void)
             w = window_at_point(cursor_x, cursor_y);  /* body click = focus only */
         }
         if (w) { active_win = w; wm_raise(w); g_need_full = 1; }
-    } else if (left && drag_win && drag_mode == 1) {  /* move: follow the cursor */
+        if (drag_win) {                               /* seed the ghost = window rect */
+            g_drag_ghx = drag_win->x; g_drag_ghy = drag_win->y;
+            g_drag_ghw = drag_win->width; g_drag_ghh = drag_win->height;
+            g_ol_on = 0; g_drag_pending = 0;
+        }
+    } else if (left && drag_win && drag_mode == 1) {  /* move: outline follows cursor */
         int nx = (cursor_x + vp_x) - drag_off_x;
         int ny = (cursor_y + vp_y) - drag_off_y;
         if (nx < 0) nx = 0;
         if (ny < 0) ny = 0;
         if (nx > WM_DESKTOP_W - drag_win->width)  nx = WM_DESKTOP_W - drag_win->width;
         if (ny > WM_DESKTOP_H - drag_win->height) ny = WM_DESKTOP_H - drag_win->height;
-        if (nx != drag_win->x || ny != drag_win->y) {
-            int ox = drag_win->x, oy = drag_win->y, ow = drag_win->width, oh = drag_win->height;
-            drag_win->x = nx; drag_win->y = ny;
-            cr_add(ox - 2, oy - 2, ox + ow + 2, oy + oh + 2);          /* vacated rect */
-            cr_add(nx - 2, ny - 2, nx + drag_win->width + 2, ny + drag_win->height + 2);
+        if (nx != g_drag_ghx || ny != g_drag_ghy) {                /* the window stays put */
+            g_drag_ghx = nx; g_drag_ghy = ny;
+            g_drag_ghw = drag_win->width; g_drag_ghh = drag_win->height;
+            g_drag_pending = 1;
         }
-    } else if (left && drag_win && drag_mode == 2) {  /* resize: corner follows */
+    } else if (left && drag_win && drag_mode == 2) {  /* resize: outline of new size */
         int nw = (cursor_x + vp_x) - drag_off_x - drag_win->x;
         int nh = (cursor_y + vp_y) - drag_off_y - drag_win->y;
         if (nw < WM_MIN_W) nw = WM_MIN_W;
         if (nh < WM_MIN_H) nh = WM_MIN_H;
         if (drag_win->x + nw > WM_DESKTOP_W) nw = WM_DESKTOP_W - drag_win->x;
         if (drag_win->y + nh > WM_DESKTOP_H) nh = WM_DESKTOP_H - drag_win->y;
-        if (nw != drag_win->width || nh != drag_win->height) {
-            int ow = drag_win->width, oh = drag_win->height;
-            drag_win->width = nw; drag_win->height = nh;
-            int mw = ow > nw ? ow : nw, mh = oh > nh ? oh : nh;
-            cr_add(drag_win->x - 2, drag_win->y - 2,
-                   drag_win->x + mw + 2, drag_win->y + mh + 2);
+        if (nw != g_drag_ghw || nh != g_drag_ghh) {
+            g_drag_ghx = drag_win->x; g_drag_ghy = drag_win->y;
+            g_drag_ghw = nw; g_drag_ghh = nh;
+            g_drag_pending = 1;
         }
-    } else if (!left && drag_win) {                  /* release */
-        drag_win = 0; drag_mode = 0;
+    } else if (!left && drag_win) {                  /* release: commit move/resize */
+        g_ol_on = 0;
+        if (drag_mode == 1) { drag_win->x = g_drag_ghx; drag_win->y = g_drag_ghy; }
+        else if (drag_mode == 2) { drag_win->width = g_drag_ghw; drag_win->height = g_drag_ghh; }
+        drag_win = 0; drag_mode = 0; g_drag_pending = 0; g_need_full = 1;
     }
 }
 
@@ -1141,16 +1164,12 @@ void wm_run(void)
             for (window_t *w = wm_head; w; w = w->next) t = w;
             chrome_done = t;
             g_need_full = 0;
-            g_cr_pending = 0;
-        } else if (g_cr_pending) {
-            /* A drag moved/resized a window — repaint only the affected region
-             * (old + new rect), clipped, so the rest of the desktop doesn't
-             * flicker each frame. */
-            wm_paint_region(g_cr_x0, g_cr_y0, g_cr_x1, g_cr_y1, frame);
-            window_t *t = 0;
-            for (window_t *w = wm_head; w; w = w->next) t = w;
-            chrome_done = t;
-            g_cr_pending = 0;
+            g_drag_pending = 0; g_ol_on = 0;
+        } else if (g_drag_pending) {
+            /* Dragging: move only the thin ghost outline (the window itself is
+             * not redrawn, so it doesn't flicker).  Committed on release. */
+            wm_outline_set(g_drag_ghx, g_drag_ghy, g_drag_ghw, g_drag_ghh);
+            g_drag_pending = 0;
         } else {
             /* (a) Content pass — incremental.  For windows added since the
              * last frame, draw chrome + a full content paint once; already-
