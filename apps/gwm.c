@@ -493,6 +493,26 @@ static void paint_scene(unsigned int frame)
     }
 }
 
+/* Deferred clipped repaint: a window move/resize only needs the union of the
+ * old and new window rectangles redrawn, not the whole screen — repainting the
+ * full desktop every drag frame is what makes dragging flicker. */
+static int g_cr_pending = 0, g_cr_x0, g_cr_y0, g_cr_x1, g_cr_y1;
+static void cr_add(int x0, int y0, int x1, int y1)
+{
+    if (!g_cr_pending) { g_cr_x0 = x0; g_cr_y0 = y0; g_cr_x1 = x1; g_cr_y1 = y1; g_cr_pending = 1; }
+    else { if (x0 < g_cr_x0) g_cr_x0 = x0; if (y0 < g_cr_y0) g_cr_y0 = y0;
+           if (x1 > g_cr_x1) g_cr_x1 = x1; if (y1 > g_cr_y1) g_cr_y1 = y1; }
+}
+/* Repaint the whole scene but clipped to (world) rect [x0,y0..x1,y1]. */
+static void wm_paint_region(int x0, int y0, int x1, int y1, unsigned int frame)
+{
+    video_set_clip(x0 - vp_x, y0 - vp_y, x1 - x0, y1 - y0);
+    g_force_redraw = 1;
+    paint_scene(frame);
+    g_force_redraw = 0;
+    video_clear_clip();
+}
+
 /* ===================================================================
  * Window-console shell text ring + flicker-free rendering.
  *
@@ -1044,8 +1064,10 @@ static void wm_drag_tick(void)
         if (nx > WM_DESKTOP_W - drag_win->width)  nx = WM_DESKTOP_W - drag_win->width;
         if (ny > WM_DESKTOP_H - drag_win->height) ny = WM_DESKTOP_H - drag_win->height;
         if (nx != drag_win->x || ny != drag_win->y) {
+            int ox = drag_win->x, oy = drag_win->y, ow = drag_win->width, oh = drag_win->height;
             drag_win->x = nx; drag_win->y = ny;
-            g_need_full = 1;
+            cr_add(ox - 2, oy - 2, ox + ow + 2, oy + oh + 2);          /* vacated rect */
+            cr_add(nx - 2, ny - 2, nx + drag_win->width + 2, ny + drag_win->height + 2);
         }
     } else if (left && drag_win && drag_mode == 2) {  /* resize: corner follows */
         int nw = (cursor_x + vp_x) - drag_off_x - drag_win->x;
@@ -1055,8 +1077,11 @@ static void wm_drag_tick(void)
         if (drag_win->x + nw > WM_DESKTOP_W) nw = WM_DESKTOP_W - drag_win->x;
         if (drag_win->y + nh > WM_DESKTOP_H) nh = WM_DESKTOP_H - drag_win->y;
         if (nw != drag_win->width || nh != drag_win->height) {
+            int ow = drag_win->width, oh = drag_win->height;
             drag_win->width = nw; drag_win->height = nh;
-            g_need_full = 1;
+            int mw = ow > nw ? ow : nw, mh = oh > nh ? oh : nh;
+            cr_add(drag_win->x - 2, drag_win->y - 2,
+                   drag_win->x + mw + 2, drag_win->y + mh + 2);
         }
     } else if (!left && drag_win) {                  /* release */
         drag_win = 0; drag_mode = 0;
@@ -1116,6 +1141,16 @@ void wm_run(void)
             for (window_t *w = wm_head; w; w = w->next) t = w;
             chrome_done = t;
             g_need_full = 0;
+            g_cr_pending = 0;
+        } else if (g_cr_pending) {
+            /* A drag moved/resized a window — repaint only the affected region
+             * (old + new rect), clipped, so the rest of the desktop doesn't
+             * flicker each frame. */
+            wm_paint_region(g_cr_x0, g_cr_y0, g_cr_x1, g_cr_y1, frame);
+            window_t *t = 0;
+            for (window_t *w = wm_head; w; w = w->next) t = w;
+            chrome_done = t;
+            g_cr_pending = 0;
         } else {
             /* (a) Content pass — incremental.  For windows added since the
              * last frame, draw chrome + a full content paint once; already-
