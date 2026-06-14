@@ -903,6 +903,13 @@ static void dev_mark_closed(window_t *w);
 /* Dismiss a window from its close box.  Shell windows are marked closed so
  * the right-click menu can re-open them (their supervisor shell keeps
  * running); other windows are simply unlinked from the WM. */
+/* Dynamic-actor I/O hooks (defined just before menu_exec, used early here). */
+extern volatile int vm_ask_pending, vm_ask_result;
+static void vm_io_tick(void);                    /* open pending VM print/gfx windows */
+static void vm_dialog_draw(void);                /* modal "accept actor?" dialog */
+static int  vm_dialog_click(int sx, int sy);
+static void vm_io_mark_closed(window_t *w);
+
 static void wm_close_window(window_t *w)
 {
     int idx, bi;
@@ -913,6 +920,7 @@ static void wm_close_window(window_t *w)
     if (bi >= 0) bas_mark_closed(bi);        /* allow menu to re-open it */
     if (aipl_is_win(w)) aipl_mark_closed();
     pres_mark_closed(w); dev_mark_closed(w);
+    vm_io_mark_closed(w);
     wm_remove(w);
     if (active_win == w) active_win = 0;
     g_need_full = 1;
@@ -1005,6 +1013,11 @@ static void wm_drag_tick(void)
     static int prev_left = 0, prev_right = 0;
     int left  = usbmouse_buttons & 1;
     int right = usbmouse_buttons & 2;
+
+    /* Modal "accept actor?" dialog intercepts all clicks while it is up. */
+    if (left && !prev_left && vm_ask_pending && vm_ask_result == 0) {
+        vm_dialog_click(cursor_x, cursor_y); prev_left = left; prev_right = right; return;
+    }
 
     /* Right-click opens the pull-down menu at the cursor. */
     if (right && !prev_right) {
@@ -1198,8 +1211,10 @@ void wm_run(void)
          * paints).  Only while the AIPL window is open + a program is live. */
         if (aui.open && aui.running) { extern void abcl_xinu_gui_tick_all(void); abcl_xinu_gui_tick_all(); }
 
+        vm_io_tick();            /* lazily open VM print/graphics windows   */
         draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
         draw_menu();             /* right-click pull-down menu, if open    */
+        vm_dialog_draw();        /* modal "accept actor?" dialog, on top   */
 
         /* Disarm the lazy lift.  Only re-stash + redraw the sprite if the
          * content pass actually hid it (i.e. something drew underneath it);
@@ -3079,6 +3094,154 @@ static void dev_open(void)
         dev_open_flag = 1; dev_screen = 0; wm_add(&dev_win);
     }
     dev_dirty = 1; active_win = &dev_win; wm_raise(&dev_win);
+}
+
+/* ===================================================================
+ * Dynamic-actor I/O: an "accept this actor?" dialog shown when a .avm is
+ * sent (webactor blocks on the answer); the actor's print() opens a text
+ * window and its graphics open a graphics window.  Both persist.
+ * =================================================================== */
+volatile int vm_ask_pending = 0;                 /* 1 = waiting for Yes/No */
+volatile int vm_ask_result  = 0;                 /* 0 pending, 1 yes, 2 no */
+static char  vm_ask_info[64] = "";
+/* Called on the webactor thread: post the request, block until answered. */
+int vm_accept_ask(const char *info)
+{
+    extern syscall sleep(unsigned);
+    int i = 0; for (; info[i] && i < 63; i++) vm_ask_info[i] = info[i]; vm_ask_info[i] = 0;
+    vm_ask_result = 0; vm_ask_pending = 1; g_need_full = 1;
+    int spins = 0;
+    while (vm_ask_result == 0 && spins < 1200) { sleep(50); spins++; }   /* up to ~60s */
+    int yes = (vm_ask_result == 1);
+    vm_ask_pending = 0; g_need_full = 1;
+    return yes;
+}
+static void vm_dialog_rect(int *x, int *y, int *w, int *h)
+{ *w = 320; *h = 96; *x = (WM_DESKTOP_W - *w) / 2; *y = (WM_DESKTOP_H - *h) / 2; }
+static void vm_dialog_btn(int yes, int *x, int *y, int *w, int *h)
+{ int dx, dy, dw, dh; vm_dialog_rect(&dx, &dy, &dw, &dh);
+  *w = 72; *h = 22; *y = dy + dh - *h - 12; *x = yes ? dx + 44 : dx + dw - *w - 44; }
+static void vm_dialog_draw(void)
+{
+    if (!vm_ask_pending || vm_ask_result != 0) return;
+    int dx, dy, dw, dh, b, bx, by, bw, bh;
+    vm_dialog_rect(&dx, &dy, &dw, &dh);
+    video_set_viewport(vp_x, vp_y);
+    fill_rect(dx - 3, dy - 3, dw + 6, dh + 6, 0xFF000000U);
+    fill_rect(dx, dy, dw, dh, 0xFF283038U);
+    fill_rect(dx, dy, dw, 3, 0xFF5090D0U);
+    draw_string_at(dx + 14, dy + 12, "Incoming actor binary", 0xFFFFD060U, 0xFF283038U);
+    draw_string_at(dx + 14, dy + 28, vm_ask_info, 0xFFC0E0FFU, 0xFF283038U);
+    draw_string_at(dx + 14, dy + 44, "Accept and run it on Xinu?", 0xFFE8F0F8U, 0xFF283038U);
+    { const char *lbl[2] = { "Yes", "No" }; unsigned int col[2] = { 0xFF2E8B40U, 0xFF8B3030U };
+      for (b = 0; b < 2; b++) { vm_dialog_btn(b == 0, &bx, &by, &bw, &bh);
+          fill_rect(bx, by, bw, bh, col[b]); fill_rect(bx, by, bw, 1, 0xFFFFFFFFU);
+          draw_string_at(bx + 10, by + 6, lbl[b], 0xFFFFFFFFU, col[b]); } }
+}
+static int vm_dialog_click(int sx, int sy)
+{
+    if (!vm_ask_pending || vm_ask_result != 0) return 0;
+    int dx = sx + vp_x, dy = sy + vp_y, b, bx, by, bw, bh;
+    for (b = 0; b < 2; b++) { vm_dialog_btn(b == 0, &bx, &by, &bw, &bh);
+        if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) {
+            vm_ask_result = (b == 0) ? 1 : 2; g_need_full = 1; return 1; } }
+    return 1;                                    /* modal: swallow other clicks */
+}
+
+/* ---- text window (actor print output) ---- */
+#define VMT_ROWS 64
+#define VMT_COLS 64
+static window_t vmtxt_win; static int vmtxt_open = 0, vmtxt_want = 0, vmtxt_dirty = 0;
+static char vmtxt_ring[VMT_ROWS][VMT_COLS + 1];
+static int  vmtxt_row = 0, vmtxt_filled = 0;
+/* Re-stamp the bottom-right resize grip (draw_chrome draws it, but a content
+ * pass can paint over it).  Same dot pattern as draw_chrome. */
+static void vm_draw_grip(window_t *w)
+{
+    int rx = w->x + w->width, ry = w->y + w->height;
+    fill_rect(rx - 5,  ry - 5,  3, 3, w->chrome_color);
+    fill_rect(rx - 10, ry - 5,  2, 2, w->chrome_color);
+    fill_rect(rx - 5,  ry - 10, 2, 2, w->chrome_color);
+}
+static void vmtxt_draw(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    if (!g_force_redraw && !vmtxt_dirty) return; vmtxt_dirty = 0;
+    /* draw_chrome() already filled the content background, so we clear only the
+     * individual text rows (no whole-window erase => no flash while dragging). */
+    int lh = FONT_HEIGHT + 2, i;
+    int maxr = (self->height - WM_TITLEBAR_H - 6) / lh; if (maxr > VMT_ROWS) maxr = VMT_ROWS;
+    int have = vmtxt_filled ? VMT_ROWS : vmtxt_row;
+    int show = have < maxr ? have : maxr;
+    int start = (vmtxt_row - show + VMT_ROWS) % VMT_ROWS;
+    for (i = 0; i < show; i++) { int r = (start + i) % VMT_ROWS;
+        int ry = self->y + WM_TITLEBAR_H + 4 + i * lh;
+        fill_rect(self->x + 1, ry - 1, self->width - 2, lh, self->content_bg);
+        draw_string_at(self->x + 6, ry, vmtxt_ring[r], 0xFFB6FFB6U, self->content_bg); }
+    vm_draw_grip(self);
+}
+void vm_print(int self_id, const char *s)         /* called on an actor thread */
+{
+    char *d = vmtxt_ring[vmtxt_row];
+    int p = sprintf(d, "a%d: ", self_id), i = 0;
+    for (; s[i] && p < VMT_COLS; i++) d[p++] = s[i]; d[p] = 0;
+    vmtxt_row = (vmtxt_row + 1) % VMT_ROWS; if (vmtxt_row == 0) vmtxt_filled = 1;
+    vmtxt_ring[vmtxt_row][0] = 0;
+    vmtxt_want = 1; vmtxt_dirty = 1;
+}
+
+/* ---- graphics window (actor draw output) ---- */
+#define VMG_MAX 512
+static window_t vmgfx_win; static int vmgfx_open = 0, vmgfx_want = 0, vmgfx_dirty = 0;
+static struct { short x1, y1, x2, y2; unsigned char col; } vmg_line[VMG_MAX];
+static int vmg_n = 0;
+static void vmgfx_draw(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    if (!g_force_redraw && !vmgfx_dirty) return; vmgfx_dirty = 0;
+    /* content_bg is the same dark colour draw_chrome already filled, so this
+     * fill is only needed to wipe old lines on an incremental (dirty) redraw. */
+    int gx = self->x + 4, gy = self->y + WM_TITLEBAR_H + 4, i;
+    if (!g_force_redraw)
+        fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
+                  self->height - WM_TITLEBAR_H - 2, self->content_bg);
+    for (i = 0; i < vmg_n; i++)
+        draw_line(gx + vmg_line[i].x1, gy + vmg_line[i].y1,
+                  gx + vmg_line[i].x2, gy + vmg_line[i].y2, bas_palette(vmg_line[i].col));
+    vm_draw_grip(self);
+}
+void vm_line(int x1, int y1, int x2, int y2, int color)   /* called on an actor thread */
+{
+    if (vmg_n < VMG_MAX) { vmg_line[vmg_n].x1 = x1; vmg_line[vmg_n].y1 = y1;
+        vmg_line[vmg_n].x2 = x2; vmg_line[vmg_n].y2 = y2; vmg_line[vmg_n].col = (unsigned char)color; vmg_n++; }
+    vmgfx_want = 1; vmgfx_dirty = 1;
+}
+void vm_cls(void) { vmg_n = 0; vmgfx_dirty = 1; }          /* clear the gfx window */
+
+/* Open any pending VM windows (called on the wm thread so wm_add is safe). */
+static void vm_io_tick(void)
+{
+    if (vmtxt_want && !vmtxt_open) {
+        vmtxt_win.x = 30; vmtxt_win.y = 60; vmtxt_win.width = 520; vmtxt_win.height = 300;
+        title_set(&vmtxt_win, "VM print");
+        vmtxt_win.chrome_color = 0xFFAACCEEU; vmtxt_win.title_bg = 0xFF103020U;
+        vmtxt_win.title_fg = 0xFFFFFFFFU; vmtxt_win.content_bg = 0xFF06140AU;
+        vmtxt_win.draw_content = vmtxt_draw; vmtxt_open = 1; wm_add(&vmtxt_win);
+        active_win = &vmtxt_win; wm_raise(&vmtxt_win); g_need_full = 1;
+    }
+    if (vmgfx_want && !vmgfx_open) {
+        vmgfx_win.x = 120; vmgfx_win.y = 100; vmgfx_win.width = 480; vmgfx_win.height = 360;
+        title_set(&vmgfx_win, "VM graphics");
+        vmgfx_win.chrome_color = 0xFFAACCEEU; vmgfx_win.title_bg = 0xFF102030U;
+        vmgfx_win.title_fg = 0xFFFFFFFFU; vmgfx_win.content_bg = 0xFF06100AU;
+        vmgfx_win.draw_content = vmgfx_draw; vmgfx_open = 1; wm_add(&vmgfx_win);
+        active_win = &vmgfx_win; wm_raise(&vmgfx_win); g_need_full = 1;
+    }
+}
+static void vm_io_mark_closed(window_t *w)
+{
+    if (w == &vmtxt_win) { vmtxt_open = 0; vmtxt_want = 0; }
+    if (w == &vmgfx_win) { vmgfx_open = 0; vmgfx_want = 0; }
 }
 
 static void menu_exec(int sel)

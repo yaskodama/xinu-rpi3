@@ -2834,7 +2834,6 @@ int abcl_vm_spawn(int ci) {
   return id;
 }
 void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, int n_args) {
-  (void)sender;
   int ci = objects[self].class_id - VM_CLASS_BASE, k;
   if (ci < 0 || ci >= vm_n_class) return;
   vmclass_t *cl = &vm_class[ci]; vmmethod_t *mt = NULL;
@@ -2876,7 +2875,23 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
                  int recv = (int)VPOP();
                  if (mn >= 0 && mn < vm_n_str) abcl_enqueue(self, recv, vm_str[mn], na, va); } break;
     case 0x41: { int ci2 = vm_u16(code + pc); pc += 2; VPUSH(abcl_vm_spawn(ci2)); } break;
-    case 0x42: { long v = VPOP(); kprintf("[vm] a%d: %ld\r\n", self, v); } break;
+    case 0x06: VPUSH(sender); break;                          /* SENDER */
+    case 0x07: { extern syscall sleep(unsigned); long ms = VPOP(); if (ms > 0) sleep((unsigned)ms); } break; /* WAIT */
+    case 0x08: { long v = sp > 0 ? stk[sp-1] : 0; VPUSH(v); } break; /* DUP */
+    case 0x42: { extern void vm_print(int, const char *); char ln[80]; long v = VPOP();
+                 sprintf(ln, "%ld", v); kprintf("[vm] a%d: %ld\r\n", self, v); vm_print(self, ln); } break;
+    case 0x44: { extern void vm_print(int, const char *);                       /* PRINTF fmt,nargs */
+                 int fi = vm_u16(code + pc); pc += 2; int na = code[pc++], i, ai = 0;
+                 long va[8]; if (na > 8) na = 8; for (i = na - 1; i >= 0; i--) va[i] = VPOP();
+                 const char *f = (fi >= 0 && fi < vm_n_str) ? vm_str[fi] : "";
+                 char ln[80]; int p = 0;
+                 while (*f && p < 76) { if (f[0] == '%' && f[1] == 'd') { if (ai < na) p += sprintf(ln + p, "%ld", va[ai++]); f += 2; }
+                              else { ln[p++] = *f++; } }
+                 ln[p] = 0; kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
+    case 0x45: { extern void vm_line(int, int, int, int, int);                  /* LINE x1,y1,x2,y2,col */
+                 long col = VPOP(), y2 = VPOP(), x2 = VPOP(), y1 = VPOP(), x1 = VPOP();
+                 vm_line((int)x1, (int)y1, (int)x2, (int)y2, (int)col); } break;
+    case 0x46: { extern void vm_cls(void); vm_cls(); } break;                   /* CLS */
     case 0x43: pc = clen; break;
     default:   pc = clen; break;
     }

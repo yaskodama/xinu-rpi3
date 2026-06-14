@@ -768,15 +768,28 @@ thread webactor_server(void)
                 0 == strncmp(reqbuf, "GET /actor/loadvm",  17))
             {
                 extern int abcl_vm_loadrun(const unsigned char *, int);
+                extern int vm_accept_ask(const char *);
                 int he = -1; char *hp = strstr(reqbuf, "\r\n\r\n");
                 if (NULL != hp) he = (int)(hp - reqbuf) + 4;
-                int id = -1, blen = 0;
+                /* The on-screen "accept actor?" dialog is OPTIONAL: pass
+                 * ?ask=0 (or ?noask) in the URL to auto-accept — handy for
+                 * benchmarks / scripted runs where no one is at the screen. */
+                char *qs = strstr(reqbuf, "\r\n"); int hdrlen = qs ? (int)(qs - reqbuf) : n;
+                int skip_ask = 0;
+                { char *a = strstr(reqbuf, "ask=0"); char *b = strstr(reqbuf, "noask");
+                  if ((a && a - reqbuf < hdrlen) || (b && b - reqbuf < hdrlen)) skip_ask = 1; }
+                int id = -1, blen = 0, accepted = 0;
                 if (he >= 0 && he <= n) {
                     blen = n - he;
-                    id = abcl_vm_loadrun((const unsigned char *)(reqbuf + he), blen);
+                    if (skip_ask) accepted = 1;          /* benchmark mode: no prompt */
+                    else { char info[64]; sprintf(info, "%d bytes from the network", blen);
+                           accepted = vm_accept_ask(info); }
+                    if (accepted)
+                        id = abcl_vm_loadrun((const unsigned char *)(reqbuf + he), blen);
                 }
                 static char vresp[256];
-                int bl = sprintf(vresp + 100, "loadvm: body=%d spawned actor id=%d\r\n", blen, id);
+                int bl = sprintf(vresp + 100, "loadvm: body=%d accepted=%d spawned actor id=%d\r\n",
+                                 blen, accepted, id);
                 int hl = sprintf(vresp, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                                         "Content-Length: %d\r\n\r\n", bl);
                 memcpy(vresp + hl, vresp + 100, bl);
