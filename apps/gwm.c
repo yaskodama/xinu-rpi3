@@ -1313,6 +1313,11 @@ extern void basic_break_n(int inst);       /* Ctrl-C a specific window         *
  * on-screen BASIC window; the matching interpreter state lives in apps/basic.c
  * bs[].  Instance is resolved by basic_curi() (interpreter-thread hooks) or by
  * the window pointer (draw) or the active window (keystrokes). */
+/* Flicker-free animation: each gfx primitive drawn since the last CLS 2 is
+ * recorded here so CLS 2 can erase JUST those (in the bg colour) instead of
+ * blanking the whole area each frame (the full-area dark fill was the flicker). */
+#define BAS_GOPS 384
+struct bas_gop { unsigned char type, color; short a, b, c, d; }; /* 1=line 2=plot 3=circle */
 struct basic_ui {
     char          ring[BAS_ROWS][BAS_COLS + 1];
     unsigned char dirty[BAS_ROWS];
@@ -1325,6 +1330,8 @@ struct basic_ui {
     semaphore     sem;
     window_t      win;
     int           open;             /* 1 while this BASIC window is on screen */
+    struct bas_gop gops[BAS_GOPS];  /* gfx primitives since the last CLS 2    */
+    int           ngops, gops_over; /* count + "too many to track" flag       */
 };
 static struct basic_ui bui[NBASIC];
 static void          basic_draw(window_t *self, unsigned int frame);
@@ -1440,14 +1447,91 @@ static void bas_emit(const char *s) { bas_emit_u(&bui[basic_curi()], s); }
  * BASIC window's content area.  basic_draw() leaves the content untouched
  * while in graphics mode (bas_gfx), so what we paint here persists frame to
  * frame; a program animates by CLS + draw + PAUSE in a loop (rotate.bas). -- */
+#define BAS_GFX_BG 0xFF001405U          /* the graphics-layer background colour */
+
+/* Record a gfx primitive so CLS 2 can erase just it (flicker-free animation). */
+static void bas_gop_add(struct basic_ui *u, int type, int a, int b, int c, int d, int color)
+{
+    if (u->ngops >= BAS_GOPS) { u->gops_over = 1; return; }
+    struct bas_gop *g = &u->gops[u->ngops++];
+    g->type = (unsigned char)type; g->color = (unsigned char)color;
+    g->a = (short)a; g->b = (short)b; g->c = (short)c; g->d = (short)d;
+}
+/* ---- factored draw helpers (take an explicit colour, so the same code both
+ * draws a primitive and erases it by passing the background colour). -------- */
+static void bas_draw_seg(struct basic_ui *u, int x1, int y1, int x2, int y2, unsigned int col)
+{
+    int gx0, gy0, gw, gh;
+    int dx = bas_abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+    int dy = -bas_abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+    int err = dx + dy, e2;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    for (;;) {
+        if (x1 >= 0 && x1 < gw && y1 >= 0 && y1 < gh)
+            fill_rect(gx0 + x1, gy0 + y1, 1, 1, col);
+        if (x1 == x2 && y1 == y2) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x1 += sx; }
+        if (e2 <= dx) { err += dx; y1 += sy; }
+    }
+}
+static void bas_draw_circle_col(struct basic_ui *u, int cx, int cy, int r, unsigned int col)
+{
+    int gx0, gy0, gw, gh, x = r, y = 0, err = 1 - r;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    if (r < 0) return;
+#define BAS_PX(px, py) do { int ax = (px), ay = (py); \
+        if (ax >= 0 && ax < gw && ay >= 0 && ay < gh) fill_rect(gx0 + ax, gy0 + ay, 1, 1, col); } while (0)
+    while (x >= y) {
+        BAS_PX(cx + x, cy + y); BAS_PX(cx - x, cy + y);
+        BAS_PX(cx + x, cy - y); BAS_PX(cx - x, cy - y);
+        BAS_PX(cx + y, cy + x); BAS_PX(cx - y, cy + x);
+        BAS_PX(cx + y, cy - x); BAS_PX(cx - y, cy - x);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+#undef BAS_PX
+}
+static void bas_draw_plot_cell(struct basic_ui *u, int x, int y, int ch, unsigned int fg)
+{
+    int gx0, gy0, gw, gh; char s[2];
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    if (x < 0 || x * FONT_WIDTH >= gw || y < 0 || y * FONT_HEIGHT >= gh) return;
+    if (ch == 0)                         /* erase: blank the cell */
+        fill_rect(gx0 + x * FONT_WIDTH, gy0 + y * FONT_HEIGHT, FONT_WIDTH, FONT_HEIGHT, BAS_GFX_BG);
+    else { s[0] = (char)ch; s[1] = 0;
+        draw_string_at(gx0 + x * FONT_WIDTH, gy0 + y * FONT_HEIGHT, s, fg, BAS_GFX_BG); }
+}
+/* Erase exactly what was drawn since the last CLS 2 — no full-area dark fill,
+ * so an animation (CLS 2 + redraw each frame) no longer flickers. */
+static void bas_gfx_erase_ops(struct basic_ui *u)
+{
+    int i;
+    for (i = 0; i < u->ngops; i++) {
+        struct bas_gop *g = &u->gops[i];
+        if (g->type == 1)      bas_draw_seg(u, g->a, g->b, g->c, g->d, BAS_GFX_BG);
+        else if (g->type == 2) bas_draw_plot_cell(u, g->a, g->b, 0, 0);
+        else if (g->type == 3) bas_draw_circle_col(u, g->a, g->b, g->c, BAS_GFX_BG);
+    }
+    u->ngops = 0; u->gops_over = 0;
+}
+static void bas_gfx_clear_full(struct basic_ui *u)
+{
+    int gx0, gy0, gw, gh;
+    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
+    if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, BAS_GFX_BG);
+    u->ngops = 0; u->gops_over = 0;
+}
 /* CLS mode: 1 = text screen, 2 = graphics screen, 3 = both. */
 static void bas_cls(int mode)
 {
     struct basic_ui *u = &bui[basic_curi()];
-    if (mode == 2 || mode == 3) {            /* clear the graphics layer */
-        int gx0, gy0, gw, gh;
-        bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
-        if (gw > 0 && gh > 0) fill_rect(gx0, gy0, gw, gh, 0xFF001405U);
+    if (mode == 3) {                         /* hard clear of the graphics layer */
+        bas_gfx_clear_full(u);
+    } else if (mode == 2) {                  /* soft clear: erase the last frame */
+        if (u->gops_over) bas_gfx_clear_full(u);   /* too many to track -> full */
+        else              bas_gfx_erase_ops(u);
     }
     if (mode == 1 || mode == 3) {            /* clear the text screen */
         int r;
@@ -1462,56 +1546,27 @@ static void bas_cls(int mode)
 static void bas_plot(int x, int y, int ch)
 {
     struct basic_ui *u = &bui[basic_curi()];
-    int gx0, gy0, gw, gh; char s[2];
-    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
     u->gfx = 1;
     if (ch < 0x20 || ch > 0x7e) ch = '*';
-    if (x < 0 || x * FONT_WIDTH >= gw || y < 0 || y * FONT_HEIGHT >= gh) return;
-    s[0] = (char)ch; s[1] = 0;
-    draw_string_at(gx0 + x * FONT_WIDTH, gy0 + y * FONT_HEIGHT, s, 0xFFB6FFB6U, 0xFF001405U);
+    bas_draw_plot_cell(u, x, y, ch, 0xFFB6FFB6U);
+    bas_gop_add(u, 2, x, y, ch, 0, 0);
 }
 /* LINE(x1,y1)-(x2,y2),color: a line segment (Bresenham) on the graphics
  * screen, coordinates in content-area pixels, colour 0..15. */
 static void bas_line(int x1, int y1, int x2, int y2, int color)
 {
     struct basic_ui *u = &bui[basic_curi()];
-    int gx0, gy0, gw, gh;
-    unsigned int col = bas_palette(color);
-    int dx = bas_abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
-    int dy = -bas_abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
-    int err = dx + dy, e2;
-    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
     u->gfx = 1;
-    for (;;) {
-        if (x1 >= 0 && x1 < gw && y1 >= 0 && y1 < gh)
-            fill_rect(gx0 + x1, gy0 + y1, 1, 1, col);
-        if (x1 == x2 && y1 == y2) break;
-        e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x1 += sx; }
-        if (e2 <= dx) { err += dx; y1 += sy; }
-    }
+    bas_draw_seg(u, x1, y1, x2, y2, bas_palette(color));
+    bas_gop_add(u, 1, x1, y1, x2, y2, color);
 }
 /* CIRCLE (cx,cy),r,color: outline circle (midpoint algorithm). */
 static void bas_circle(int cx, int cy, int r, int color)
 {
     struct basic_ui *u = &bui[basic_curi()];
-    int gx0, gy0, gw, gh, x = r, y = 0, err = 1 - r;
-    unsigned int col = bas_palette(color);
-    bas_gfx_rect(u, &gx0, &gy0, &gw, &gh);
     u->gfx = 1;
-    if (r < 0) return;
-#define BAS_PX(px, py) do { int ax = (px), ay = (py); \
-        if (ax >= 0 && ax < gw && ay >= 0 && ay < gh) fill_rect(gx0 + ax, gy0 + ay, 1, 1, col); } while (0)
-    while (x >= y) {
-        BAS_PX(cx + x, cy + y); BAS_PX(cx - x, cy + y);
-        BAS_PX(cx + x, cy - y); BAS_PX(cx - x, cy - y);
-        BAS_PX(cx + y, cy + x); BAS_PX(cx - y, cy + x);
-        BAS_PX(cx + y, cy - x); BAS_PX(cx - y, cy - x);
-        y++;
-        if (err < 0) err += 2 * y + 1;
-        else { x--; err += 2 * (y - x) + 1; }
-    }
-#undef BAS_PX
+    bas_draw_circle_col(u, cx, cy, r, bas_palette(color));
+    bas_gop_add(u, 3, cx, cy, r, 0, color);
 }
 /* WIFI ON|OFF|STATUS from BASIC (mirrors the `wifi` shell command). */
 static void bas_wifi(int action)
