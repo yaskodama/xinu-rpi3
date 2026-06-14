@@ -1382,7 +1382,7 @@ extern void basic_break_n(int inst);       /* Ctrl-C a specific window         *
 
 #define BAS_ROWS 300        /* ~10 screens of scrollback (arrow up/down roams it) */
 #define BAS_COLS 60
-#define BAS_TB_H  32                /* toolbar height (px) — two button rows  */
+#define BAS_TB_H  48                /* toolbar height (px) — three button rows (samples + program buttons) */
 #define BAS_BTN_H 12                /* one button's height                    */
 #define BAS_ROW_H 16                /* row pitch (button + gap)               */
 #define BAS_QN 8                    /* interpreter input line queue depth     */
@@ -1777,15 +1777,18 @@ static int bas_ubtn_count(struct basic_ui *u)
 {
     int c = 0; for (int n = 0; n < UBTN_MAX; n++) if (u->ubtn[n][0]) c = n + 1; return c;
 }
-/* The toolbar's active button set: program buttons when on, else samples. */
+/* The toolbar shows the sample-launch buttons, followed by any program-defined
+ * buttons — so a running program's buttons don't hide the way to launch other
+ * programs.  Index < BAS_NBTN = sample, else = program button (i - BAS_NBTN). */
 static const char *bas_tb_label(struct basic_ui *u, int i)
 {
-    return u->ubtn_on ? u->ubtn[i] : bas_btns[i].label;
+    return i < BAS_NBTN ? bas_btns[i].label : u->ubtn[i - BAS_NBTN];
 }
 static int bas_tb_count(struct basic_ui *u)
 {
-    return u->ubtn_on ? bas_ubtn_count(u) : BAS_NBTN;
+    return BAS_NBTN + (u->ubtn_on ? bas_ubtn_count(u) : 0);
 }
+static int bas_tb_is_user(int i) { return i >= BAS_NBTN; }
 
 /* Button i's rectangle in desktop coords, laid out left-to-right and wrapped
  * to a new row when it would overflow the window width. */
@@ -1808,10 +1811,11 @@ static void basic_draw_toolbar(window_t *self)
 {
     struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
     int i, bx, by, bw, bh, n = bas_tb_count(u);
-    unsigned int face = u->ubtn_on ? 0xFF205088U : 0xFF1E6E38U;
-    unsigned int hi   = u->ubtn_on ? 0xFF3A78C8U : 0xFF2EA050U;
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2, self->width - 2, BAS_TB_H, 0xFF0A2A12U);
     for (i = 0; i < n; i++) {
+        int usr = bas_tb_is_user(i);                        /* program button = blue */
+        unsigned int face = usr ? 0xFF205088U : 0xFF1E6E38U;
+        unsigned int hi   = usr ? 0xFF3A78C8U : 0xFF2EA050U;
         bas_btn_rect(self, i, &bx, &by, &bw, &bh);
         fill_rect(bx, by, bw, bh, face);
         fill_rect(bx, by, bw, 1, hi);                       /* top highlight  */
@@ -1823,7 +1827,10 @@ static void basic_draw(window_t *self, unsigned int frame)
 {
     const int line_h = FONT_HEIGHT + 1;
     struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
-    if (u->full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+    /* Full-area clear, but NOT while a gfx program owns the area: CLS 3 sets
+     * full=1 then the program draws its picture; clearing here afterwards would
+     * wipe it (e.g. koch at low levels finishes drawing before this ran). */
+    if (u->full && !u->gfx) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                              self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); u->full = 0; }
     if (g_force_redraw || u->tb_dirty) { basic_draw_toolbar(self); u->tb_dirty = 0; }
     /* Graphics mode: CLS/PLOT/LINE paint the content directly; leave it be. */
@@ -1998,12 +2005,12 @@ static void basic_run_button(int inst, int idx)
     struct basic_ui *u;
     if (inst < 0 || inst >= NBASIC || idx < 0) return;
     u = &bui[inst];
-    if (u->ubtn_on) {                 /* program button: record the click for BTN() */
-        if (idx < UBTN_MAX) u->ubtn_press[idx]++;
+    if (idx >= BAS_NBTN) {            /* appended program button: record for BTN() */
+        int n = idx - BAS_NBTN;
+        if (n < UBTN_MAX) u->ubtn_press[n]++;
         return;
     }
-    if (idx >= BAS_NBTN) return;
-    cmd = bas_btns[idx].cmd;
+    cmd = bas_btns[idx].cmd;          /* sample-launch button: run its command */
     bas_emit_u(u, cmd); bas_emit_u(u, "\n");
     bas_enqueue(u, cmd);
 }
