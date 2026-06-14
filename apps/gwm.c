@@ -1916,7 +1916,16 @@ static void aipl_exec_line(const char *line) {
   } else if (0 == strncmp(p, "text", 4)) {        /* leave graphics mode -> editor */
     aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_emit("text mode\n");
   } else if (0 == strncmp(p, "help", 4)) {
-    aipl_emit("cmds: files | list | run \"Rotate4Lines.abcl\" | run \"PingPong.abcl\" | start | stop | text\n");
+    aui.gfx = 0; aui.full = 1;
+    aipl_emit("AIPL commands:\n");
+    aipl_emit("  files                   list the available .abcl programs\n");
+    aipl_emit("  list                    show the selected program's source\n");
+    aipl_emit("  run \"Rotate4Lines.abcl\"  run it: 4 lines rotate (Spinner actors)\n");
+    aipl_emit("  run \"PingPong.abcl\"      run it: 2 actors trade a message (AIPL console)\n");
+    aipl_emit("  start                   resume the rotating spinners\n");
+    aipl_emit("  stop                    pause the rotating spinners\n");
+    aipl_emit("  text                    leave graphics mode, back to the editor\n");
+    aipl_emit("  help                    show this list\n");
   } else {
     aipl_emit("? unknown — try `help`\n");
   }
