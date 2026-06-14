@@ -1787,7 +1787,7 @@ static void basic_run_button(int inst, int idx)
  * ============================================================ */
 #define AIPL_TB_H  16            /* toolbar height                          */
 #define AIPL_TXT_N 10            /* text-console rows (rest is graphics)    */
-extern void abcl_rotate4_init(void);
+extern int  abcl_rotate4_init(void);
 extern void abcl_rotate4_start(void);
 extern void abcl_rotate4_stop(void);
 extern void abcl_pingpong_init(void);
@@ -1913,7 +1913,13 @@ static void aipl_exec_line(const char *line) {
     } else {
       aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
       aui.gfx = 1; aui.running = 1; aipl_capture = 0; aui.full = 1;
-      abcl_rotate4_init();
+      { int cid = abcl_rotate4_init();
+        char m[40]; int k = 0; const char *t = "controller id=";
+        while (t[k]) { m[k] = t[k]; k++; }
+        if (cid < 0) { m[k++]='-'; cid = -cid; }
+        if (cid >= 100) m[k++] = '0' + (cid/100)%10;
+        if (cid >= 10)  m[k++] = '0' + (cid/10)%10;
+        m[k++] = '0' + cid%10; m[k++]='\n'; m[k]=0; aipl_emit(m); }
     }
   } else if (0 == strncmp(p, "start", 5)) {
     abcl_rotate4_start(); aui.gfx = 1; aui.running = 1; aui.full = 1; aipl_emit("started\n");

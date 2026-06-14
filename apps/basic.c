@@ -987,7 +987,7 @@ static const char *S_bubble[] = {
     "140 GOSUB *DRAWALL",
     "150 WAIT 0.05",
     "160 NEXT",
-    "170 PRINT \"DONE!\"",
+    "170 REM keep the bars on screen",
     "180 END",
     "500 *SWAP",
     "510 T = A(J)",
@@ -999,8 +999,8 @@ static const char *S_bubble[] = {
     "720 FOR K = 0 TO N - 1",
     "730 V = A(K)",
     "740 BX = 30 + K * 6",
-    "750 BY = 380 - V * 3",
-    "760 LINE (BX,BY)-(BX,380),CYAN",
+    "750 BY = 290 - V * 2",
+    "760 LINE (BX,BY)-(BX,290),CYAN",
     "770 NEXT",
     "780 RETURN"
 };

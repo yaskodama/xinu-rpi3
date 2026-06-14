@@ -2595,7 +2595,8 @@ extern value_t xinu_gui_register_ticker(int n_args, value_t *args); /* (actor) *
 extern value_t xinu_gui_add_button(int n_args, value_t *args);     /* (label,x,y,w,h,obj,method) */
 
 enum { F_Spinner_idx, F_Spinner_angle, F_Spinner_speed, F_Spinner_cx, F_Spinner_cy,
-       F_Spinner_radius, F_Spinner_running, F_Spinner_rr, F_Spinner_gg, F_Spinner_bb };
+       F_Spinner_radius, F_Spinner_running, F_Spinner_rr, F_Spinner_gg, F_Spinner_bb,
+       F_Spinner_turns };
 
 static void init_fields_Spinner(int self_id) {
   objects[self_id].fields[F_Spinner_idx]     = mk_int(0L);
@@ -2608,6 +2609,7 @@ static void init_fields_Spinner(int self_id) {
   objects[self_id].fields[F_Spinner_rr]      = mk_int(200L);
   objects[self_id].fields[F_Spinner_gg]      = mk_int(220L);
   objects[self_id].fields[F_Spinner_bb]      = mk_int(255L);
+  objects[self_id].fields[F_Spinner_turns]   = mk_int(0L);
 }
 static long fi(int self_id, int f) {     /* field-as-long helper (int or float) */
   value_t v = objects[self_id].fields[f];
@@ -2627,17 +2629,26 @@ static void Spinner_init(int self_id, int sender_id, value_t* args, int n_args) 
   objects[self_id].fields[F_Spinner_gg]      = mk_int((n_args > 5) ? (long)((args[5].tag==V_INT)?args[5].i:(long)args[5].f) : 0L);
   objects[self_id].fields[F_Spinner_bb]      = mk_int((n_args > 6) ? (long)((args[6].tag==V_INT)?args[6].i:(long)args[6].f) : 0L);
   objects[self_id].fields[F_Spinner_running] = mk_int(1L);
+  objects[self_id].fields[F_Spinner_turns]   = mk_int(0L);
   enqueue(self_id, self_id, "tick", 0, NULL);
 }
 static void Spinner_start(int self_id, int s, value_t* a, int n) { (void)s;(void)a;(void)n;
+  objects[self_id].fields[F_Spinner_turns]   = mk_int(0L);    /* restart the 10-turn count */
   objects[self_id].fields[F_Spinner_running] = mk_int(1L); }
 static void Spinner_stop(int self_id, int s, value_t* a, int n)  { (void)s;(void)a;(void)n;
   objects[self_id].fields[F_Spinner_running] = mk_int(0L); }
+#define SPINNER_MAX_TURNS 10
 static void Spinner_tick(int self_id, int sender_id, value_t* args, int n_args) {
   (void)sender_id; (void)args; (void)n_args;
   if (fi(self_id, F_Spinner_running) == 1L) {
     double a = ff(self_id, F_Spinner_angle) + (double)fi(self_id, F_Spinner_speed);
-    if (a >= 360.0) a -= 360.0;
+    if (a >= 360.0) {
+      a -= 360.0;
+      long turns = fi(self_id, F_Spinner_turns) + 1;          /* one full rotation */
+      objects[self_id].fields[F_Spinner_turns] = mk_int(turns);
+      if (turns >= SPINNER_MAX_TURNS)                         /* stop after 10 turns */
+        objects[self_id].fields[F_Spinner_running] = mk_int(0L);
+    }
     objects[self_id].fields[F_Spinner_angle] = mk_float(a);
   }
   double ang = ff(self_id, F_Spinner_angle);
@@ -2697,9 +2708,15 @@ static void dispatch_Controller(int self_id, int sender_id, const char* method, 
  * buttons + registers tickers).  Called on demand from the AIPL window's
  * `run "Rotate4Lines.abcl"` (apps/gwm.c).  Idempotent-ish guard via g_rotate4. */
 static int g_rotate4 = -1;
-void abcl_rotate4_init(void) {
-  if (g_rotate4 >= 0) return;              /* already running */
+int abcl_rotate4_init(void) {
+  if (g_rotate4 >= 0) return g_rotate4;    /* already running */
+  /* Diagnostic test line (idx 7, not used by the spinners): drawn directly so
+   * the AIPL window can tell a render problem (line absent) from an actor
+   * problem (line present but the spinner lines absent). */
+  xinu_gui_set_line(8, (value_t[]){ mk_int(7L), mk_int(180L), mk_int(60L),
+      mk_int(420L), mk_int(300L), mk_int(255L), mk_int(255L), mk_int(0L) });
   g_rotate4 = create_obj(CLASS_Controller, 0, NULL);
+  return g_rotate4;
 }
 void abcl_rotate4_start(void) { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "start", 0, NULL); }
 void abcl_rotate4_stop(void)  { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "stop",  0, NULL); }
