@@ -658,7 +658,7 @@ static void sh_draw(window_t *self, unsigned int frame)
         int cr_y = SH_TXT_TOP(self) + (rows - 1) * line_h;
         int cr_x = self->x + 4 + s->cur_col * FONT_WIDTH;
         if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
-            unsigned int col = ((frame >> 2) & 1) ? 0xFFFFD23CU : self->content_bg;
+            unsigned int col = ((frame >> 4) & 1) ? 0xFFFFD23CU : self->content_bg;
             fill_rect(cr_x, cr_y, FONT_WIDTH, FONT_HEIGHT, col);
         }
     }
@@ -1637,7 +1637,7 @@ static void basic_draw(window_t *self, unsigned int frame)
             int cr_y = BAS_TXT_TOP(self) + i * line_h;
             int cr_x = self->x + 4 + u->ed_col * FONT_WIDTH;
             if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
-                unsigned int col = ((frame >> 2) & 1) ? 0xFF66FF66U : self->content_bg;
+                unsigned int col = ((frame >> 4) & 1) ? 0xFF66FF66U : self->content_bg;
                 fill_rect(cr_x, cr_y + FONT_HEIGHT - 2, FONT_WIDTH, 2, col);
             }
         }
@@ -1795,6 +1795,7 @@ extern void abcl_xinu_gui_render(void);
 extern void abcl_xinu_gui_tick_all(void);
 extern int  abcl_xinu_gui_handle_click(int, int);
 extern int  abcl_gui_ox, abcl_gui_oy;
+extern unsigned short abcl_gui_bg;
 
 static const char *aipl_files[] = { "Rotate4Lines.abcl", "PingPong.abcl" };
 #define AIPL_NFILE ((int)(sizeof(aipl_files) / sizeof(aipl_files[0])))
@@ -1911,11 +1912,11 @@ static void aipl_exec_line(const char *line) {
       abcl_pingpong_init();
     } else {
       aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
-      aui.gfx = 1; aui.running = 1; aipl_capture = 0;
+      aui.gfx = 1; aui.running = 1; aipl_capture = 0; aui.full = 1;
       abcl_rotate4_init();
     }
   } else if (0 == strncmp(p, "start", 5)) {
-    abcl_rotate4_start(); aui.gfx = 1; aui.running = 1; aipl_emit("started\n");
+    abcl_rotate4_start(); aui.gfx = 1; aui.running = 1; aui.full = 1; aipl_emit("started\n");
   } else if (0 == strncmp(p, "stop", 4)) {
     abcl_rotate4_stop(); aipl_emit("stopped\n");
   } else if (0 == strncmp(p, "text", 4)) {        /* leave graphics mode -> editor */
@@ -1981,16 +1982,19 @@ static void aipl_draw(window_t *self, unsigned int frame) {
   if (g_force_redraw) aipl_draw_toolbar(self);   /* gate: avoid bleeding on top */
   int txt_top = AIPL_TXT_TOP(self);
 
-  /* Graphics mode (Rotate4Lines): clear the content + paint the rotating
-   * lines/buttons (offset to the window).  Like the BASIC window's gfx mode. */
+  /* Graphics mode (Rotate4Lines): paint the rotating lines/buttons offset to
+   * the window.  The render erases each line's previous position itself, so we
+   * only clear the whole area ONCE (on entry, via u->full above) — no per-frame
+   * full clear, which keeps the frame cheap and the mouse cursor steady. */
   if (u->gfx) {
-    int gfx_h = self->y + self->height - txt_top - 2;
-    if (gfx_h > 0) {
-      fill_rect(self->x + 1, txt_top, self->width - 2, gfx_h, self->content_bg);
-      abcl_gui_ox = self->x + 4;
-      abcl_gui_oy = txt_top;
-      abcl_xinu_gui_render();
-    }
+    unsigned int bg = self->content_bg;            /* 0xAARRGGBB -> rgb565 */
+    abcl_gui_bg = (unsigned short)(
+        ((((bg >> 16) & 0xFF) >> 3) << 11) |
+        ((((bg >> 8)  & 0xFF) >> 2) << 5)  |
+        (((bg) & 0xFF) >> 3));
+    abcl_gui_ox = self->x + 4;
+    abcl_gui_oy = txt_top;
+    abcl_xinu_gui_render();
     return;
   }
 
@@ -2026,7 +2030,7 @@ static void aipl_draw(window_t *self, unsigned int frame) {
       int cr_y = txt_top + ci * line_h;
       int cr_x = self->x + 4 + u->ed_col * FONT_WIDTH;
       if (cr_x + FONT_WIDTH <= self->x + self->width - 4) {
-        unsigned int col = ((frame >> 2) & 1) ? 0xFFE0B0FFU : self->content_bg;
+        unsigned int col = ((frame >> 4) & 1) ? 0xFFE0B0FFU : self->content_bg;
         fill_rect(cr_x, cr_y + FONT_HEIGHT - 2, FONT_WIDTH, 2, col);
       }
     }

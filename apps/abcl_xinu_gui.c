@@ -104,6 +104,7 @@ typedef struct {
     int valid;
     int x1, y1, x2, y2;
     int r, g, b;
+    int has_prev, px1, py1, px2, py2;   /* last-drawn endpoints, for erase */
 } gline_t;
 
 static gline_t   g_lines[MAX_GLINES];
@@ -112,8 +113,12 @@ static int       lines_init_done = 0;
 
 /* Render offset: the AIPL window (apps/gwm.c) sets these to its content origin
  * each frame so the rotating lines + Start/Stop buttons (authored at absolute
- * coords) paint INSIDE the window.  Default 0 = full-screen (legacy). */
+ * coords) paint INSIDE the window.  Default 0 = full-screen (legacy).
+ * abcl_gui_bg is the window background, used to erase a line's previous
+ * position so the animation needs NO per-frame full-area clear (which made the
+ * mouse cursor blink). */
 int abcl_gui_ox = 0, abcl_gui_oy = 0;
+unsigned short abcl_gui_bg = 0;
 
 static void lines_ensure_init(void)
 {
@@ -726,11 +731,25 @@ void abcl_xinu_gui_render(void)
             unsigned short c = rgb565(g_lines[i].r, g_lines[i].g, g_lines[i].b);
             int x1 = g_lines[i].x1 + abcl_gui_ox, y1 = g_lines[i].y1 + abcl_gui_oy;
             int x2 = g_lines[i].x2 + abcl_gui_ox, y2 = g_lines[i].y2 + abcl_gui_oy;
+            /* erase the previous segment (background) so no full-area clear is
+             * needed each frame — keeps the frame cheap so the cursor is steady */
+            if (g_lines[i].has_prev) {
+                int qx1 = g_lines[i].px1 + abcl_gui_ox, qy1 = g_lines[i].py1 + abcl_gui_oy;
+                int qx2 = g_lines[i].px2 + abcl_gui_ox, qy2 = g_lines[i].py2 + abcl_gui_oy;
+                draw_line(qx1,   qy1,   qx2,   qy2,   abcl_gui_bg);
+                draw_line(qx1+1, qy1,   qx2+1, qy2,   abcl_gui_bg);
+                draw_line(qx1,   qy1+1, qx2,   qy2+1, abcl_gui_bg);
+                draw_line(qx1-1, qy1,   qx2-1, qy2,   abcl_gui_bg);
+                draw_line(qx1,   qy1-1, qx2,   qy2-1, abcl_gui_bg);
+            }
             draw_line(x1,   y1,   x2,   y2,   c);
             draw_line(x1+1, y1,   x2+1, y2,   c);
             draw_line(x1,   y1+1, x2,   y2+1, c);
             draw_line(x1-1, y1,   x2-1, y2,   c);
             draw_line(x1,   y1-1, x2,   y2-1, c);
+            g_lines[i].px1 = g_lines[i].x1; g_lines[i].py1 = g_lines[i].y1;
+            g_lines[i].px2 = g_lines[i].x2; g_lines[i].py2 = g_lines[i].y2;
+            g_lines[i].has_prev = 1;
         }
     }
     signal(lines_mu);
