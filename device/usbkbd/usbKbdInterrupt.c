@@ -100,6 +100,18 @@ static const char keymap[256][2] = {
     [103] = {'=', '='},      /* Keypad =                  */
 };
 
+/* ---- auto-repeat (typematic) state ---------------------------------------
+ * USB boot keyboards only send a report when a key changes, so a *held* key
+ * produces a single keypress.  We publish the most-recently-pressed key here
+ * (its translated byte sequence + the raw usage id so we can tell when it is
+ * released); a separate slow timer thread (kbd_repeat_bridge in main.c) re-
+ * injects the sequence while the key stays down, giving cursor keys / typing
+ * a "hold to repeat" behaviour. */
+volatile char     g_kbd_repeat_seq[3] = {0,0,0};
+volatile int      g_kbd_repeat_len    = 0;     /* 0 = nothing held to repeat   */
+volatile unsigned g_kbd_repeat_gen    = 0;     /* bumps on every NEW keypress  */
+static   uchar    g_kbd_repeat_usage  = 0;     /* usage id of the repeat key   */
+
 /**
  * Called when the USB transfer request from a USB keyboard's IN interrupt
  * endpoint completes or fails.
@@ -183,7 +195,24 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
                 }
                 /* else: input ring overrun — drop */
             }
+
+            /* Publish this key as the auto-repeat candidate (the newest key in
+             * the report wins).  The repeat thread re-injects it while held. */
+            for (k = 0; k < slen && k < 3; k++) g_kbd_repeat_seq[k] = seq[k];
+            g_kbd_repeat_len   = slen;
+            g_kbd_repeat_usage = usage_id;
+            g_kbd_repeat_gen++;                 /* restart the repeat delay     */
         }
+
+        /* Stop repeating once the repeat key is no longer held down. */
+        if (g_kbd_repeat_len > 0)
+        {
+            int still = 0;
+            for (i = 2; i < 8; i++)
+                if (data[i] != 0 && data[i] == g_kbd_repeat_usage) still = 1;
+            if (!still) g_kbd_repeat_len = 0;
+        }
+
         USBKBD_TRACE("Reported %u new characters", count);
         signaln(kbd->isema, count);
         memcpy(kbd->recent_usage_ids, data + 2, 6);

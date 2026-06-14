@@ -130,6 +130,7 @@ static int          bak_x, bak_y;       /* where the sprite is currently drawn *
  * disturb it.  g_cursor_lifted records whether we actually hid it. */
 static volatile int g_paint_armed  = 0;
 static volatile int g_cursor_lifted = 0;
+static tid_typ      g_wm_tid = -1;      /* the wm_run thread; only it may lift */
 
 static void draw_cursor_xy(int cx, int cy)
 {
@@ -187,6 +188,11 @@ static void cursor_show(void)
  * (correct), not on every animation frame somewhere else on screen. */
 static void gv_cursor_predraw(int sx, int sy, int w, int h)
 {
+    /* Only the wm thread's content pass may touch the cursor backing store.
+     * Other threads (e.g. the BASIC interpreter drawing CLS/LINE graphics)
+     * also go through fill_rect/draw_line — they must NOT race cursor_hide()
+     * here, which would corrupt the sprite patch and the animation. */
+    if (thrcurrent != g_wm_tid) return;
     if (!g_paint_armed || g_cursor_lifted) return;
     if (!cursor_visible || !cursor_bak_valid) return;
     /* Overlap test against the sprite's current position (bak_x,bak_y). */
@@ -1054,7 +1060,9 @@ void wm_run(void)
     for (window_t *w = wm_head; w; w = w->next) chrome_done = w;
     cursor_show();
     /* Install the overlap-aware lazy-lift hook: from now on the cursor is
-     * only hidden when a draw genuinely lands on it, not once per frame. */
+     * only hidden when a draw genuinely lands on it, not once per frame.
+     * Record our thread id so only this thread's draws lift the sprite. */
+    g_wm_tid = thrcurrent;
     extern void (*gv_predraw_rect)(int, int, int, int);
     gv_predraw_rect = gv_cursor_predraw;
 
@@ -2223,6 +2231,34 @@ static void menu_exec(int sel)
 /* 1 while the current BASIC window is showing pixel graphics — do_run() uses
  * this to skip the "Ok" print (which would wipe a finished drawing). */
 static int bas_gfx_active(void) { return bui[basic_curi()].gfx; }
+
+/* Maximize (on=1) / restore (on=0) the calling thread's BASIC window — used by
+ * the `debug` command so the line debugger runs full-screen.  Picks the
+ * instance by thread (basic_curi), so it follows the window that ran `debug`. */
+static int bas_fs_saved[NBASIC][4];
+static int bas_fs_on[NBASIC];
+static void bas_fullscreen(int on)
+{
+    int i = basic_curi();
+    if (i < 0 || i >= NBASIC) return;
+    struct basic_ui *u = &bui[i];
+    if (on) {
+        if (bas_fs_on[i]) return;
+        bas_fs_saved[i][0] = u->win.x;     bas_fs_saved[i][1] = u->win.y;
+        bas_fs_saved[i][2] = u->win.width; bas_fs_saved[i][3] = u->win.height;
+        u->win.x = 0; u->win.y = 0;
+        u->win.width  = (int)video_screen_width();
+        u->win.height = (int)video_screen_height();
+        bas_fs_on[i] = 1;
+        active_win = &u->win; wm_raise(&u->win);
+    } else {
+        if (!bas_fs_on[i]) return;
+        u->win.x = bas_fs_saved[i][0]; u->win.y = bas_fs_saved[i][1];
+        u->win.width  = bas_fs_saved[i][2]; u->win.height = bas_fs_saved[i][3];
+        bas_fs_on[i] = 0;
+    }
+    g_need_full = 1;
+}
 static void basic_install_hooks(void)
 {
     extern void basic_set_cls(void (*)(int));
@@ -2232,6 +2268,7 @@ static void basic_install_hooks(void)
     extern void basic_set_circle(void (*)(int, int, int, int));
     extern void basic_set_wifi(void (*)(int));
     extern void basic_set_gfx_active(int (*)(void));
+    extern void basic_set_fullscreen(void (*)(int));
     basic_set_emit(bas_emit);
     basic_set_input(basic_getline);
     basic_set_cls(bas_cls);
@@ -2241,6 +2278,7 @@ static void basic_install_hooks(void)
     basic_set_circle(bas_circle);
     basic_set_wifi(bas_wifi);
     basic_set_gfx_active(bas_gfx_active);
+    basic_set_fullscreen(bas_fullscreen);
 }
 
 /* One REPL thread per BASIC window (apps/basic.c instance @inst). */

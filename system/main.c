@@ -58,6 +58,38 @@ static thread gwin_kbd_bridge(void)
     return OK;
 }
 
+/*
+ * Keyboard auto-repeat (typematic).  USB boot keyboards only report on change,
+ * so a held key yields one keypress.  The HID interrupt handler publishes the
+ * currently-held key (apps see it as g_kbd_repeat_*); here we wait an initial
+ * delay then re-inject that key sequence at a steady rate until it is released,
+ * so holding e.g. a cursor key scrolls continuously ("連打" = rapid repeat).
+ */
+static thread kbd_repeat_bridge(void)
+{
+    extern void gwm_feed_key(int c);
+    extern volatile char     g_kbd_repeat_seq[3];
+    extern volatile int      g_kbd_repeat_len;
+    extern volatile unsigned g_kbd_repeat_gen;
+    const int TICK = 25, DELAY = 350, INTERVAL = 45;   /* ms */
+    unsigned seen = 0; int held = 0, acc = 0;
+    for (;;) {
+        sleep(TICK);
+        int len = g_kbd_repeat_len;
+        unsigned gen = g_kbd_repeat_gen;
+        if (len <= 0) { seen = gen; held = 0; acc = 0; continue; }
+        if (gen != seen) { seen = gen; held = 0; acc = 0; }   /* new key: restart */
+        held += TICK;
+        if (held < DELAY) continue;                            /* initial delay   */
+        acc += TICK;
+        if (acc >= INTERVAL) {
+            acc -= INTERVAL;
+            for (int k = 0; k < len && k < 3; k++) gwm_feed_key(g_kbd_repeat_seq[k]);
+        }
+    }
+    return OK;
+}
+
 /**
  * Main thread.  You can modify this routine to customize what Embedded Xinu
  * does when it starts up.  The default is designed to do something reasonable
@@ -422,6 +454,8 @@ thread main(void)
         }
         /* physical USB keyboard -> active window (shell or BASIC) */
         ready(create((void *)gwin_kbd_bridge, 8192, INITPRIO, "kbdbridge", 0),
+              RESCHED_NO);
+        ready(create((void *)kbd_repeat_bridge, 8192, INITPRIO, "kbdrepeat", 0),
               RESCHED_NO);
     }
 #endif

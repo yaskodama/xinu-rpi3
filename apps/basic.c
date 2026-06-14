@@ -56,6 +56,8 @@ static void (*g_circle)(int cx, int cy, int r, int color);        /* CIRCLE  */
 static void (*g_wifi)(int action);           /* WIFI: 1=on 0=off 2=status   */
 static int  (*g_gfx_active)(void);           /* 1 if the window is in gfx mode */
 void basic_set_gfx_active(int (*fn)(void))           { g_gfx_active = fn; }
+static void (*g_fullscreen)(int on);         /* maximize/restore the window */
+void basic_set_fullscreen(void (*fn)(int))           { g_fullscreen = fn; }
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
@@ -1417,7 +1419,8 @@ static const char *S_rescue[] = {
     "190 DIM TSX(3)",
     "200 DIM TSY(3)",
     "210 DIM TOK(3)",
-    "220 T = 0 : C = 0",
+    "220 T = 0",
+    "225 C = 0",
     "230 *FRAME",
     "240 CLS 2",
     "250 IF T < 30 THEN GOTO *PH1",
@@ -1572,9 +1575,12 @@ static const char *S_rescue[] = {
     "1720 NEXT",
     "1730 T = T + 2",
     "1740 IF T < 240 THEN GOTO 1750",
-    "1742 T = 0 : C = C + 1 : IF C >= 3 THEN END",
+    "1742 C = C + 1",
+    "1744 T = 0",
+    "1746 IF C >= 3 THEN GOTO 1765",
     "1750 WAIT 0.03",
     "1760 GOTO *FRAME",
+    "1765 END",
     "1770 *PROJ",
     "1780 DX = WX - CX",
     "1790 DY = WY - CY",
@@ -2102,10 +2108,12 @@ void basic_exec_line(const char *line)
             if (!load_named(fn)) { emit("?file not found\n"); return; }
         } else { ip = save; }
         if (nprog == 0) { emit("?no program — type some lines first\n"); return; }
+        if (g_fullscreen) g_fullscreen(1);     /* debugger takes the full screen */
         emit("[debug] s step  c cont  b N bp  p expr  q quit  (h help)\n");
         dbg_on = 1; dbg_step = 1;              /* stop before the first line */
         do_run();
         dbg_on = 0; dbg_step = 0;
+        if (g_fullscreen) g_fullscreen(0);     /* restore the window size        */
         return;
     }
     /* immediate statement(s) */
