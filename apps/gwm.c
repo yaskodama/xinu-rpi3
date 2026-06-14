@@ -2313,35 +2313,98 @@ static void aipl_run_button(int idx) {
 static window_t pres_win;
 static int pres_slide = 0, pres_open_flag = 0, pres_dirty = 1;
 static const char *pres_slides[][9] = {
-  { "Typed AI Agent Language", "",
-    "   Design and Implementation", "",
-    "   Yasushi Kodama", "   Hosei University", 0 },
-  { "1. Motivation", "",
-    "- AI agents need a real language",
-    "- Static types catch errors early",
-    "- One source, many runtimes", 0 },
-  { "2. Language Design", "",
+  { "AIPL", "",
+    "Typed AI Agent Language",
+    "Actor-based Intelligent Parallel Lang",
+    "", "Yasushi Kodama   2026", 0 },
+  { "Agenda", "",
+    "1. Background   2. Language basics",
+    "3. Type system  4. Actor concurrency",
+    "5. AI-native    6. Gradual typing",
+    "7. Multi-runtime 8. Evolution & apps", 0 },
+  { "What is AIPL?", "",
+    "- A language to write AI agents",
+    "- Actors are first-class",
+    "- LLM calls are a language feature",
     "- Hindley-Milner type inference",
-    "- Actors + asynchronous messages",
-    "- send / select primitives",
-    "- scope { } structured concurrency", 0 },
-  { "3. Runtimes", "",
-    "- Py-I  (reference interpreter)",
-    "- OCaml, C",
-    "- JavaScript: browser + node",
-    "- 7 runtimes, one semantics", 0 },
-  { "4. Implementation", "",
-    "- abcl2c: AIPL -> C translator",
-    "- Kernel integration on Xinu / Pi",
-    "- Actors run bare-metal on ARM", 0 },
-  { "5. Evaluation", "",
+    "- Transpiles to Py / OCaml / JS / C", 0 },
+  { "1. Background", "",
+    "- LLM orchestration code is exploding",
+    "- Really just string-building scripts",
+    "- Persona / steps / state scattered",
+    "- Untyped: breaks only at runtime",
+    "- => put structure in the language", 0 },
+  { "1. Four problems", "",
+    "- Untyped: prompts/args are strings",
+    "- Concurrency weakly expressed",
+    "- Distributed calls special-cased",
+    "- Effects invisible: fs/net/ai/mut",
+    "  AIPL: types + actors solve all 4", 0 },
+  { "1. Design goals", "",
+    "- Safety: catch errors early",
+    "- Expressiveness: concurrency",
+    "- AI-native: LLM calls first-class",
+    "- Transparency: effects in the type",
+    "- Portability + self-hosting", 0 },
+  { "2. Language basics", "",
+    "- Actor = hidden state, talks by msg",
+    "- class: var fields + methods",
+    "- send self.m() : async self-message",
+    "- int float string bool unit",
+    "- array[T] (T,U) {x:int} records", 0 },
+  { "2. Counter (code)", "",
+    "class Counter {",
+    "  var count = 0;",
+    "  method inc() {",
+    "    count = count + 1;",
+    "    if (count<3) send self.inc(); } }", 0 },
+  { "3. Type system", "",
+    "- Full HM inference, 0 annotations",
+    "- Most general type from whole prog",
+    "- Generics as type variables",
+    "- Annotations refine, never override",
+    "- OCaml/JS/Py share the same HM", 0 },
+  { "3. Types (code)", "",
+    "function add(a:int,b:int)->int {",
+    "  return a + b; }",
+    "var pt:{x:int,y:int} = {x:3,y:4};",
+    "var xs:array[int] = [1,2,3];", 0 },
+  { "4. Actor concurrency", "",
+    "- send a.m(x): async, returns at once",
+    "- now a.m(x): sync, waits for reply",
+    "- reply(v): return a value",
+    "- future + scope{}: structured conc.",
+    "- one actor runs serially: no races", 0 },
+  { "4. scope (code)", "",
+    "scope {",
+    "  var f1 = future a.work(3);",
+    "  var f2 = future b.work(5); }",
+    "print(await f1 + await f2);", 0 },
+  { "5. AI-native", "",
+    "- ai_call is a builtin",
+    "- method plan(q)->string !{ai,net}",
+    "- effects in the signature",
+    "  !{fs, ai, net, mut}",
+    "- LLM is a primitive, not a library", 0 },
+  { "6. Gradual typing", "",
+    "- Type features added in phases 11-17",
+    "- annotations, generics, records",
+    "- effects, refinement over time", 0 },
+  { "7. Multi-runtime", "",
+    "- Py-I, OCaml, JS browser+node, C",
+    "- 7 runtimes, one semantics",
+    "- Distributed actors across machines",
+    "- Runs bare-metal on Xinu / Pi", 0 },
+  { "8. Evolution & apps", "",
+    "- GA evolves language designs",
+    "- Kernel evolution, MANET routing",
+    "- Web spreadsheet, drone sim, Reversi",
+    "- From the browser to bare metal", 0 },
+  { "Conclusion", "",
+    "- Typed, multi-runtime agent language",
+    "- Actors + effects + AI-native",
     "- 26 / 26 feature parity",
-    "- HM type cleanness 87%",
-    "- Live on Raspberry Pi 3", 0 },
-  { "6. Conclusion", "",
-    "- Typed, multi-runtime agent lang.",
-    "- From the browser to bare metal",
-    "- Future work: BPE n-gram, JM", 0 },
+    "- From the browser to bare metal", 0 },
 };
 #define PRES_NSLIDE ((int)(sizeof(pres_slides)/sizeof(pres_slides[0])))
 static void pres_btn_rect(window_t *self, int which, int *bx,int *by,int *bw,int *bh)
@@ -2417,7 +2480,9 @@ static void pres_open(void)
  * device = white, intermediate positional AI) that runs in the "screen".
  * =================================================================== */
 static window_t dev_win;
-static int dev_open_flag = 0, dev_dirty = 1, dev_screen = 0;   /* 0 home, 1 reversi */
+static int dev_open_flag = 0, dev_dirty = 1, dev_screen = 0;   /* 0 home, 1 reversi, 2 shogi */
+static int dev_clk_valid = 0; static unsigned long dev_clk_shown = 0;
+static void dev_draw_shogi(window_t *self);
 static signed char rv_board[8][8];
 static int rv_turn = 1, rv_over = 0;                            /* 1 black(you) 2 white(AI) */
 static const int RV_W[8][8] = {
@@ -2524,35 +2589,213 @@ static void dev_rvbtn_rect(int which, int *bx, int *by, int *bw, int *bh)
     *bw = 96; *bh = 20; *by = gy + 8 * cell + 10;
     *bx = which == 0 ? gx : gx + 8 * cell - *bw;
 }
-static void dev_icon_rect(int *ix, int *iy, int *iw, int *ih)
+/* App icon n (0 Reversi, 1 Shogi) on the home screen. */
+static void dev_icon_rect(int n, int *ix, int *iy, int *iw, int *ih)
 {
     *iw = 72; *ih = 72;
-    *ix = dev_win.x + (dev_win.width - 72) / 2;
-    *iy = dev_win.y + WM_TITLEBAR_H + 70;
+    int gap = 36, total = 2 * 72 + gap;
+    *ix = dev_win.x + (dev_win.width - total) / 2 + n * (72 + gap);
+    *iy = dev_win.y + WM_TITLEBAR_H + 80;
 }
+/* ---- Shogi (intermediate) ----------------------------------------------
+ * You = sente (light pieces, move up); device = gote (gold pieces, move down).
+ * Board code: +type sente, -type gote.  type 1..8 = P L N S G B R K, promoted
+ * 9..15 = +P +L +N +S (12) , 14 +B, 15 +R (gold/king never promote).
+ * Simplified: capturing the King ends the game (no check/mate search). */
+static signed char sg_b[9][9];
+static int sg_hp[8], sg_ha[8];                 /* hands: base-type counts 1..7 */
+static int sg_turn = 1, sg_over = 0, sg_win = 0;
+static int sg_sx = -1, sg_sy = -1, sg_sh = 0;  /* selection: board cell, or hand type */
+static int sg_base(int a){ return a > 8 ? (a == 14 ? 6 : a == 15 ? 7 : a - 8) : a; }
+static int sg_val(int a){ static const int v[16] = {0,1,3,3,5,6,8,10,999,7,6,6,6,0,11,13};
+                          return a < 16 ? v[a] : 0; }
+static char sg_letter(int a){ static const char L[16] =
+    {' ','P','L','N','S','G','B','R','K','T','M','O','E','?','H','D'}; return a < 16 ? L[a] : '?'; }
+static int sg_inb(int x, int y){ return x >= 0 && x < 9 && y >= 0 && y < 9; }
+static int sg_moves(signed char b[9][9], int x, int y, int out[][2])
+{
+    int t = b[y][x]; if (t == 0) return 0;
+    int who = t > 0 ? 1 : -1, a = t > 0 ? t : -t, n = 0;
+    static const int gold[6][2] = {{0,-1},{-1,-1},{1,-1},{-1,0},{1,0},{0,1}};
+    static const int king[8][2] = {{0,-1},{0,1},{-1,0},{1,0},{-1,-1},{1,-1},{-1,1},{1,1}};
+    static const int silv[5][2] = {{0,-1},{-1,-1},{1,-1},{-1,1},{1,1}};
+#define ADDS(dx,dy) do{ int nx=x+(dx), ny=y+(who>0?(dy):-(dy)); \
+    if(sg_inb(nx,ny) && (b[ny][nx]==0 || (b[ny][nx]>0)!=(who>0))){ out[n][0]=nx;out[n][1]=ny;n++; } }while(0)
+#define SLD(dx,dy) do{ int ux=(dx),uy=(who>0?(dy):-(dy)),nx=x+ux,ny=y+uy; \
+    while(sg_inb(nx,ny)){ if(b[ny][nx]==0){out[n][0]=nx;out[n][1]=ny;n++;} \
+      else { if((b[ny][nx]>0)!=(who>0)){out[n][0]=nx;out[n][1]=ny;n++;} break; } nx+=ux;ny+=uy; } }while(0)
+    if (a==1) { ADDS(0,-1); }
+    else if (a==2) { SLD(0,-1); }
+    else if (a==3) { ADDS(-1,-2); ADDS(1,-2); }
+    else if (a==4) { int i; for(i=0;i<5;i++) ADDS(silv[i][0],silv[i][1]); }
+    else if (a==5 || (a>=9 && a<=12)) { int i; for(i=0;i<6;i++) ADDS(gold[i][0],gold[i][1]); }
+    else if (a==8) { int i; for(i=0;i<8;i++) ADDS(king[i][0],king[i][1]); }
+    else if (a==6) { SLD(-1,-1);SLD(1,-1);SLD(-1,1);SLD(1,1); }
+    else if (a==7) { SLD(0,-1);SLD(0,1);SLD(-1,0);SLD(1,0); }
+    else if (a==14){ SLD(-1,-1);SLD(1,-1);SLD(-1,1);SLD(1,1); ADDS(0,-1);ADDS(0,1);ADDS(-1,0);ADDS(1,0); }
+    else if (a==15){ SLD(0,-1);SLD(0,1);SLD(-1,0);SLD(1,0); ADDS(-1,-1);ADDS(1,-1);ADDS(-1,1);ADDS(1,1); }
+#undef ADDS
+#undef SLD
+    return n;
+}
+/* Apply a board move (drop=0) or a drop (drop=base type) for side `who`. */
+static void sg_apply(signed char b[9][9], int hp[8], int ha[8], int who,
+                     int fx, int fy, int tx, int ty, int drop)
+{
+    if (drop > 0) { b[ty][tx] = (signed char)(who * drop); if (who > 0) hp[drop]--; else ha[drop]--; return; }
+    int t = b[fy][fx], cap = b[ty][tx], a = t > 0 ? t : -t;
+    if (cap != 0) { int bt = sg_base(cap > 0 ? cap : -cap); if (who > 0) hp[bt]++; else ha[bt]++; }
+    int inzone = who > 0 ? (ty <= 2 || fy <= 2) : (ty >= 6 || fy >= 6);
+    if (a >= 1 && a <= 7 && a != 5 && inzone) t = (t > 0 ? 1 : -1) * (a + 8);
+    b[ty][tx] = (signed char)t; b[fy][fx] = 0;
+}
+static int sg_drop_ok(signed char b[9][9], int who, int bt, int tx, int ty)
+{
+    if (b[ty][tx] != 0) return 0;
+    if (bt == 1) {                                  /* nifu: no two pawns on a file */
+        int y; for (y = 0; y < 9; y++) if (b[y][tx] == (signed char)(who * 1)) return 0;
+        if (who > 0 ? (ty == 0) : (ty == 8)) return 0;          /* dead pawn */
+    }
+    if (bt == 2 && (who > 0 ? ty == 0 : ty == 8)) return 0;     /* dead lance */
+    if (bt == 3 && (who > 0 ? ty <= 1 : ty >= 7)) return 0;     /* dead knight */
+    return 1;
+}
+/* Enumerate all moves for `who` into mv[][5] = {fx,fy,tx,ty,drop}; returns count. */
+static int sg_genall(signed char b[9][9], int hp[8], int ha[8], int who, int mv[][5])
+{
+    int n = 0, x, y, i, out[40][2];
+    for (y = 0; y < 9; y++) for (x = 0; x < 9; x++) {
+        if (b[y][x] != 0 && (b[y][x] > 0) == (who > 0)) {
+            int m = sg_moves(b, x, y, out);
+            for (i = 0; i < m; i++) { mv[n][0]=x;mv[n][1]=y;mv[n][2]=out[i][0];mv[n][3]=out[i][1];mv[n][4]=0;n++; }
+        }
+    }
+    int *hand = who > 0 ? hp : ha, bt;
+    for (bt = 1; bt <= 7; bt++) if (hand[bt] > 0)
+        for (y = 0; y < 9; y++) for (x = 0; x < 9; x++)
+            if (sg_drop_ok(b, who, bt, x, y)) { mv[n][0]=-1;mv[n][1]=-1;mv[n][2]=x;mv[n][3]=y;mv[n][4]=bt;n++; }
+    return n;
+}
+static int sg_material(signed char b[9][9], int hp[8], int ha[8], int who)
+{
+    int x, y, s = 0, i;
+    for (y = 0; y < 9; y++) for (x = 0; x < 9; x++) { int t=b[y][x]; if(!t)continue;
+        int a=t>0?t:-t, v=sg_val(a); if(a==8){} /* king handled by capture-ends */
+        s += ((t>0)==(who>0)) ? v : -v; }
+    for (i = 1; i <= 7; i++) { s += hp[i]*sg_val(i)*(who>0?1:-1); s += ha[i]*sg_val(i)*(who>0?-1:1); }
+    return s;
+}
+static int sg_has_king(signed char b[9][9], int who)
+{
+    int x,y; for(y=0;y<9;y++)for(x=0;x<9;x++) if(b[y][x]==(signed char)(who*8)) return 1; return 0;
+}
+/* Best player reply value after a hypothetical AI move — only the player's
+ * capturing BOARD moves (cheap), so the AI avoids hanging pieces. */
+/* Min gote-material remaining after the player's best immediate capture (the
+ * player minimizes my material); large value if the player has no capture. */
+static int sg_player_best_capture(signed char b[9][9], int hp[8], int ha[8])
+{
+    int x, y, i, out[40][2], worst = 1000000;
+    for (y = 0; y < 9; y++) for (x = 0; x < 9; x++) if (b[y][x] > 0) {
+        int m = sg_moves(b, x, y, out);
+        for (i = 0; i < m; i++) if (b[out[i][1]][out[i][0]] < 0) {      /* captures a gote piece */
+            signed char ub[9][9]; int uhp[8], uha[8];
+            memcpy(ub,b,sizeof ub); memcpy(uhp,hp,sizeof uhp); memcpy(uha,ha,sizeof uha);
+            sg_apply(ub,uhp,uha,1,x,y,out[i][0],out[i][1],0);
+            int r = !sg_has_king(ub,-1) ? -100000 : sg_material(ub,uhp,uha,-1);
+            if (r < worst) worst = r;
+        }
+    }
+    return worst;
+}
+/* Device (gote, who=-1) plays: material after my move, but assume you grab back
+ * with your best immediate capture (a light, fast look-ahead). */
+static void sg_ai_move(void)
+{
+    static int mv[800][5];
+    int n = sg_genall(sg_b, sg_hp, sg_ha, -1, mv), i, best = -1000000, bi = -1;
+    for (i = 0; i < n; i++) {
+        signed char tb[9][9]; int thp[8], tha[8];
+        memcpy(tb, sg_b, sizeof tb); memcpy(thp, sg_hp, sizeof thp); memcpy(tha, sg_ha, sizeof tha);
+        sg_apply(tb, thp, tha, -1, mv[i][0], mv[i][1], mv[i][2], mv[i][3], mv[i][4]);
+        int sc;
+        if (!sg_has_king(tb, 1)) sc = 100000;                   /* captures your king */
+        else {
+            sc = sg_material(tb, thp, tha, -1);                 /* gote material */
+            int mp = sg_player_best_capture(tb, thp, tha);      /* your best recapture */
+            if (mp < sc) sc = mp;                               /* worst-case after your reply */
+            if (mv[i][3] > mv[i][1]) sc += 1;                   /* tiny advance bonus */
+        }
+        if (sc > best) { best = sc; bi = i; }
+    }
+    if (bi >= 0) {
+        sg_apply(sg_b, sg_hp, sg_ha, -1, mv[bi][0], mv[bi][1], mv[bi][2], mv[bi][3], mv[bi][4]);
+        if (!sg_has_king(sg_b, 1)) { sg_over = 1; sg_win = 2; }
+    }
+    sg_turn = 1;
+}
+static void sg_init(void)
+{
+    int x; memset(sg_b, 0, sizeof sg_b); memset(sg_hp, 0, sizeof sg_hp); memset(sg_ha, 0, sizeof sg_ha);
+    static const int back[9] = {2,3,4,5,8,5,4,3,2};            /* L N S G K G S N L */
+    for (x = 0; x < 9; x++) { sg_b[0][x] = -back[x]; sg_b[8][x] = back[x]; }
+    sg_b[1][1] = -7; sg_b[1][7] = -6;                          /* gote R,B */
+    sg_b[7][7] = 7;  sg_b[7][1] = 6;                           /* sente R,B */
+    for (x = 0; x < 9; x++) { sg_b[2][x] = -1; sg_b[6][x] = 1; }  /* pawns */
+    sg_turn = 1; sg_over = 0; sg_win = 0; sg_sx = -1; sg_sy = -1; sg_sh = 0;
+}
+static void sg_board_geom(int *bx, int *by, int *cell)
+{
+    *cell = 30; *bx = dev_win.x + (dev_win.width - 9 * 30) / 2;
+    *by = dev_win.y + WM_TITLEBAR_H + 64;
+}
+
 static void dev_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
+    extern volatile unsigned long clktime;
+    unsigned int screen = 0xFF0A1020U;
+    if (dev_screen == 0) {                                     /* HOME (live clock) */
+        if (g_force_redraw || dev_dirty) {
+            dev_dirty = 0;
+            unsigned int body = 0xFF101418U;
+            fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
+                      self->height - WM_TITLEBAR_H - 2, body);
+            fill_rect(self->x + 8, self->y + WM_TITLEBAR_H + 6, self->width - 16,
+                      self->height - WM_TITLEBAR_H - 28, screen);
+            fill_rect(self->x + self->width / 2 - 20, self->y + self->height - 12, 40, 4, 0xFF404850U);
+            draw_string_at(self->x + 14, self->y + WM_TITLEBAR_H + 14, "Smart Device", 0xFF80D0FFU, screen);
+            int k, ix, iy, iw, ih; const char *nm[2] = { "Reversi", "Shogi" };
+            const char *ic[2] = { "othello", " shogi " };
+            for (k = 0; k < 2; k++) { dev_icon_rect(k, &ix, &iy, &iw, &ih);
+                fill_rect(ix, iy, iw, ih, k ? 0xFF7E4A1EU : 0xFF1E7E48U);
+                fill_rect(ix, iy, iw, 2, k ? 0xFFB07A34U : 0xFF34B060U);
+                draw_string_at(ix + 8, iy + 30, ic[k], 0xFFFFFFFFU, k ? 0xFF7E4A1EU : 0xFF1E7E48U);
+                draw_string_at(ix + 10, iy + ih + 6, nm[k], 0xFFD8E8FFU, screen); }
+            dev_clk_valid = 0;
+        }
+        unsigned long t = clktime;
+        if (!dev_clk_valid || t != dev_clk_shown) {
+            dev_clk_shown = t; dev_clk_valid = 1;
+            char cb[16]; int hh=(int)((t/3600)%24), mm=(int)((t/60)%60), ss=(int)(t%60);
+            sprintf(cb, "%02d:%02d:%02d", hh, mm, ss);
+            int sx0 = self->x + self->width - 92, sy0 = self->y + WM_TITLEBAR_H + 14;
+            fill_rect(sx0, sy0, 84, 9, screen);
+            draw_string_at(sx0, sy0, cb, 0xFFFFFFFFU, screen);
+        }
+        return;
+    }
     if (!g_force_redraw && !dev_dirty) return;
     dev_dirty = 0;
-    unsigned int body = 0xFF101418U, screen = 0xFF0A1020U;
+    if (dev_screen == 2) { dev_draw_shogi(self); return; }
+    unsigned int body = 0xFF101418U;
     fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
               self->height - WM_TITLEBAR_H - 2, body);
     fill_rect(self->x + 8, self->y + WM_TITLEBAR_H + 6, self->width - 16,
               self->height - WM_TITLEBAR_H - 28, screen);                /* "glass" */
     fill_rect(self->x + self->width / 2 - 20, self->y + self->height - 12,
               40, 4, 0xFF404850U);                                       /* home bar */
-    if (dev_screen == 0) {                                               /* HOME */
-        draw_string_at(self->x + 14, self->y + WM_TITLEBAR_H + 16, "Smart Device",
-                       0xFF80D0FFU, screen);
-        int ix, iy, iw, ih; dev_icon_rect(&ix, &iy, &iw, &ih);
-        fill_rect(ix, iy, iw, ih, 0xFF1E7E48U);
-        fill_rect(ix, iy, iw, 2, 0xFF34B060U);
-        draw_string_at(ix + 8, iy + 30, "othello", 0xFFFFFFFFU, 0xFF1E7E48U);
-        draw_string_at(ix + 4, iy + ih + 6, " Reversi", 0xFFD8E8FFU, screen);
-        return;
-    }
-    /* REVERSI */
+    /* REVERSI (dev_screen == 1) */
     int gx, gy, cell, x, y, you = 0, ai = 0;
     dev_board_geom(&gx, &gy, &cell);
     for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
@@ -2577,17 +2820,115 @@ static void dev_draw(window_t *self, unsigned int frame)
           fill_rect(bx, by, bw, bh, 0xFF205088U); fill_rect(bx, by, bw, 1, 0xFF3A78C8U);
           draw_string_at(bx + 8, by + 6, lbl[b], 0xFFFFFFFFU, 0xFF205088U); } }
 }
+/* Shogi: Home(0)/New(1) buttons, and hand slot (base type 1..7) rects. */
+static void sg_btn_rect(int which, int *bx, int *by, int *bw, int *bh)
+{
+    int gx, gy, cell; sg_board_geom(&gx, &gy, &cell);
+    *bw = 90; *bh = 20; *by = gy + 9 * cell + 14;
+    *bx = which == 0 ? gx : gx + 9 * cell - *bw;
+}
+static void sg_handslot_rect(int type, int who, int *hx, int *hy, int *hw, int *hh)
+{
+    int gx, gy, cell; sg_board_geom(&gx, &gy, &cell);
+    *hw = cell; *hh = 18;
+    *hx = gx + (type - 1) * cell;
+    *hy = who > 0 ? gy + 9 * cell + 40 : gy - 24;
+}
+static void dev_draw_shogi(window_t *self)
+{
+    unsigned int body = 0xFF101418U, screen = 0xFF0A1020U;
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
+              self->height - WM_TITLEBAR_H - 2, body);
+    fill_rect(self->x + 8, self->y + WM_TITLEBAR_H + 4, self->width - 16,
+              self->height - WM_TITLEBAR_H - 10, screen);
+    int gx, gy, cell, x, y, i;
+    sg_board_geom(&gx, &gy, &cell);
+    const char *st = sg_over ? (sg_win == 1 ? "You win!" : "Device wins")
+                            : (sg_turn == 1 ? "Your move" : "Device...");
+    draw_string_at(gx, self->y + WM_TITLEBAR_H + 16, st, 0xFFFFD060U, screen);
+    /* legal destinations for the current selection */
+    int sel[40][2], nsel = 0;
+    if (!sg_over && sg_turn == 1 && sg_sx >= 0) nsel = sg_moves(sg_b, sg_sx, sg_sy, sel);
+    fill_rect(gx - 2, gy - 2, 9 * cell + 4, 9 * cell + 4, 0xFF8A5A2AU);
+    for (y = 0; y < 9; y++) for (x = 0; x < 9; x++) {
+        int px = gx + x * cell, py = gy + y * cell;
+        unsigned int cellcol = (sg_sx == x && sg_sy == y) ? 0xFFEAC84CU : 0xFFD8A860U;
+        fill_rect(px, py, cell - 1, cell - 1, cellcol);
+        int t = sg_b[y][x];
+        if (t != 0) { int a = t > 0 ? t : -t; char s[2]; s[0] = sg_letter(a); s[1] = 0;
+            draw_string_at(px + cell / 2 - 4, py + cell / 2 - 4, s,
+                           t > 0 ? 0xFF101010U : 0xFFB01000U, cellcol);
+            if (a >= 9) fill_rect(px + 2, py + 2, 3, 3, 0xFFC00000U); }
+        for (i = 0; i < nsel; i++) if (sel[i][0] == x && sel[i][1] == y)
+            fill_rect(px + cell / 2 - 2, py + cell / 2 - 2, 4, 4, 0xFF1060E0U);
+        if (sg_sh > 0 && sg_turn == 1 && !sg_over && sg_drop_ok(sg_b, 1, sg_sh, x, y))
+            fill_rect(px + cell / 2 - 2, py + cell / 2 - 2, 4, 4, 0xFF10A030U);
+    }
+    /* hands (your slots below, device's above) */
+    int who2, type;
+    for (who2 = 0; who2 < 2; who2++) { int *hand = who2 ? sg_hp : sg_ha; int wh = who2 ? 1 : -1;
+        for (type = 1; type <= 7; type++) {
+            int hx, hy, hw, hh; sg_handslot_rect(type, wh, &hx, &hy, &hw, &hh);
+            unsigned int hc = (wh > 0 && sg_sh == type) ? 0xFF305878U : 0xFF182838U;
+            fill_rect(hx, hy, hw - 1, hh, hc);
+            char s[8]; s[0] = sg_letter(type); s[1] = hand[type] > 9 ? '+' : (char)('0' + hand[type]); s[2] = 0;
+            draw_string_at(hx + 4, hy + 5, s, hand[type] ? 0xFFFFFFFFU : 0xFF607080U, hc);
+        } }
+    { int b, bx, by, bw, bh; const char *lbl[2] = { "Home", "New Game" };
+      for (b = 0; b < 2; b++) { sg_btn_rect(b, &bx, &by, &bw, &bh);
+          fill_rect(bx, by, bw, bh, 0xFF205088U); fill_rect(bx, by, bw, 1, 0xFF3A78C8U);
+          draw_string_at(bx + 8, by + 6, lbl[b], 0xFFFFFFFFU, 0xFF205088U); } }
+}
+static void dev_click_shogi(int dx, int dy)
+{
+    int bx, by, bw, bh, type;
+    sg_btn_rect(0, &bx, &by, &bw, &bh); if (dx>=bx&&dx<bx+bw&&dy>=by&&dy<by+bh) { dev_screen = 0; return; }
+    sg_btn_rect(1, &bx, &by, &bw, &bh); if (dx>=bx&&dx<bx+bw&&dy>=by&&dy<by+bh) { sg_init(); return; }
+    if (sg_over || sg_turn != 1) return;
+    for (type = 1; type <= 7; type++) {                 /* select a hand piece to drop */
+        int hx, hy, hw, hh; sg_handslot_rect(type, 1, &hx, &hy, &hw, &hh);
+        if (dx>=hx&&dx<hx+hw&&dy>=hy&&dy<hy+hh) { if (sg_hp[type] > 0) { sg_sh = type; sg_sx = -1; } return; }
+    }
+    int gx, gy, cell; sg_board_geom(&gx, &gy, &cell);
+    int cx = (dx - gx) / cell, cy = (dy - gy) / cell;
+    if (!sg_inb(cx, cy)) return;
+    if (sg_sh > 0) {                                     /* drop */
+        if (sg_drop_ok(sg_b, 1, sg_sh, cx, cy)) {
+            sg_apply(sg_b, sg_hp, sg_ha, 1, -1, -1, cx, cy, sg_sh); sg_sh = 0;
+            if (!sg_has_king(sg_b, -1)) { sg_over = 1; sg_win = 1; return; }
+            sg_turn = 2; sg_ai_move();
+        } else sg_sh = 0;
+        return;
+    }
+    if (sg_sx >= 0) {                                    /* move the selected piece */
+        int out[40][2], m = sg_moves(sg_b, sg_sx, sg_sy, out), i, ok = 0;
+        for (i = 0; i < m; i++) if (out[i][0] == cx && out[i][1] == cy) ok = 1;
+        if (ok) {
+            sg_apply(sg_b, sg_hp, sg_ha, 1, sg_sx, sg_sy, cx, cy, 0); sg_sx = -1;
+            if (!sg_has_king(sg_b, -1)) { sg_over = 1; sg_win = 1; return; }
+            sg_turn = 2; sg_ai_move();
+        } else if (sg_b[cy][cx] > 0) { sg_sx = cx; sg_sy = cy; }
+        else sg_sx = -1;
+        return;
+    }
+    if (sg_b[cy][cx] > 0) { sg_sx = cx; sg_sy = cy; sg_sh = 0; }   /* select own piece */
+}
 static int dev_click(int sx, int sy)
 {
     if (!dev_open_flag || window_at_point(sx, sy) != &dev_win) return 0;
     int dx = sx + vp_x, dy = sy + vp_y;
     active_win = &dev_win; wm_raise(&dev_win); dev_dirty = 1;
     if (dev_screen == 0) {
-        int ix, iy, iw, ih; dev_icon_rect(&ix, &iy, &iw, &ih);
-        if (dx >= ix && dx < ix + iw && dy >= iy && dy < iy + ih) { dev_screen = 1; rv_init(); }
+        int k, ix, iy, iw, ih;
+        for (k = 0; k < 2; k++) { dev_icon_rect(k, &ix, &iy, &iw, &ih);
+            if (dx >= ix && dx < ix + iw && dy >= iy && dy < iy + ih) {
+                if (k == 0) { dev_screen = 1; rv_init(); } else { dev_screen = 2; sg_init(); }
+                return 1;
+            } }
         return 1;
     }
-    int b, bx, by, bw, bh;
+    if (dev_screen == 2) { dev_click_shogi(dx, dy); return 1; }
+    int b, bx, by, bw, bh;                               /* REVERSI */
     for (b = 0; b < 2; b++) { dev_rvbtn_rect(b, &bx, &by, &bw, &bh);
         if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) {
             if (b == 0) dev_screen = 0; else rv_init();
