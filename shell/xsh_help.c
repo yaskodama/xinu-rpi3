@@ -67,11 +67,34 @@ shellcmd xsh_help(int nargs, char *args[])
         return 1;
     }
 
-    /* Output command list */
+    /* Output command list in columns, spread across the window width. */
     printf("Shell Commands:\n");
-    for (i = 0; i < ncommand; i++)
     {
-        printf("\t%s\n", commandtab[i].name);
+        int maxlen = 0, colw, cols, col = 0, j, pad;
+        const int width = 54;          /* usable chars in the shell window */
+        for (i = 0; i < ncommand; i++)
+        {
+            int l = (int)strlen(commandtab[i].name);
+            if (l > maxlen) maxlen = l;
+        }
+        colw = maxlen + 2;
+        cols = width / colw;
+        if (cols < 1) cols = 1;
+        for (i = 0; i < ncommand; i++)
+        {
+            printf("%s", commandtab[i].name);
+            if (++col >= cols)
+            {
+                printf("\n");
+                col = 0;
+            }
+            else
+            {
+                pad = colw - (int)strlen(commandtab[i].name);
+                for (j = 0; j < pad; j++) printf(" ");
+            }
+        }
+        if (col != 0) printf("\n");
     }
 
     return 0;
