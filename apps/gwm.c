@@ -644,6 +644,7 @@ static const struct { const char *label; const char *cmd; } sh_btns[] = {
     { "wifi on",     "wifi on" },
     { "wifi status", "wifi status" },
     { "wifi off",    "wifi off" },
+    { "wine",        "wine" },
 };
 #define SH_NBTN ((int)(sizeof(sh_btns) / sizeof(sh_btns[0])))
 
@@ -1578,13 +1579,23 @@ static void bas_gop_erase(struct basic_ui *u, struct bas_gop *g)
     else if (g->type == 2) bas_draw_plot_cell(u, g->a, g->b, 0, 0);
     else if (g->type == 3) bas_draw_circle_col(u, g->a, g->b, g->c, BAS_GFX_BG);
 }
-/* Paired incremental erase: called right before a new primitive is drawn, it
- * erases the corresponding primitive from the PREVIOUS frame.  Because each old
- * line is removed only at the instant its replacement is painted, the scene is
- * never blanked wholesale — far less flicker than erase-all-then-draw-all. */
-static void bas_pair_erase_one(struct basic_ui *u)
+/* Paired incremental draw step.  Compares the primitive about to be drawn with
+ * the matching one from the previous frame:
+ *   - identical  -> leave the on-screen pixels alone, skip the redraw (so
+ *                   static scenery like a control tower never flickers);
+ *   - different  -> erase the old one now, then the caller draws the new one
+ *                   (the old line vanishes only as its replacement appears).
+ * Returns 1 if the caller should draw, 0 if the primitive is already correct. */
+static int bas_pair_step(struct basic_ui *u, int type, int a, int b, int c, int d, int color)
 {
-    if (u->perase < u->png) bas_gop_erase(u, &u->pgops[u->perase++]);
+    if (u->perase < u->png) {
+        struct bas_gop *g = &u->pgops[u->perase++];
+        if (g->type == (unsigned char)type && g->color == (unsigned char)color &&
+            g->a == (short)a && g->b == (short)b && g->c == (short)c && g->d == (short)d)
+            return 0;                            /* unchanged: nothing to do */
+        bas_gop_erase(u, g);                     /* changed: erase the old one */
+    }
+    return 1;
 }
 static void bas_gfx_clear_full(struct basic_ui *u)
 {
@@ -1628,8 +1639,7 @@ static void bas_plot(int x, int y, int ch)
     struct basic_ui *u = &bui[basic_curi()];
     u->gfx = 1;
     if (ch < 0x20 || ch > 0x7e) ch = '*';
-    bas_pair_erase_one(u);
-    bas_draw_plot_cell(u, x, y, ch, 0xFFB6FFB6U);
+    if (bas_pair_step(u, 2, x, y, ch, 0, 0)) bas_draw_plot_cell(u, x, y, ch, 0xFFB6FFB6U);
     bas_gop_add(u, 2, x, y, ch, 0, 0);
 }
 /* LINE(x1,y1)-(x2,y2),color: a line segment (Bresenham) on the graphics
@@ -1638,8 +1648,7 @@ static void bas_line(int x1, int y1, int x2, int y2, int color)
 {
     struct basic_ui *u = &bui[basic_curi()];
     u->gfx = 1;
-    bas_pair_erase_one(u);
-    bas_draw_seg(u, x1, y1, x2, y2, bas_palette(color));
+    if (bas_pair_step(u, 1, x1, y1, x2, y2, color)) bas_draw_seg(u, x1, y1, x2, y2, bas_palette(color));
     bas_gop_add(u, 1, x1, y1, x2, y2, color);
 }
 /* CIRCLE (cx,cy),r,color: outline circle (midpoint algorithm). */
@@ -1647,8 +1656,7 @@ static void bas_circle(int cx, int cy, int r, int color)
 {
     struct basic_ui *u = &bui[basic_curi()];
     u->gfx = 1;
-    bas_pair_erase_one(u);
-    bas_draw_circle_col(u, cx, cy, r, bas_palette(color));
+    if (bas_pair_step(u, 3, cx, cy, r, 0, color)) bas_draw_circle_col(u, cx, cy, r, bas_palette(color));
     bas_gop_add(u, 3, cx, cy, r, 0, color);
 }
 /* WIFI ON|OFF|STATUS from BASIC (mirrors the `wifi` shell command). */
