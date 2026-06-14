@@ -64,6 +64,22 @@ static void (*g_buttons_reset)(void);         /* clear program buttons (on RUN) 
 void basic_set_button(void (*fn)(int, const char *)) { g_button = fn; }
 void basic_set_btn(int (*fn)(int))                   { g_btn = fn; }
 void basic_set_buttons_reset(void (*fn)(void))       { g_buttons_reset = fn; }
+/* Event-driven buttons: BUTTON n,"label",line registers a handler line that is
+ * GOSUB'd automatically when button n is clicked.  g_btn_queue accumulates
+ * presses so each click dispatches exactly one handler call. */
+#define BTN_MAX 8
+static int g_btn_handler[BTN_MAX];           /* handler line per button (0 = polled) */
+static int g_btn_queue[BTN_MAX];             /* pending handler dispatches            */
+static int g_has_btn_handlers = 0;
+static int bas_next_btn_event(void)          /* handler line of one pending event, or 0 */
+{
+    if (!g_btn) return 0;
+    for (int n = 0; n < BTN_MAX; n++) if (g_btn_handler[n] > 0) {
+        g_btn_queue[n] += g_btn(n);          /* drain new clicks into our queue */
+        if (g_btn_queue[n] > 0) { g_btn_queue[n]--; return g_btn_handler[n]; }
+    }
+    return 0;
+}
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
@@ -1052,55 +1068,58 @@ static const char *S_bubble[] = {
 static const char *S_koch[] = {
     "10 CLS 3",
     "20 D = 4",
-    "30 BUTTON 0, \"Level -\"",
-    "40 BUTTON 1, \"Level +\"",
+    "30 BUTTON 0, \"Level -\", 300",
+    "40 BUTTON 1, \"Level +\", 350",
     "50 GOSUB *SHOW",
     "60 GOSUB *REDRAW",
     "70 *LOOP",
-    "80 P = BTN(1) - BTN(0)",
-    "90 IF P = 0 THEN GOTO 150",
-    "100 D = D + P",
-    "110 IF D < 1 THEN D = 1",
-    "120 IF D > 10 THEN D = 10",
-    "130 GOSUB *SHOW",
-    "140 GOSUB *REDRAW",
-    "150 WAIT 0.05",
-    "160 GOTO *LOOP",
-    "170 *SHOW",
-    "180 BUTTON 2, \"LEVEL \" + STR$(D)",
-    "190 RETURN",
-    "200 *REDRAW",
-    "210 CLS 3",
-    "220 X = 50",
-    "230 Y = 280",
-    "240 A = 0",
-    "250 L = 486",
-    "260 GOSUB *KOCH",
-    "270 RETURN",
-    "300 *KOCH",
-    "310 IF D > 0 THEN GOTO 400",
-    "320 GOSUB *DRAW",
-    "330 RETURN",
-    "400 D = D - 1",
-    "410 L = L / 3",
-    "420 GOSUB *KOCH",
-    "430 A = A + 60",
-    "440 GOSUB *KOCH",
-    "450 A = A - 120",
-    "460 GOSUB *KOCH",
-    "470 A = A + 60",
-    "480 GOSUB *KOCH",
-    "490 D = D + 1",
-    "500 L = L * 3",
-    "510 RETURN",
-    "600 *DRAW",
-    "610 RAD = A * 0.01745329",
-    "620 X2 = X + L * COS(RAD)",
-    "630 Y2 = Y - L * SIN(RAD)",
-    "640 LINE (X,Y)-(X2,Y2),CYAN",
-    "650 X = X2",
-    "660 Y = Y2",
-    "670 RETURN",
+    "80 WAIT 0.1",
+    "90 GOTO *LOOP",
+    "300 D = D - 1",
+    "310 IF D < 1 THEN D = 1",
+    "320 GOSUB *SHOW",
+    "330 GOSUB *REDRAW",
+    "340 RETURN",
+    "350 D = D + 1",
+    "360 IF D > 10 THEN D = 10",
+    "370 GOSUB *SHOW",
+    "380 GOSUB *REDRAW",
+    "390 RETURN",
+    "400 *SHOW",
+    "410 BUTTON 2, \"LEVEL \" + STR$(D)",
+    "420 RETURN",
+    "430 *REDRAW",
+    "440 CLS 3",
+    "450 X = 50",
+    "460 Y = 280",
+    "470 A = 0",
+    "480 L = 486",
+    "490 GOSUB *KOCH",
+    "500 RETURN",
+    "510 *KOCH",
+    "520 IF D > 0 THEN GOTO 600",
+    "530 GOSUB *DRAW",
+    "540 RETURN",
+    "600 D = D - 1",
+    "610 L = L / 3",
+    "620 GOSUB *KOCH",
+    "630 A = A + 60",
+    "640 GOSUB *KOCH",
+    "650 A = A - 120",
+    "660 GOSUB *KOCH",
+    "670 A = A + 60",
+    "680 GOSUB *KOCH",
+    "690 D = D + 1",
+    "700 L = L * 3",
+    "710 RETURN",
+    "720 *DRAW",
+    "730 RAD = A * 0.01745329",
+    "740 X2 = X + L * COS(RAD)",
+    "750 Y2 = Y - L * SIN(RAD)",
+    "760 LINE (X,Y)-(X2,Y2),CYAN",
+    "770 X = X2",
+    "780 Y = Y2",
+    "790 RETURN",
 };
 static const char *S_dragon[] = {
     "10 CLS 3",
@@ -1878,11 +1897,17 @@ static void exec_stmt(void)
         if (g_cls) g_cls(mode);
         return;
     }
-    if (kw("BUTTON")) {                       /* BUTTON n, "label" — GUI button */
+    if (kw("BUTTON")) {                       /* BUTTON n,"label"[,line] — GUI button */
         int n = (int)expr(); skipsp();
         if (*ip != ',') { berr("BUTTON ,"); return; } ip++;
         char lbl[SVAR_LEN]; seval(lbl, sizeof lbl);
         if (g_button) g_button(n, lbl);
+        skipsp();
+        if (n >= 0 && n < BTN_MAX) {
+            if (*ip == ',') { ip++; g_btn_handler[n] = (int)expr();  /* event handler line */
+                              if (g_btn_handler[n] > 0) g_has_btn_handlers = 1; }
+            else g_btn_handler[n] = 0;        /* polled: read with BTN(n) */
+        }
         return;
     }
     if (kw("PLOT")) {                         /* PLOT x,y[,charcode] */
@@ -2109,6 +2134,8 @@ static void do_run(void)
     data_pc = -1; data_ip = 0;                 /* rewind DATA          */
     var_clear_all();                                              /* clear vars/arrays */
     if (g_buttons_reset) g_buttons_reset();                       /* drop program buttons */
+    { int i; for (i = 0; i < BTN_MAX; i++) { g_btn_handler[i] = 0; g_btn_queue[i] = 0; }
+      g_has_btn_handlers = 0; }
     if (nprog == 0) { running = 0; emit("Ok\n"); return; }
     pc = 0; ip = prog[0].text;
     long guard = 0;
@@ -2125,6 +2152,23 @@ static void do_run(void)
             dbg_show_line();
             dbg_repl();
             if (!running) break;              /* `q` aborted the program */
+        }
+
+        /* Event-driven buttons: at the start of a top-level line (not inside
+         * the program's own GOSUB), if a BUTTON with a handler was clicked,
+         * GOSUB its handler (it RETURNs back here).  gosubtop==0 keeps handlers
+         * atomic — they never interrupt the program mid-subroutine. */
+        if (g_has_btn_handlers && gosubtop == 0 && ip == prog[pc].text && !dbg_on) {
+            int hn = bas_next_btn_event();
+            if (hn > 0) {
+                int idx = find_line(hn);
+                if (idx >= 0) {
+                    if (gosubtop < GOSUB_MAX) {
+                        gosubstk[gosubtop].rpc = pc; gosubstk[gosubtop].rip = ip; gosubtop++;
+                    }
+                    pc = idx; ip = prog[pc].text; continue;
+                }
+            }
         }
 
         g_goto = -1;
