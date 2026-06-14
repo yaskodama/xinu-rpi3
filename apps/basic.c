@@ -583,10 +583,44 @@ static void prog_set(int no, const char *text)
     int k = 0; for (; text[k] && k < PLINELEN - 1; k++) prog[pos].text[k] = text[k]; prog[pos].text[k] = 0;
     nprog++;
 }
+/* Uppercase the leading alphabetic token of @t (after any spaces) into @out. */
+static void bas_first_token(const char *t, char *out, int cap)
+{
+    while (*t == ' ' || *t == '\t') t++;
+    int n = 0;
+    while (n < cap - 1 && ((*t >= 'A' && *t <= 'Z') || (*t >= 'a' && *t <= 'z'))) {
+        char c = *t++; if (c >= 'a') c -= 32; out[n++] = c;
+    }
+    out[n] = 0;
+}
+static int bas_streq(const char *a, const char *b)
+{
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; } return *a == *b;
+}
+
+/* Pretty-printing LIST: right-align line numbers and indent FOR/WHILE blocks
+ * (NEXT/WEND de-indent), so nested loops read at a glance. */
 static void do_list(void)
 {
-    char nb[16];
-    for (int i = 0; i < nprog; i++) { num_str((double)prog[i].no, nb); emit(nb); emit(" "); emit(prog[i].text); emit("\n"); }
+    char nb[16], tok[8];
+    int depth = 0;
+    for (int i = 0; i < nprog; i++) {
+        const char *t = prog[i].text;
+        const char *p = t; while (*p == ' ' || *p == '\t') p++;  /* trim leading */
+        bas_first_token(t, tok, sizeof tok);
+        int is_close = bas_streq(tok, "NEXT") || bas_streq(tok, "WEND");
+        int is_open  = bas_streq(tok, "FOR")  || bas_streq(tok, "WHILE");
+        if (is_close && depth > 0) depth--;
+
+        num_str((double)prog[i].no, nb);
+        int ln = 0; while (nb[ln]) ln++;
+        for (int s = ln; s < 4; s++) emit(" ");        /* right-align to width 4 */
+        emit(nb); emit("  ");
+        for (int d = 0; d < depth && d < 12; d++) emit("  ");
+        emit(p); emit("\n");
+
+        if (is_open) depth++;
+    }
 }
 
 /* ---- pre-loaded sample programs (read-only) ----------------------- *
@@ -1383,7 +1417,7 @@ static const char *S_rescue[] = {
     "190 DIM TSX(3)",
     "200 DIM TSY(3)",
     "210 DIM TOK(3)",
-    "220 T = 0",
+    "220 T = 0 : C = 0",
     "230 *FRAME",
     "240 CLS 2",
     "250 IF T < 30 THEN GOTO *PH1",
@@ -1536,9 +1570,10 @@ static const char *S_rescue[] = {
     "1700 FOR I = 0 TO 3",
     "1710 IF TOK(I) = 1 THEN CIRCLE (TSX(I),TSY(I)),DR,CYAN",
     "1720 NEXT",
-    "1730 T = T + 1",
-    "1740 IF T >= 240 THEN T = 0",
-    "1750 WAIT 0.05",
+    "1730 T = T + 2",
+    "1740 IF T < 240 THEN GOTO 1750",
+    "1742 T = 0 : C = C + 1 : IF C >= 3 THEN END",
+    "1750 WAIT 0.03",
     "1760 GOTO *FRAME",
     "1770 *PROJ",
     "1780 DX = WX - CX",

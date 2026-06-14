@@ -122,6 +122,15 @@ static unsigned int cursor_bak[12 * 12];
 static int          cursor_bak_valid = 0;
 static int          bak_x, bak_y;       /* where the sprite is currently drawn */
 
+/* Lazy-lift state for the content pass.  While g_paint_armed is set, the
+ * gvideo pre-draw hook (gv_cursor_predraw) lifts the cursor sprite the FIRST
+ * time a draw rectangle overlaps it — so a frame that never touches the
+ * pointer leaves it untouched (no per-frame blink), while the continuously
+ * spinning 3-D window, the WiFi badge, etc. (all elsewhere) no longer
+ * disturb it.  g_cursor_lifted records whether we actually hid it. */
+static volatile int g_paint_armed  = 0;
+static volatile int g_cursor_lifted = 0;
+
 static void draw_cursor_xy(int cx, int cy)
 {
     if (!cursor_visible) return;
@@ -168,6 +177,23 @@ static void cursor_show(void)
     video_save_rect(x, y, 12, 12, cursor_bak);
     bak_x = x; bak_y = y; cursor_bak_valid = 1;
     draw_cursor_xy(x, y);
+}
+
+/* gvideo pre-draw hook (installed in wm_run).  Called in SCREEN coords just
+ * before a fill_rect / draw_line / glyph touches the framebuffer.  During the
+ * content pass we lift the cursor sprite the first time a draw actually
+ * overlaps its 12x12 box; draws that miss the pointer leave it alone, so the
+ * cursor only ever "blinks" when something is genuinely redrawn underneath it
+ * (correct), not on every animation frame somewhere else on screen. */
+static void gv_cursor_predraw(int sx, int sy, int w, int h)
+{
+    if (!g_paint_armed || g_cursor_lifted) return;
+    if (!cursor_visible || !cursor_bak_valid) return;
+    /* Overlap test against the sprite's current position (bak_x,bak_y). */
+    if (sx >= bak_x + 12 || sx + w <= bak_x ||
+        sy >= bak_y + 12 || sy + h <= bak_y) return;
+    cursor_hide();                 /* restore the patch — no fill_rect, no recursion */
+    g_cursor_lifted = 1;
 }
 
 void wm_add(window_t *w)
@@ -259,6 +285,22 @@ static void draw_wifi_indicator(void)
     unsigned int col = conn ? 0xFF36D35AU : 0xFFFFFFFFU;   /* green / white */
     int cx = sw - 24;          /* fan centre x */
     int by = sh - 40;          /* mark dot baseline (room for SSID + IP below) */
+
+    /* Only repaint when the displayed state actually changes (connection,
+     * SSID or IP) — otherwise we churn the framebuffer every frame and would
+     * lift the cursor whenever it is parked over the badge. */
+    {
+        unsigned char ip0[4] = {0,0,0,0}, gw0[4]; int have0 = 0;
+        wifi_dhcp_diag(ip0, gw0, &have0);
+        const char *ss = wifi_ssid();
+        unsigned sig = (unsigned)conn * 2654435761u;
+        for (const char *p = ss; *p; p++) sig = sig * 31u + (unsigned char)*p;
+        sig = sig * 31u + (unsigned)have0;
+        if (have0) for (int i = 0; i < 4; i++) sig = sig * 31u + ip0[i];
+        static unsigned last_sig = 0; static int seeded = 0;
+        if (seeded && sig == last_sig && !g_force_redraw) return;
+        last_sig = sig; seeded = 1;
+    }
 
     /* Dark backing box covering the mark + SSID + IP label lines. */
     fill_rect(sw - 152, by - 22, 150, 60, 0xFF182028U);
@@ -1011,10 +1053,19 @@ void wm_run(void)
     /* Remember the tail we just fully painted. */
     for (window_t *w = wm_head; w; w = w->next) chrome_done = w;
     cursor_show();
+    /* Install the overlap-aware lazy-lift hook: from now on the cursor is
+     * only hidden when a draw genuinely lands on it, not once per frame. */
+    extern void (*gv_predraw_rect)(int, int, int, int);
+    gv_predraw_rect = gv_cursor_predraw;
 
     for (;;) {
         if (wm_tick) wm_tick();
-        cursor_hide();        /* lift the sprite so the content pass draws clean */
+        /* Arm the lazy lift: the first draw that overlaps the pointer this
+         * frame hides it (gv_cursor_predraw); a frame that misses it leaves
+         * the sprite untouched, so the pointer no longer blinks while the
+         * 3-D window spins / the WiFi badge refreshes elsewhere. */
+        g_cursor_lifted = 0;
+        g_paint_armed   = 1;
         wm_drag_tick();       /* process the left button: start/continue a drag */
 
         video_set_viewport(vp_x, vp_y);
@@ -1057,9 +1108,11 @@ void wm_run(void)
         draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
         draw_menu();             /* right-click pull-down menu, if open    */
 
-        /* Re-stash the patch under the cursor (the content pass may have
-         * redrawn there) and draw the sprite on top. */
-        cursor_show();
+        /* Disarm the lazy lift.  Only re-stash + redraw the sprite if the
+         * content pass actually hid it (i.e. something drew underneath it);
+         * otherwise the pointer is still on screen and untouched — no blink. */
+        g_paint_armed = 0;
+        if (g_cursor_lifted) cursor_show();
         frame++;
 
         /* Fast cursor sub-loop.  USB mouse reports move cursor_x/y
@@ -1092,6 +1145,10 @@ static window_t info_win;
 static void info_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
+    /* Static text — only paint on a full repaint, like softkbd_draw.  Avoids
+     * rewriting the same glyphs every frame (framebuffer churn + would lift
+     * the cursor if parked over this window). */
+    if (!g_force_redraw) return;
     draw_string_at(self->x + 8, self->y + WM_TITLEBAR_H + 6,
         "Xinu Pi3 Window System",
         0xFF00FF80U, self->content_bg);
@@ -1298,7 +1355,7 @@ extern int  basic_curi(void);              /* current interpreter instance     *
 extern void basic_bind_thread(int inst);   /* register this thread's instance  */
 extern void basic_break_n(int inst);       /* Ctrl-C a specific window         */
 
-#define BAS_ROWS 56
+#define BAS_ROWS 300        /* ~10 screens of scrollback (arrow up/down roams it) */
 #define BAS_COLS 60
 #define BAS_TB_H  32                /* toolbar height (px) — two button rows  */
 #define BAS_BTN_H 12                /* one button's height                    */
@@ -1324,6 +1381,7 @@ struct basic_ui {
     int           row, col, filled, full;
     int           gfx;              /* 1 = pixel graphics (CLS/PLOT/LINE)     */
     int           ed_row, ed_col;   /* full-screen editor cursor              */
+    int           prev_start;       /* last view top row (detect scroll)      */
     int           esc;              /* CSI parser: 0 idle, 1 ESC, 2 ESC[      */
     char          q[BAS_QN][256];   /* logical-line queue -> interpreter      */
     int           qh, qt;
@@ -1675,11 +1733,23 @@ static void basic_draw(window_t *self, unsigned int frame)
     {                                    /* scrolling text console */
         int have = u->filled ? BAS_ROWS : u->row + 1;
         rows = have < max_rows ? have : max_rows;
-        start = (u->row - rows + 1 + BAS_ROWS) % BAS_ROWS;
+        /* View normally anchored at the live bottom line, but follows the edit
+         * cursor up into the scrollback: if the cursor sits above the visible
+         * window, scroll up just enough to keep it on the top line. */
+        int back = (u->row - u->ed_row + BAS_ROWS) % BAS_ROWS;  /* rows above live */
+        int vbot_back = (back > rows - 1) ? (back - (rows - 1)) : 0;
+        if (vbot_back > have - rows) vbot_back = have - rows;
+        if (vbot_back < 0) vbot_back = 0;
+        int vbot = (u->row - vbot_back + BAS_ROWS) % BAS_ROWS;
+        start = (vbot - rows + 1 + BAS_ROWS) % BAS_ROWS;
     }
+    /* When the view scrolls, the row->screen mapping shifts, so every visible
+     * line must be repainted (not just the per-row dirty ones). */
+    int force_rows = g_force_redraw || (start != u->prev_start);
+    u->prev_start = start;
     for (int i = 0; i < rows; i++) {
         int r = (start + i) % BAS_ROWS;
-        if (g_force_redraw || u->dirty[r]) {
+        if (force_rows || u->dirty[r]) {
             int ry = BAS_TXT_TOP(self) + i * line_h;
             fill_rect(self->x + 4, ry, self->width - 8, line_h, self->content_bg);
             draw_string_at(self->x + 4, ry, u->ring[r], 0xFFB6FFB6U, self->content_bg);

@@ -25,6 +25,13 @@ static unsigned int            fb_width;
 static unsigned int            fb_height;
 static int                     fb_ready;
 
+/* Optional pre-draw hook.  Called (in SCREEN coords) just before fill_rect /
+ * draw_line / draw_glyph_at touch the framebuffer.  gwm installs a handler
+ * that lifts the mouse-cursor sprite ONLY when the draw rectangle actually
+ * overlaps the pointer's 12x12 box, so the continuously-spinning 3-D window
+ * elsewhere no longer makes the cursor blink.  NULL = no hook (default). */
+void (*gv_predraw_rect)(int sx, int sy, int w, int h) = 0;
+
 /* Text-console cursor.  Named with a g_ prefix to avoid clashing with
  * the global int cursor_col / cursor_row declared in <framebuffer.h>
  * (used by the boot fb console). */
@@ -190,6 +197,7 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     if (sx + w > clip_x1) w = clip_x1 - sx;
     if (sy + h > clip_y1) h = clip_y1 - sy;
     if (w <= 0 || h <= 0) return;
+    if (gv_predraw_rect) gv_predraw_rect(sx, sy, w, h);
 
     for (int dy = 0; dy < h; dy++) {
         unsigned int *row =
@@ -250,6 +258,11 @@ void draw_line(int x0, int y0, int x1, int y1, unsigned int color)
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
     int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
     int err = adx - ady;
+    if (gv_predraw_rect) {
+        int bx0 = x0 < x1 ? x0 : x1, by0 = y0 < y1 ? y0 : y1;
+        int bx1 = x0 < x1 ? x1 : x0, by1 = y0 < y1 ? y1 : y0;
+        gv_predraw_rect(bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
+    }
     for (;;) {
         put_px(x0, y0, color);
         if (x0 == x1 && y0 == y1) break;
@@ -282,6 +295,7 @@ void draw_glyph_at(int px, int py, char c,
     /* Trivial reject if the entire glyph cell is off-screen. */
     if (sx >= (int)fb_width || sy >= (int)fb_height) return;
     if (sx + FONT_WIDTH <= 0 || sy + FONT_HEIGHT <= 0) return;
+    if (gv_predraw_rect) gv_predraw_rect(sx, sy, FONT_WIDTH, FONT_HEIGHT);
 
     for (int gy = 0; gy < FONT_HEIGHT; gy++) {
         int rsy = sy + gy;
