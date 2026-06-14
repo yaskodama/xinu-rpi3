@@ -344,6 +344,64 @@ int abcl_gc_sweep(long threshold_ms, int dry_run, int *out_scanned) {
   return killed;
 }
 
+/* Reachability garbage collector (mark & sweep).  Roots are: protected actors,
+ * actors with pending mail (enq != deq), and actors whose worker thread is
+ * doing work (any state other than THRWAIT — i.e. not blocked waiting on its
+ * empty mailbox; a sleeping actor in wait() is THRSLEEP and stays a root).
+ * From the roots we follow actor-id references stored in fields — V_OBJ
+ * precisely, and V_INT conservatively (bytecode-VM actors keep peer ids as
+ * plain ints, so any int that is a valid live actor id is treated as a possible
+ * reference; this never frees something still reachable).  Every actor not
+ * marked is unreferenced garbage and is killed.  dry_run=1 only counts.
+ * Returns the number of actors collected. */
+int abcl_gc_mark_sweep(int dry_run, int *out_scanned) {
+  static char mark[MAX_OBJECTS];
+  static int  stack[MAX_OBJECTS];
+  int i, fi, sp = 0, scanned = 0, collected = 0;
+  int total = rcu_n_objects();
+  for (i = 0; i < total; i++) mark[i] = 0;
+  /* --- seed roots --- */
+  for (i = 0; i < total; i++) {
+    if (objects[i].dead || !objects[i].started) continue;
+    scanned++;
+    int pending = (objects[i].mbox.enq != objects[i].mbox.deq);
+    tid_typ t = objects[i].tid;
+    int active = (!isbadtid(t) && thrtab[t].state != THRWAIT);
+    if (objects[i].protected_from_gc || pending || active) {
+      if (!mark[i]) { mark[i] = 1; stack[sp++] = i; }
+    }
+  }
+  /* --- transitive mark over field references --- */
+  while (sp > 0) {
+    int a = stack[--sp];
+    for (fi = 0; fi < MAX_FIELDS; fi++) {
+      value_t v = objects[a].fields[fi];
+      int ref = -1;
+      if (v.tag == V_OBJ) ref = v.obj_id;
+      else if (v.tag == V_INT && v.i >= 0 && v.i < total) ref = (int)v.i;  /* conservative */
+      if (ref >= 0 && ref < total && !objects[ref].dead && !mark[ref]) {
+        mark[ref] = 1; stack[sp++] = ref;
+      }
+    }
+  }
+  /* --- sweep: kill every live, unprotected, unmarked actor --- */
+  for (i = 0; i < total; i++) {
+    if (objects[i].dead || !objects[i].started) continue;
+    if (objects[i].protected_from_gc || mark[i]) continue;
+    collected++;
+    if (!dry_run) {
+      tid_typ t = objects[i].tid;
+      objects[i].dead = 1;
+      if (!isbadtid(t)) { signal(objects[i].mbox.items); kill(t); }  /* wake if blocked, then reap */
+    }
+  }
+  if (!dry_run && collected > 0)
+    kprintf("[aipl-gc] mark&sweep: scanned %d, collected %d unreferenced actor(s)\r\n",
+            scanned, collected);
+  if (out_scanned) *out_scanned = scanned;
+  return collected;
+}
+
 /* 自殺関数: the actor terminates itself.  Sets the dead flag so its worker
  * thread (abcl_actor_main) leaves its dispatch loop after the current
  * message and exits.  Callable from a generated method via self_id. */
@@ -2901,8 +2959,10 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
 }
 /* HTTP entry: load a .avm, spawn its first class, kick it with "tick". */
 int abcl_vm_loadrun(const unsigned char *buf, int len) {
+  extern void vm_gfx_unsuppress(void);
   int base = abcl_vm_load(buf, len);
   if (base < 0) return -1;
+  vm_gfx_unsuppress();                 /* a fresh send re-enables closed VM windows */
   int id = abcl_vm_spawn(0);
   if (id >= 0) abcl_enqueue(-1, id, "tick", 0, NULL);
   return id;
@@ -3112,7 +3172,13 @@ static void abcl_rt_init_once(void) {
 int abcl_web_init(void) {
   static int web_id = -1;
   abcl_rt_init_once();
-  if (web_id < 0) web_id = create_obj(CLASS_WebReceiver, 0, NULL);
+  if (web_id < 0) {
+    web_id = create_obj(CLASS_WebReceiver, 0, NULL);
+    /* The web bridge actor is idle (blocked on its mailbox) and referenced by
+     * nobody, so the reachability GC would collect it and cut off HTTP — pin
+     * it as a permanent root. */
+    if (web_id >= 0) abcl_object_protect(web_id, 1);
+  }
   return web_id;
 }
 

@@ -234,6 +234,7 @@ static int sysinit(void)
 #endif
 
 #ifdef WITH_USB
+    { extern void usbmsc_init(void); usbmsc_init(); }  /* register USB MSC before enumeration */
     usbinit();
 #endif
 

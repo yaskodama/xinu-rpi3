@@ -49,6 +49,35 @@ shellcmd xsh_cat(int nargs, char *args[])
             continue;
         }
 
+        /* /sd/<name> -> read off a USB-attached SD-card reader's FAT32 root. */
+        if (0 == strncmp(args[i], "/sd/", 4))
+        {
+            extern int usbmsc_fat_select(void);
+            const char *name = args[i] + 4;
+            struct fat_dirent e;
+            if (usbmsc_fat_select() != 0)
+            {
+                printf("cat: /sd: USB card not ready\n");
+                continue;
+            }
+            if (fat_mount() != 0)
+            {
+                printf("cat: /sd: mount failed\n");
+                fat_set_blkdev(0, 0);
+                continue;
+            }
+            if (0 != fat_find_root(name, &e) || e.is_dir)
+            {
+                printf("cat: %s: no such file\n", args[i]);
+                fat_set_blkdev(0, 0);
+                continue;
+            }
+            fat_read_file(e.cluster, e.size, cat_emit, NULL);
+            putchar('\n');
+            fat_set_blkdev(0, 0);
+            continue;
+        }
+
         fd = xfsOpen(args[i], XFS_O_RDONLY);
         if (fd < 0)
         {

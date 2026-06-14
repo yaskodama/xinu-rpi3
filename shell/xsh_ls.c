@@ -52,6 +52,15 @@ shellcmd xsh_ls(int nargs, char *args[])
         return 0;
     }
 
+    /* /sd -> a USB-attached SD-card reader (USB Mass-Storage / BBB+SCSI).
+     * usbmsc_fat_list() prints its own diagnostics (present / capacity /
+     * raw-block-0 / mount) so failures are visible in the shell window. */
+    if (0 == strncmp(path, "/sd", 3))
+    {
+        extern int usbmsc_fat_list(int long_form);   /* apps/usbmsc.c */
+        return (usbmsc_fat_list(long_form) == 0) ? 0 : 1;
+    }
+
     while (OK == xfsReaddir(path, idx, &ent, &next))
     {
         idx = next;

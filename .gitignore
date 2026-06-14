@@ -53,3 +53,4 @@ docs/*.synctex.gz
 docs/*-log.txt
 docs/dining_results_clean.json
 tools/counter.avm
+tools/__pycache__/

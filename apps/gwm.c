@@ -694,6 +694,8 @@ static const struct { const char *label; const char *cmd; } sh_btns[] = {
     { "wifi on",     "wifi on" },
     { "wifi status", "wifi status" },
     { "wifi off",    "wifi off" },
+    { "ls /microsd", "ls /microsd" },
+    { "ls /sd",      "ls /sd" },
     { "wine",        "wine" },
     { "clear",       "clear" },
     { "help",        "help" },
@@ -3192,22 +3194,32 @@ void vm_print(int self_id, const char *s)         /* called on an actor thread *
 
 /* ---- graphics window (actor draw output) ---- */
 #define VMG_MAX 512
-static window_t vmgfx_win; static int vmgfx_open = 0, vmgfx_want = 0, vmgfx_dirty = 0;
+static window_t vmgfx_win; static int vmgfx_open = 0, vmgfx_want = 0, vmgfx_dirty = 0, vmgfx_suppress = 0;
+static int vmtxt_suppress = 0;
 static struct { short x1, y1, x2, y2; unsigned char col; } vmg_line[VMG_MAX];
+static struct { short x1, y1, x2, y2; } vmg_drawn[VMG_MAX]; static int vmg_drawn_n = 0;
 static int vmg_n = 0;
 static void vmgfx_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     if (!g_force_redraw && !vmgfx_dirty) return; vmgfx_dirty = 0;
-    /* content_bg is the same dark colour draw_chrome already filled, so this
-     * fill is only needed to wipe old lines on an incremental (dirty) redraw. */
     int gx = self->x + 4, gy = self->y + WM_TITLEBAR_H + 4, i;
+    /* Flicker-free animation: instead of clearing the whole content (a visible
+     * erase->redraw flash), on an incremental redraw we only un-draw last
+     * frame's line segments (paint them in the background colour), then stroke
+     * the new ones.  On a full repaint the chrome already cleared the bg. */
     if (!g_force_redraw)
-        fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
-                  self->height - WM_TITLEBAR_H - 2, self->content_bg);
+        for (i = 0; i < vmg_drawn_n; i++)
+            draw_line(vmg_drawn[i].x1, vmg_drawn[i].y1, vmg_drawn[i].x2, vmg_drawn[i].y2,
+                      self->content_bg);
     for (i = 0; i < vmg_n; i++)
         draw_line(gx + vmg_line[i].x1, gy + vmg_line[i].y1,
                   gx + vmg_line[i].x2, gy + vmg_line[i].y2, bas_palette(vmg_line[i].col));
+    vmg_drawn_n = (vmg_n > VMG_MAX) ? VMG_MAX : vmg_n;       /* remember for next erase */
+    for (i = 0; i < vmg_drawn_n; i++) {
+        vmg_drawn[i].x1 = (short)(gx + vmg_line[i].x1); vmg_drawn[i].y1 = (short)(gy + vmg_line[i].y1);
+        vmg_drawn[i].x2 = (short)(gx + vmg_line[i].x2); vmg_drawn[i].y2 = (short)(gy + vmg_line[i].y2);
+    }
     vm_draw_grip(self);
 }
 void vm_line(int x1, int y1, int x2, int y2, int color)   /* called on an actor thread */
@@ -3216,12 +3228,18 @@ void vm_line(int x1, int y1, int x2, int y2, int color)   /* called on an actor 
         vmg_line[vmg_n].x2 = x2; vmg_line[vmg_n].y2 = y2; vmg_line[vmg_n].col = (unsigned char)color; vmg_n++; }
     vmgfx_want = 1; vmgfx_dirty = 1;
 }
-void vm_cls(void) { vmg_n = 0; vmgfx_dirty = 1; }          /* clear the gfx window */
+/* cls() resets the buffer but does NOT mark dirty: a frame is only redrawn once
+ * its line()s have rebuilt the set, so we never flash a blank between cls and
+ * the first line. */
+void vm_cls(void) { vmg_n = 0; vmgfx_want = 1; }
+/* Re-enable the VM windows after they were closed (called when a new module is
+ * loaded, so a fresh send re-opens them). */
+void vm_gfx_unsuppress(void) { vmgfx_suppress = 0; vmtxt_suppress = 0; }
 
 /* Open any pending VM windows (called on the wm thread so wm_add is safe). */
 static void vm_io_tick(void)
 {
-    if (vmtxt_want && !vmtxt_open) {
+    if (vmtxt_want && !vmtxt_open && !vmtxt_suppress) {
         vmtxt_win.x = 30; vmtxt_win.y = 60; vmtxt_win.width = 520; vmtxt_win.height = 300;
         title_set(&vmtxt_win, "VM print");
         vmtxt_win.chrome_color = 0xFFAACCEEU; vmtxt_win.title_bg = 0xFF103020U;
@@ -3229,7 +3247,8 @@ static void vm_io_tick(void)
         vmtxt_win.draw_content = vmtxt_draw; vmtxt_open = 1; wm_add(&vmtxt_win);
         active_win = &vmtxt_win; wm_raise(&vmtxt_win); g_need_full = 1;
     }
-    if (vmgfx_want && !vmgfx_open) {
+    if (vmgfx_want && !vmgfx_open && !vmgfx_suppress) {
+        vmg_drawn_n = 0;                              /* fresh window: nothing to erase yet */
         vmgfx_win.x = 120; vmgfx_win.y = 100; vmgfx_win.width = 480; vmgfx_win.height = 360;
         title_set(&vmgfx_win, "VM graphics");
         vmgfx_win.chrome_color = 0xFFAACCEEU; vmgfx_win.title_bg = 0xFF102030U;
@@ -3240,8 +3259,10 @@ static void vm_io_tick(void)
 }
 static void vm_io_mark_closed(window_t *w)
 {
-    if (w == &vmtxt_win) { vmtxt_open = 0; vmtxt_want = 0; }
-    if (w == &vmgfx_win) { vmgfx_open = 0; vmgfx_want = 0; }
+    /* User closed the window: suppress auto-reopen even though the actor keeps
+     * drawing.  A new module load clears the suppression (vm_gfx_unsuppress). */
+    if (w == &vmtxt_win) { vmtxt_open = 0; vmtxt_want = 0; vmtxt_suppress = 1; }
+    if (w == &vmgfx_win) { vmgfx_open = 0; vmgfx_want = 0; vmgfx_suppress = 1; vmg_drawn_n = 0; }
 }
 
 static void menu_exec(int sel)

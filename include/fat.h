@@ -53,4 +53,15 @@ int fat_read_file(unsigned long first_cluster, unsigned long size,
                   int (*cb)(const unsigned char *buf, int len, void *ctx),
                   void *ctx);
 
+
+/* Point the FAT layer at a different 512-byte block device (reader+writer),
+ * e.g. a USB mass-storage card for `ls /sd` / `cp .. /sd/`.  Pass 0/0 to
+ * restore the on-board SD. */
+void fat_set_blkdev(int (*reader)(unsigned long lba, void *buf),
+                    int (*writer)(unsigned long lba, const void *buf));
+
+/* Create/overwrite a file in the root directory (8.3 name).  Returns 0 on
+ * success, -1 on error (disk full / root full / write error). */
+int fat_write_root(const char *name, const unsigned char *data, unsigned long size);
+
 #endif /* _FAT_H_ */

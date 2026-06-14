@@ -562,14 +562,26 @@ thread webactor_server(void)
                         if (*q >= '0' && *q <= '9') dry = (*q - '0');
                     }
                 }
+                /* mark=1 -> reachability mark&sweep (collect UNREFERENCED
+                 * actors); otherwise the time-based idle sweep. */
+                const char *mk = (NULL != url) ? strstr(url, "mark=1") : NULL;
                 extern int abcl_gc_sweep(long, int, int *);
-                int scanned = 0;
-                int killed  = abcl_gc_sweep(threshold, dry, &scanned);
+                extern int abcl_gc_mark_sweep(int, int *);
+                int scanned = 0, killed;
                 static char gcresp[300];
-                int blen = sprintf(gcresp + 100,
+                int blen;
+                if (NULL != mk) {
+                    killed = abcl_gc_mark_sweep(dry, &scanned);
+                    blen = sprintf(gcresp + 100,
+                                   "mode=mark-sweep collected=%d scanned=%d%s\r\n",
+                                   killed, scanned, dry ? " (dry-run)" : "");
+                } else {
+                killed  = abcl_gc_sweep(threshold, dry, &scanned);
+                blen = sprintf(gcresp + 100,
                                    "killed=%d scanned=%d threshold_ms=%ld%s\r\n",
                                    killed, scanned, threshold,
                                    dry ? " (dry-run)" : "");
+                }
                 int hlen = sprintf(gcresp,
                                    "HTTP/1.0 200 OK\r\n"
                                    "Content-Type: text/plain\r\n"
