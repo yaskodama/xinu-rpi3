@@ -1578,7 +1578,7 @@ static const char *S_rescue[] = {
     "1742 C = C + 1",
     "1744 T = 0",
     "1746 IF C >= 3 THEN GOTO 1765",
-    "1750 WAIT 0.03",
+    "1750 WAIT 0.02",
     "1760 GOTO *FRAME",
     "1765 END",
     "1770 *PROJ",
