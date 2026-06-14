@@ -1411,7 +1411,7 @@ static const char *S_flight[] = {
     "1620 IF TVK(3) = 1 THEN IF TVK(7) = 1 THEN LINE (TPX(3),TPY(3))-(TPX(7),TPY(7)),CYAN",
     "1630 LINE (320 - 10 * CBA, 200 - 10 * SBA)-(320 + 10 * CBA, 200 + 10 * SBA),RED",
     "1640 LINE (320 + 10 * SBA, 200 - 10 * CBA)-(320 - 10 * SBA, 200 + 10 * CBA),RED",
-    "1650 T = T + 4",
+    "1650 T = T + 8",
     "1660 WAIT 0.001",
     "1670 GOTO *FRAME",
     "1680 *DONE",
@@ -1450,7 +1450,7 @@ static const char *S_flight[] = {
     "2330 LINE (BMX + 16 * BMD, BMY)-(BMX + 9 * BMD, BMY - 4), CYAN",
     "2340 LINE (BMX - 16 * BMD, BMY)-(BMX - 21 * BMD, BMY - 10), CYAN",
     "2350 LINE (BMX - 5 * BMD, BMY)-(BMX + 4 * BMD, BMY + 7), CYAN",
-    "2360 T = T + 4",
+    "2360 T = T + 8",
     "2370 WAIT 0.001",
     "2380 GOTO *FRAME",
 };
