@@ -645,6 +645,8 @@ static const struct { const char *label; const char *cmd; } sh_btns[] = {
     { "wifi status", "wifi status" },
     { "wifi off",    "wifi off" },
     { "wine",        "wine" },
+    { "clear",       "clear" },
+    { "help",        "help" },
 };
 #define SH_NBTN ((int)(sizeof(sh_btns) / sizeof(sh_btns[0])))
 
