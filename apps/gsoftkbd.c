@@ -72,7 +72,12 @@ static void draw_key(int x, int y, int w, int h, const char *lbl,
 
 void softkbd_draw(window_t *self, unsigned int frame)
 {
+    extern int g_force_redraw;     /* apps/gwm.c: set only on a full repaint */
     (void)frame;
+    /* Only paint on a full repaint.  Drawing all the keys every frame
+     * (the incremental content pass calls draw_content for every window)
+     * made the keyboard bleed on top of whatever window overlaps it. */
+    if (!g_force_redraw) return;
 
     /* Inner content rectangle. */
     int cx0 = self->x + 4;

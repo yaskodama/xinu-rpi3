@@ -496,6 +496,8 @@ struct aipl_ui {
 static struct aipl_ui aui;
 static int  aipl_toolbar_hit(int sx, int sy);
 static void aipl_run_button(int idx);
+static void aipl_emit(const char *s);
+static int  aipl_capture;       /* 1 = mirror AIPL print() into the dev window */
 
 /* Which shell index a window pointer belongs to (0 if not a shell window). */
 static int sh_index_of(window_t *self)
@@ -635,7 +637,7 @@ static void sh_draw(window_t *self, unsigned int frame)
                   self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
         s->full_clear = 0;
     }
-    sh_draw_toolbar(self);
+    if (g_force_redraw) sh_draw_toolbar(self);   /* gate: avoid bleeding on top */
     int content_h = self->height - (SH_TXT_TOP(self) - self->y) - 3;
     int max_rows = content_h / line_h;
     if (max_rows < 1) return;
@@ -1245,6 +1247,9 @@ void aipl_console_puts(const char *s)
     while (i < CON_COLW - 1) con_ring[slot][i++] = ' ';   /* pad: clean overwrite */
     con_ring[slot][CON_COLW - 1] = '\0';
     con_head++;
+    /* When the AIPL dev window ran a text program (PingPong), mirror the
+     * actor print() output into that window so it shows where it was run. */
+    if (aipl_capture && aui.open && !aui.gfx && s) { aipl_emit(s); aipl_emit("\n"); }
 }
 
 static window_t console_win;
@@ -1606,7 +1611,7 @@ static void basic_draw(window_t *self, unsigned int frame)
     struct basic_ui *u = &bui[bas_index_of(self) < 0 ? 0 : bas_index_of(self)];
     if (u->full) { fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                              self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg); u->full = 0; }
-    basic_draw_toolbar(self);
+    if (g_force_redraw) basic_draw_toolbar(self);   /* gate: avoid bleeding on top */
     /* Graphics mode: CLS/PLOT/LINE paint the content directly; leave it be. */
     if (u->gfx) return;
     int content_h = self->height - (BAS_TXT_TOP(self) - self->y) - 3;
@@ -1892,21 +1897,21 @@ void aipl_feed(int c) {
 }
 static void aipl_exec_line(const char *line) {
   const char *p = line; while (*p == ' ' || *p == '\t') p++;
-  if (*p == 0) { aipl_emit("aipl> "); return; }
+  if (*p == 0) { return; }
   if (0 == strncmp(p, "files", 5)) {
-    int i; aui.gfx = 0; aui.full = 1; aipl_emit("AIPL programs:\n");
+    int i; aui.gfx = 0; aui.full = 1; aipl_capture = 0; aipl_emit("AIPL programs:\n");
     for (i = 0; i < AIPL_NFILE; i++) { aipl_emit("  "); aipl_emit(aipl_files[i]); aipl_emit("\n"); }
   } else if (0 == strncmp(p, "list", 4) || 0 == strncmp(p, "cat", 3)) {
-    int i; aui.gfx = 0; aui.full = 1; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
+    int i; aui.gfx = 0; aui.full = 1; aipl_capture = 0; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
   } else if (0 == strncmp(p, "run", 3)) {
     /* pick the program by name (default Rotate4Lines); PingPong is text-only. */
     if (strstr(p, "Ping") || strstr(p, "ping")) {
-      aipl_emit("running PingPong.abcl (output in the AIPL console window)...\n");
-      aui.gfx = 0; aui.running = 0;
+      aipl_emit("running PingPong.abcl (abcl2c->C->actors):\n");
+      aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_capture = 1;
       abcl_pingpong_init();
     } else {
       aipl_emit("running Rotate4Lines.abcl (abcl2c->C->actors)...\n");
-      aui.gfx = 1; aui.running = 1;
+      aui.gfx = 1; aui.running = 1; aipl_capture = 0;
       abcl_rotate4_init();
     }
   } else if (0 == strncmp(p, "start", 5)) {
@@ -1914,7 +1919,7 @@ static void aipl_exec_line(const char *line) {
   } else if (0 == strncmp(p, "stop", 4)) {
     abcl_rotate4_stop(); aipl_emit("stopped\n");
   } else if (0 == strncmp(p, "text", 4)) {        /* leave graphics mode -> editor */
-    aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_emit("text mode\n");
+    aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_capture = 0; aipl_emit("text mode\n");
   } else if (0 == strncmp(p, "help", 4)) {
     aui.gfx = 0; aui.full = 1;
     aipl_emit("AIPL commands:\n");
@@ -1929,14 +1934,11 @@ static void aipl_exec_line(const char *line) {
   } else {
     aipl_emit("? unknown — try `help`\n");
   }
-  aipl_emit("aipl> ");
 }
 thread aipl_win_main(void) {
   char line[256];
   aui.sem = semcreate(0);
-  aipl_emit("Xinu AIPL — actor-language dev window.\n");
-  aipl_emit("  files | list | run \"Rotate4Lines.abcl\" | start | stop | help\n");
-  aipl_emit("aipl> ");
+  aipl_emit("Xinu AIPL — actor-language dev window.  Type `help`.\n");
   for (;;) { aipl_getline(line, sizeof line); aipl_exec_line(line); }
   return OK;
 }
@@ -1976,7 +1978,7 @@ static void aipl_draw(window_t *self, unsigned int frame) {
               self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
     u->full = 0;
   }
-  aipl_draw_toolbar(self);
+  if (g_force_redraw) aipl_draw_toolbar(self);   /* gate: avoid bleeding on top */
   int txt_top = AIPL_TXT_TOP(self);
 
   /* Graphics mode (Rotate4Lines): clear the content + paint the rotating
