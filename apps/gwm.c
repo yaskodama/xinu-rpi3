@@ -848,6 +848,8 @@ static window_t *window_at_close(int sx, int sy)
     return hit;
 }
 
+static void pres_mark_closed(window_t *w);
+static void dev_mark_closed(window_t *w);
 /* Dismiss a window from its close box.  Shell windows are marked closed so
  * the right-click menu can re-open them (their supervisor shell keeps
  * running); other windows are simply unlinked from the WM. */
@@ -860,6 +862,7 @@ static void wm_close_window(window_t *w)
     bi = bas_index_of(w);
     if (bi >= 0) bas_mark_closed(bi);        /* allow menu to re-open it */
     if (aipl_is_win(w)) aipl_mark_closed();
+    pres_mark_closed(w); dev_mark_closed(w);
     wm_remove(w);
     if (active_win == w) active_win = 0;
     g_need_full = 1;
@@ -903,11 +906,17 @@ static void wm_raise(window_t *w)
 /* BASIC-window toolbar (defined in the BASIC section below). */
 static int  basic_toolbar_hit(int sx, int sy, int *inst); /* button idx @pt, or -1 */
 static void basic_run_button(int inst, int idx);          /* run that button's command */
+static int  pres_click(int sx, int sy);                   /* PRESENTATION prev/next */
+static void pres_open(void);
+static void pres_mark_closed(window_t *w);
+static int  dev_click(int sx, int sy);                    /* SMART DEVICE icons/app */
+static void dev_open(void);
+static void dev_mark_closed(window_t *w);
 
 /* ---- right-click pull-down menu --------------------------------------- */
-#define MENU_W  76
+#define MENU_W  108
 #define MENU_IH 15
-static const char *menu_labels[] = { "Shell", "BASIC", "AIPL" };
+static const char *menu_labels[] = { "Shell", "BASIC", "AIPL", "PRESENT", "DEVICE" };
 #define NMENU ((int)(sizeof(menu_labels) / sizeof(menu_labels[0])))
 static int menu_open, menu_x, menu_y;            /* desktop coords           */
 static void menu_exec(int sel);                  /* defined after the windows */
@@ -993,6 +1002,11 @@ static void wm_drag_tick(void)
                 prev_left = left; return;
             }
         }
+    }
+    /* PRESENTATION prev/next buttons + SMART DEVICE icons/app input. */
+    if (left && !prev_left) {
+        if (pres_click(cursor_x, cursor_y)) { prev_left = left; return; }
+        if (dev_click(cursor_x, cursor_y))  { prev_left = left; return; }
     }
     prev_left = left;
 
@@ -2292,6 +2306,306 @@ static void aipl_run_button(int idx) {
 }
 
 /* Right-click menu action. */
+/* ===================================================================
+ * PRESENTATION window — AIPL paper slides (English; 8x8 font), with
+ * mouse Prev/Next page-flip buttons.
+ * =================================================================== */
+static window_t pres_win;
+static int pres_slide = 0, pres_open_flag = 0, pres_dirty = 1;
+static const char *pres_slides[][9] = {
+  { "Typed AI Agent Language", "",
+    "   Design and Implementation", "",
+    "   Yasushi Kodama", "   Hosei University", 0 },
+  { "1. Motivation", "",
+    "- AI agents need a real language",
+    "- Static types catch errors early",
+    "- One source, many runtimes", 0 },
+  { "2. Language Design", "",
+    "- Hindley-Milner type inference",
+    "- Actors + asynchronous messages",
+    "- send / select primitives",
+    "- scope { } structured concurrency", 0 },
+  { "3. Runtimes", "",
+    "- Py-I  (reference interpreter)",
+    "- OCaml, C",
+    "- JavaScript: browser + node",
+    "- 7 runtimes, one semantics", 0 },
+  { "4. Implementation", "",
+    "- abcl2c: AIPL -> C translator",
+    "- Kernel integration on Xinu / Pi",
+    "- Actors run bare-metal on ARM", 0 },
+  { "5. Evaluation", "",
+    "- 26 / 26 feature parity",
+    "- HM type cleanness 87%",
+    "- Live on Raspberry Pi 3", 0 },
+  { "6. Conclusion", "",
+    "- Typed, multi-runtime agent lang.",
+    "- From the browser to bare metal",
+    "- Future work: BPE n-gram, JM", 0 },
+};
+#define PRES_NSLIDE ((int)(sizeof(pres_slides)/sizeof(pres_slides[0])))
+static void pres_btn_rect(window_t *self, int which, int *bx,int *by,int *bw,int *bh)
+{
+    *bw = 86; *bh = 18;
+    *by = self->y + self->height - *bh - 8;
+    *bx = which == 0 ? self->x + 12 : self->x + self->width - *bw - 12;
+}
+static void pres_draw(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    if (!g_force_redraw && !pres_dirty) return;
+    pres_dirty = 0;
+    unsigned int bg = self->content_bg;
+    int cx = self->x + 18, cy = self->y + WM_TITLEBAR_H + 14, i, y;
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1,
+              self->width - 2, self->height - WM_TITLEBAR_H - 2, bg);
+    const char **sl = pres_slides[pres_slide];
+    draw_string_at(cx, cy, sl[0], 0xFF7FE0FFU, bg);            /* title */
+    fill_rect(cx, cy + 11, self->width - 36, 1, 0xFF3A6CB8U);
+    y = cy + 26;
+    for (i = 1; sl[i]; i++) { draw_string_at(cx, y, sl[i], 0xFFE8F0F8U, bg); y += 14; }
+    { char pg[24]; sprintf(pg, "%d / %d", pres_slide + 1, PRES_NSLIDE);
+      draw_string_at(self->x + self->width / 2 - 12, self->y + self->height - 24, pg,
+                     0xFFA0C0E0U, bg); }
+    { int b, x0, y0, w0, h0; for (b = 0; b < 2; b++) {
+        pres_btn_rect(self, b, &x0, &y0, &w0, &h0);
+        fill_rect(x0, y0, w0, h0, 0xFF205088U);
+        fill_rect(x0, y0, w0, 1, 0xFF3A78C8U);
+        draw_string_at(x0 + 12, y0 + 5, b == 0 ? "< Prev" : "Next >", 0xFFFFFFFFU, 0xFF205088U);
+    } }
+}
+static int pres_click(int sx, int sy)
+{
+    if (!pres_open_flag || window_at_point(sx, sy) != &pres_win) return 0;
+    int dx = sx + vp_x, dy = sy + vp_y, b, x0, y0, w0, h0;
+    for (b = 0; b < 2; b++) {
+        pres_btn_rect(&pres_win, b, &x0, &y0, &w0, &h0);
+        if (dx >= x0 && dx < x0 + w0 && dy >= y0 && dy < y0 + h0) {
+            if (b == 0 && pres_slide > 0) pres_slide--;
+            if (b == 1 && pres_slide < PRES_NSLIDE - 1) pres_slide++;
+            pres_dirty = 1; active_win = &pres_win; wm_raise(&pres_win);
+            return 1;
+        }
+    }
+    active_win = &pres_win; wm_raise(&pres_win); return 1;   /* swallow body clicks */
+}
+static void pres_mark_closed(window_t *w) { if (w == &pres_win) pres_open_flag = 0; }
+static void pres_open(void)
+{
+    if (!pres_open_flag) {
+        pres_win.x = 120; pres_win.y = 70; pres_win.width = 470; pres_win.height = 300;
+        title_set(&pres_win, "Presentation");
+        pres_win.chrome_color = 0xFFAACCEEU; pres_win.title_bg = 0xFF402080U;
+        pres_win.title_fg = 0xFFFFFFFFU; pres_win.content_bg = 0xFF0C1422U;
+        pres_win.draw_content = pres_draw;
+        pres_open_flag = 1; wm_add(&pres_win);
+    }
+    pres_dirty = 1; active_win = &pres_win; wm_raise(&pres_win);
+}
+
+/* ===================================================================
+ * SMART DEVICE — an iPad-like simulator window.  Home screen with app
+ * icons; the Reversi icon launches a playable Othello (you = black,
+ * device = white, intermediate positional AI) that runs in the "screen".
+ * =================================================================== */
+static window_t dev_win;
+static int dev_open_flag = 0, dev_dirty = 1, dev_screen = 0;   /* 0 home, 1 reversi */
+static signed char rv_board[8][8];
+static int rv_turn = 1, rv_over = 0;                            /* 1 black(you) 2 white(AI) */
+static const int RV_W[8][8] = {
+  {120,-20, 20,  5,  5, 20,-20,120},
+  {-20,-40, -5, -5, -5, -5,-40,-20},
+  { 20, -5, 15,  3,  3, 15, -5, 20},
+  {  5, -5,  3,  3,  3,  3, -5,  5},
+  {  5, -5,  3,  3,  3,  3, -5,  5},
+  { 20, -5, 15,  3,  3, 15, -5, 20},
+  {-20,-40, -5, -5, -5, -5,-40,-20},
+  {120,-20, 20,  5,  5, 20,-20,120},
+};
+static const int RV_DX[8] = {1,1,1,0,0,-1,-1,-1}, RV_DY[8] = {1,0,-1,1,-1,1,0,-1};
+static int rv_inb(int x, int y) { return x >= 0 && x < 8 && y >= 0 && y < 8; }
+/* Flips for `who` playing (x,y); applies them when doit!=0.  0 = illegal. */
+static int rv_flips(signed char b[8][8], int x, int y, int who, int doit)
+{
+    if (!rv_inb(x, y) || b[y][x] != 0) return 0;
+    int opp = who == 1 ? 2 : 1, total = 0, d;
+    for (d = 0; d < 8; d++) {
+        int cx = x + RV_DX[d], cy = y + RV_DY[d], cnt = 0;
+        while (rv_inb(cx, cy) && b[cy][cx] == opp) { cx += RV_DX[d]; cy += RV_DY[d]; cnt++; }
+        if (cnt > 0 && rv_inb(cx, cy) && b[cy][cx] == who) {
+            total += cnt;
+            if (doit) { int fx = x + RV_DX[d], fy = y + RV_DY[d], k;
+                        for (k = 0; k < cnt; k++) { b[fy][fx] = who; fx += RV_DX[d]; fy += RV_DY[d]; } }
+        }
+    }
+    if (doit && total > 0) b[y][x] = who;
+    return total;
+}
+static int rv_has_move(signed char b[8][8], int who)
+{
+    int x, y; for (y = 0; y < 8; y++) for (x = 0; x < 8; x++)
+        if (rv_flips(b, x, y, who, 0) > 0) return 1;
+    return 0;
+}
+static int rv_eval_for(signed char b[8][8], int who)
+{
+    int x, y, s = 0, opp = who == 1 ? 2 : 1;
+    for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
+        if (b[y][x] == who) s += RV_W[y][x]; else if (b[y][x] == opp) s -= RV_W[y][x];
+    }
+    return s;
+}
+static int rv_nega(signed char b[8][8], int who, int depth)
+{
+    if (depth == 0) return rv_eval_for(b, who);
+    int opp = who == 1 ? 2 : 1, best = -1000000, any = 0, x, y;
+    for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
+        if (rv_flips(b, x, y, who, 0) > 0) {
+            signed char t[8][8]; memcpy(t, b, sizeof t); rv_flips(t, x, y, who, 1);
+            int sc = -rv_nega(t, opp, depth - 1);
+            if (sc > best) best = sc; any = 1;
+        }
+    }
+    if (!any) { if (!rv_has_move(b, opp)) return rv_eval_for(b, who);
+                return -rv_nega(b, opp, depth - 1); }
+    return best;
+}
+static void rv_ai_move(void)
+{
+    int bx = -1, by = -1, best = -1000000, x, y;
+    for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
+        if (rv_flips(rv_board, x, y, 2, 0) > 0) {
+            signed char t[8][8]; memcpy(t, rv_board, sizeof t); rv_flips(t, x, y, 2, 1);
+            int sc = -rv_nega(t, 1, 2);                 /* depth-3 from AI's root */
+            if (sc > best) { best = sc; bx = x; by = y; }
+        }
+    }
+    if (bx >= 0) rv_flips(rv_board, bx, by, 2, 1);
+}
+/* Auto-play AI turns + skip forced passes until the player can move or it ends. */
+static void rv_run_until_player(void)
+{
+    for (;;) {
+        int p = rv_has_move(rv_board, 1), a = rv_has_move(rv_board, 2);
+        if (!p && !a) { rv_over = 1; return; }
+        if (rv_turn == 1) { if (p) return; rv_turn = 2; continue; }
+        if (a) { rv_ai_move(); rv_turn = 1; continue; }
+        rv_turn = 1;
+    }
+}
+static void rv_init(void)
+{
+    memset(rv_board, 0, sizeof rv_board);
+    rv_board[3][3] = 2; rv_board[4][4] = 2; rv_board[3][4] = 1; rv_board[4][3] = 1;
+    rv_turn = 1; rv_over = 0;
+}
+static void dev_disc(int cx, int cy, int r, unsigned int col)
+{
+    int dx, dy; for (dy = -r; dy <= r; dy++) for (dx = -r; dx <= r; dx++)
+        if (dx * dx + dy * dy <= r * r) fill_rect(cx + dx, cy + dy, 1, 1, col);
+}
+static void dev_board_geom(int *bx, int *by, int *cell)
+{
+    *cell = 36; *bx = dev_win.x + (dev_win.width - 8 * 36) / 2;
+    *by = dev_win.y + WM_TITLEBAR_H + 52;
+}
+/* Home / New buttons (reversi screen). which: 0 Home, 1 New. */
+static void dev_rvbtn_rect(int which, int *bx, int *by, int *bw, int *bh)
+{
+    int gx, gy, cell; dev_board_geom(&gx, &gy, &cell);
+    *bw = 96; *bh = 20; *by = gy + 8 * cell + 10;
+    *bx = which == 0 ? gx : gx + 8 * cell - *bw;
+}
+static void dev_icon_rect(int *ix, int *iy, int *iw, int *ih)
+{
+    *iw = 72; *ih = 72;
+    *ix = dev_win.x + (dev_win.width - 72) / 2;
+    *iy = dev_win.y + WM_TITLEBAR_H + 70;
+}
+static void dev_draw(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    if (!g_force_redraw && !dev_dirty) return;
+    dev_dirty = 0;
+    unsigned int body = 0xFF101418U, screen = 0xFF0A1020U;
+    fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 1, self->width - 2,
+              self->height - WM_TITLEBAR_H - 2, body);
+    fill_rect(self->x + 8, self->y + WM_TITLEBAR_H + 6, self->width - 16,
+              self->height - WM_TITLEBAR_H - 28, screen);                /* "glass" */
+    fill_rect(self->x + self->width / 2 - 20, self->y + self->height - 12,
+              40, 4, 0xFF404850U);                                       /* home bar */
+    if (dev_screen == 0) {                                               /* HOME */
+        draw_string_at(self->x + 14, self->y + WM_TITLEBAR_H + 16, "Smart Device",
+                       0xFF80D0FFU, screen);
+        int ix, iy, iw, ih; dev_icon_rect(&ix, &iy, &iw, &ih);
+        fill_rect(ix, iy, iw, ih, 0xFF1E7E48U);
+        fill_rect(ix, iy, iw, 2, 0xFF34B060U);
+        draw_string_at(ix + 8, iy + 30, "othello", 0xFFFFFFFFU, 0xFF1E7E48U);
+        draw_string_at(ix + 4, iy + ih + 6, " Reversi", 0xFFD8E8FFU, screen);
+        return;
+    }
+    /* REVERSI */
+    int gx, gy, cell, x, y, you = 0, ai = 0;
+    dev_board_geom(&gx, &gy, &cell);
+    for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
+        if (rv_board[y][x] == 1) you++; else if (rv_board[y][x] == 2) ai++;
+    }
+    { char sb[40]; sprintf(sb, "You %d   AI %d", you, ai);
+      draw_string_at(gx, self->y + WM_TITLEBAR_H + 20, sb, 0xFFE8F0F8U, screen);
+      const char *st = rv_over ? (you > ai ? "You win!" : you < ai ? "AI wins" : "Draw")
+                              : (rv_turn == 1 ? "Your move" : "AI thinking");
+      draw_string_at(gx, self->y + WM_TITLEBAR_H + 34, st, 0xFFFFD060U, screen); }
+    fill_rect(gx - 2, gy - 2, 8 * cell + 4, 8 * cell + 4, 0xFF0A5A2AU);
+    for (y = 0; y < 8; y++) for (x = 0; x < 8; x++) {
+        int px = gx + x * cell, py = gy + y * cell;
+        fill_rect(px, py, cell - 1, cell - 1, 0xFF128040U);
+        if (rv_board[y][x] == 1) dev_disc(px + cell / 2, py + cell / 2, cell / 2 - 4, 0xFF101010U);
+        else if (rv_board[y][x] == 2) dev_disc(px + cell / 2, py + cell / 2, cell / 2 - 4, 0xFFF0F0F0U);
+        else if (rv_turn == 1 && !rv_over && rv_flips(rv_board, x, y, 1, 0) > 0)
+            dev_disc(px + cell / 2, py + cell / 2, 3, 0xFF40A040U);       /* legal hint */
+    }
+    { int b, bx, by, bw, bh; const char *lbl[2] = { "Home", "New Game" };
+      for (b = 0; b < 2; b++) { dev_rvbtn_rect(b, &bx, &by, &bw, &bh);
+          fill_rect(bx, by, bw, bh, 0xFF205088U); fill_rect(bx, by, bw, 1, 0xFF3A78C8U);
+          draw_string_at(bx + 8, by + 6, lbl[b], 0xFFFFFFFFU, 0xFF205088U); } }
+}
+static int dev_click(int sx, int sy)
+{
+    if (!dev_open_flag || window_at_point(sx, sy) != &dev_win) return 0;
+    int dx = sx + vp_x, dy = sy + vp_y;
+    active_win = &dev_win; wm_raise(&dev_win); dev_dirty = 1;
+    if (dev_screen == 0) {
+        int ix, iy, iw, ih; dev_icon_rect(&ix, &iy, &iw, &ih);
+        if (dx >= ix && dx < ix + iw && dy >= iy && dy < iy + ih) { dev_screen = 1; rv_init(); }
+        return 1;
+    }
+    int b, bx, by, bw, bh;
+    for (b = 0; b < 2; b++) { dev_rvbtn_rect(b, &bx, &by, &bw, &bh);
+        if (dx >= bx && dx < bx + bw && dy >= by && dy < by + bh) {
+            if (b == 0) dev_screen = 0; else rv_init();
+            return 1;
+        } }
+    int gx, gy, cell; dev_board_geom(&gx, &gy, &cell);
+    int cx = (dx - gx) / cell, cy = (dy - gy) / cell;
+    if (rv_inb(cx, cy) && !rv_over && rv_turn == 1 && rv_flips(rv_board, cx, cy, 1, 0) > 0) {
+        rv_flips(rv_board, cx, cy, 1, 1); rv_turn = 2; rv_run_until_player();
+    }
+    return 1;
+}
+static void dev_mark_closed(window_t *w) { if (w == &dev_win) dev_open_flag = 0; }
+static void dev_open(void)
+{
+    if (!dev_open_flag) {
+        dev_win.x = 150; dev_win.y = 40; dev_win.width = 332; dev_win.height = 470;
+        title_set(&dev_win, "Smart Device");
+        dev_win.chrome_color = 0xFFAACCEEU; dev_win.title_bg = 0xFF202830U;
+        dev_win.title_fg = 0xFFFFFFFFU; dev_win.content_bg = 0xFF101418U;
+        dev_win.draw_content = dev_draw;
+        dev_open_flag = 1; dev_screen = 0; wm_add(&dev_win);
+    }
+    dev_dirty = 1; active_win = &dev_win; wm_raise(&dev_win);
+}
+
 static void menu_exec(int sel)
 {
     if (sel == 0) {                              /* Shell: open a closed slot */
@@ -2306,6 +2620,10 @@ static void menu_exec(int sel)
         if (!opened) basic_window_open_n(0);     /* all open -> raise BASIC 0 */
     } else if (sel == 2) {                       /* AIPL */
         aipl_window_open();
+    } else if (sel == 3) {                       /* PRESENTATION */
+        pres_open();
+    } else if (sel == 4) {                       /* SMART DEVICE */
+        dev_open();
     }
     g_need_full = 1;
 }
