@@ -16,6 +16,7 @@ append `?ask=0`):
 | Rotate4Lines.avm        | 4 line segments (one per actor) rotate about a square's corners |
 | Rotate4LinesLoop.avm    | same, endless |
 | DiningPhilosophers.avm  | 5 Philosopher + 5 Fork actors; held forks drawn as arrows to the holder |
+| ArmRobotVM.avm          | 6-axis robot arm; a Renderer interpolates baked keyframe joint poses and draws the links + gripper |
 
 Rebuild from source with the AIPL->.avm compiler:
 
