@@ -1077,7 +1077,7 @@ static const char *S_koch[] = {
 static const char *S_dragon[] = {
     "10 CLS 3",
     "20 X = 200",
-    "30 Y = 160",
+    "30 Y = 130",
     "40 A = 0",
     "50 L = 15",
     "60 D = 8",
@@ -1615,7 +1615,7 @@ static const struct { const char *name; const char *const *line; int n; } sample
     { "maze.bas",     S_maze,     180 },
     { "glass.bas",    S_glass,    80 },
     { "flight.bas",   S_flight,   224 },
-    { "rescue.bas",   S_rescue,   188 },
+    { "rescue.bas",   S_rescue,   (int)(sizeof(S_rescue)/sizeof(S_rescue[0])) },
 };
 #define NSAMPLE ((int)(sizeof(samples) / sizeof(samples[0])))
 
