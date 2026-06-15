@@ -278,6 +278,18 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
     }
     else
     {
+        /* The transfer errored (e.g. USB_STATUS_HARDWARE_ERROR).  For a
+         * low/full-speed keyboard behind the Pi's hub, transfers are SPLIT
+         * transactions; if the error struck mid-split the request is left in a
+         * COMPLETE-SPLIT state, and blindly re-arming retries that stuck CSPLIT
+         * forever (the endpoint then errors on every poll and never recovers —
+         * the AIPL-window keyboard wedge).  Reset the split state so the
+         * throttled re-arm begins a clean START-SPLIT.  No control transfers
+         * are issued, so this cannot disturb the mouse.  (Leave next_data_pid
+         * alone to avoid desyncing the data toggle.) */
+        req->complete_split = 0;
+        req->csplit_retries = 0;
+        req->need_sof       = 0;
         g_kbd_intr_req = req;
         g_kbd_resubmit_pending = 1;
     }
