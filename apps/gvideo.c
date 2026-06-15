@@ -248,6 +248,24 @@ static void put_px(int sx, int sy, unsigned int color)
     *(unsigned int *)(fb_base + sy * fb_pitch + sx * 4) = color;
 }
 
+/* Bridges for apps/abcl_xinu_gui.c (the AIPL actor graphics: rotating lines,
+ * dining forks).  Its put_pixel_pub/etc. used to resolve to apps/wm.c, which
+ * draws into a QEMU PL110 BSS framebuffer that is invisible on the Pi3 HDMI —
+ * so the AIPL "rotate" lines never appeared.  These route to the real 32bpp
+ * gvideo framebuffer instead.  Coords are in desktop space (viewport-adjusted
+ * here, like fill_rect/draw_line).  Callers pass 32bpp ARGB. */
+void gv_put_pixel(int x, int y, unsigned int color)
+{
+    if (!fb_ready) return;
+    put_px(x - view_x, y - view_y, color);
+}
+void gv_fill_rect(int x, int y, int w, int h, unsigned int color)  { fill_rect(x, y, w, h, color); }
+void gv_draw_rect(int x, int y, int w, int h, unsigned int color)  { draw_rect(x, y, w, h, color); }
+void gv_draw_string(int x, int y, const char *s, unsigned int fg, unsigned int bg)
+{
+    draw_string_at(x, y, s, fg, bg);
+}
+
 /* Bresenham line in screen coords (viewport + clip applied) — used by the
  * gwm graphics window's 3-D wireframe. */
 void draw_line(int x0, int y0, int x1, int y1, unsigned int color)

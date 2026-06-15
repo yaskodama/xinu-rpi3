@@ -118,7 +118,22 @@ void rect_outline_pub(int x, int y, int w, int h, unsigned short c);
 void draw_string_pub(int x, int y, const char *s, unsigned short c);
 void wm_draw_line(int x0, int y0, int x1, int y1, unsigned short c);
 
-void put_pixel_pub(int x, int y, unsigned short c) { put_pixel(x, y, c); }
+/* abcl_xinu_gui (AIPL actor graphics) passes BGR565 colours (apps/abcl_xinu_gui.c
+ * rgb565()).  On the Pi3 the visible framebuffer is gvideo's 32bpp HDMI buffer,
+ * NOT this file's QEMU PL110 BSS array — so route these through gvideo and
+ * convert the colour, else the AIPL "rotate" lines draw into an invisible buffer. */
+extern void gv_put_pixel(int x, int y, unsigned int color);
+extern void gv_fill_rect(int x, int y, int w, int h, unsigned int color);
+extern void gv_draw_rect(int x, int y, int w, int h, unsigned int color);
+extern void gv_draw_string(int x, int y, const char *s, unsigned int fg, unsigned int bg);
+static unsigned int bgr565_to_argb(unsigned short c)
+{
+    int b = ((c >> 11) & 0x1F) << 3;
+    int g = ((c >> 5)  & 0x3F) << 2;
+    int r =  (c        & 0x1F) << 3;
+    return 0xFF000000u | ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
+}
+void put_pixel_pub(int x, int y, unsigned short c) { gv_put_pixel(x, y, bgr565_to_argb(c)); }
 
 /* User render hook — called once per WM frame after windows are drawn.
  * Used by `rotlines` and similar overlays. */
@@ -214,8 +229,8 @@ static void rect_outline(int x, int y, int w, int h, unsigned short c)
     fill_rect(x + w - 1, y,         1, h, c);
 }
 
-void fill_rect_pub(int x, int y, int w, int h, unsigned short c) { fill_rect(x, y, w, h, c); }
-void rect_outline_pub(int x, int y, int w, int h, unsigned short c) { rect_outline(x, y, w, h, c); }
+void fill_rect_pub(int x, int y, int w, int h, unsigned short c) { gv_fill_rect(x, y, w, h, bgr565_to_argb(c)); }
+void rect_outline_pub(int x, int y, int w, int h, unsigned short c) { gv_draw_rect(x, y, w, h, bgr565_to_argb(c)); }
 
 /* 8x8 ASCII font for printable chars 0x20..0x7F. Public-domain pixel design. */
 static const unsigned char font8x8[96][8] = {
@@ -342,7 +357,7 @@ static void draw_string(int x, int y, const char *s, unsigned short fg)
     }
 }
 
-void draw_string_pub(int x, int y, const char *s, unsigned short c) { draw_string(x, y, s, c); }
+void draw_string_pub(int x, int y, const char *s, unsigned short c) { gv_draw_string(x, y, s, bgr565_to_argb(c), 0xFF0A0414u); }
 void draw_char_pub(int x, int y, char c, unsigned short fg) { draw_char(x, y, c, fg); }
 
 #define CHAR_W (8 * FONT_SCALE)
