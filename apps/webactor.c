@@ -1967,6 +1967,28 @@ thread webactor_server(void)
                     "Content-Length: 0\r\n\r\n");
                 write(tcpdev, kh2, hlen); close(tcpdev); web_cur_tcpdev = -1; continue;
             }
+            /* /api/kbdstat — USB keyboard diagnostics.  After reproducing the
+             *   "physical keyboard dies after using the soft keyboard" bug,
+             *   poll this while pressing a physical key: if int_calls does NOT
+             *   advance, the keyboard's USB interrupt transfer has halted at
+             *   the HCD level; if it advances but no char appears, the bug is
+             *   above the HCD. */
+            if (0 == strncmp(reqbuf, "GET /api/kbdstat", 16)) {
+                extern void usbKbdDiag(unsigned*, unsigned*, int*, unsigned*,
+                                       int*, int*, unsigned*);
+                unsigned calls=0, reports=0, injects=0, resub=0;
+                int last=0, icount=0, istart=0;
+                static char kb[256], kbh[96]; int kl, kh;
+                usbKbdDiag(&calls, &reports, &last, &injects, &icount, &istart, &resub);
+                kl = sprintf(kb,
+                    "int_calls=%u int_reports=%u last_status=%d "
+                    "inject_cnt=%u resubmit_fail=%u icount=%d istart=%d\n",
+                    calls, reports, last, injects, resub, icount, istart);
+                kh = sprintf(kbh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", kl);
+                write(tcpdev, kbh, kh); write(tcpdev, kb, kl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/wifi/shellring — dump the windowed shell's text ring as
              *   plain text (diagnostic: shows what xsh has actually emitted
              *   to GWINCON0, independent of on-screen rendering). */

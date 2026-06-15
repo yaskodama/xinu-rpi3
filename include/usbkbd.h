@@ -65,6 +65,10 @@ devcall usbKbdGetc(device *devptr);
 devcall usbKbdInit(device *devptr);
 void    usbKbdInterrupt(struct usb_xfer_request *req);
 devcall usbKbdRead(device *devptr, void *buf, uint len);
+void    usbKbdInject(int c);     /* feed a synthetic key (soft keyboard) */
+void    usbKbdDiag(unsigned *calls, unsigned *reports, int *last_status,
+                   unsigned *injects, int *icount, int *istart,
+                   unsigned *resub_fail);   /* /api/kbdstat diagnostics */
 
 /* usbkbd internal functions  */
 usb_status_t usbKbdBindDevice(struct usb_device *dev);

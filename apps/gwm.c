@@ -566,6 +566,7 @@ static struct shcon shc[NSHELL];
 static void wm_raise(window_t *w);
 static int  g_need_full;
 static window_t *window_at_point(int sx, int sy);   /* topmost window @point */
+void gwm_feed_key(int c);                            /* route a key to focus  */
 /* BASIC windows live in bui[] (full defs in the BASIC section); these
  * accessors let wm_close_window() dismiss one like a shell window. */
 static int  bas_index_of(window_t *w);   /* BASIC window -> instance, else -1 */
@@ -1073,6 +1074,20 @@ static void wm_drag_tick(void)
         if (pres_click(cursor_x, cursor_y)) { prev_left = left; return; }
         if (dev_click(cursor_x, cursor_y))  { prev_left = left; return; }
     }
+    /* Soft keyboard: a click on a key delivers the character to the active
+     * (last-focused) text window WITHOUT stealing focus.  We inject it into
+     * USBKBD0's input ring (usbKbdInject) rather than calling gwm_feed_key
+     * here, so the single keyboard-bridge thread is the only caller of the
+     * window editors — feeding them directly from this (wm/mouse) thread
+     * raced the bridge thread and froze keyboard input after one use. */
+    if (left && !prev_left) {
+        int ch = 0;
+        if (softkbd_hit(cursor_x + vp_x, cursor_y + vp_y, &ch)) {
+            extern void usbKbdInject(int);
+            if (ch) usbKbdInject(ch);
+            prev_left = left; return;
+        }
+    }
     prev_left = left;
 
     if (left && !drag_win) {                         /* press: focus + maybe grab */
@@ -1088,7 +1103,12 @@ static void wm_drag_tick(void)
         } else {
             w = window_at_point(cursor_x, cursor_y);  /* body click = focus only */
         }
-        if (w) { active_win = w; wm_raise(w); g_need_full = 1; }
+        if (w == &softkbd_win) {
+            /* Raise the keyboard so its keys are clickable, but keep the
+             * input focus on the previously-focused (text) window so its
+             * keystrokes still route there. */
+            wm_raise(w); g_need_full = 1;
+        } else if (w) { active_win = w; wm_raise(w); g_need_full = 1; }
         if (drag_win) {                               /* seed the ghost = window rect */
             g_drag_ghx = drag_win->x; g_drag_ghy = drag_win->y;
             g_drag_ghw = drag_win->width; g_drag_ghh = drag_win->height;

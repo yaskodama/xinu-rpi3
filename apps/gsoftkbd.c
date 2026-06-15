@@ -9,8 +9,14 @@
 
 #include <gsoftkbd.h>
 #include <gvideo.h>
+#include <string.h>
 
 window_t softkbd_win;
+
+/* Modifier state.  Shift is one-shot (clears after the next character key);
+ * Caps is a lock.  Both are toggled by clicking their on-screen keys. */
+static int kbd_shift = 0;
+static int kbd_caps  = 0;
 
 /* One row = sequence of (label, width_in_units).  Width 0 means
  * use the row's default 1-unit cell.  A NULL label terminates. */
@@ -120,6 +126,91 @@ void softkbd_draw(window_t *self, unsigned int frame)
             x += kw;
         }
     }
+}
+
+/* US-QWERTY shifted symbols for the number/punctuation keys. */
+static char shift_sym(char c)
+{
+    switch (c) {
+        case '1': return '!'; case '2': return '@'; case '3': return '#';
+        case '4': return '$'; case '5': return '%'; case '6': return '^';
+        case '7': return '&'; case '8': return '*'; case '9': return '(';
+        case '0': return ')'; case '-': return '_'; case '=': return '+';
+        case '[': return '{'; case ']': return '}'; case ';': return ':';
+        case '\'':return '"'; case ',': return '<'; case '.': return '>';
+        case '/': return '?'; case '`': return '~';
+        default:  return c;
+    }
+}
+
+/* Resolve a key label to the character to feed the focused window, honouring
+ * the current Shift/Caps state.  Returns 0 for a pure modifier key. */
+static int key_char(const char *lbl)
+{
+    if (lbl[1] == 0) {                          /* single-glyph key */
+        char c = lbl[0];
+        if (c >= 'a' && c <= 'z')
+            return (kbd_caps ^ kbd_shift) ? (c - 'a' + 'A') : c;
+        return kbd_shift ? shift_sym(c) : c;
+    }
+    if (0 == strcmp(lbl, "Space")) return ' ';
+    if (0 == strcmp(lbl, "Bksp"))  return 8;    /* backspace */
+    if (0 == strcmp(lbl, "Ret"))   return '\n'; /* newline -> run line */
+    if (0 == strcmp(lbl, "Tab"))   return '\t';
+    return 0;                                   /* Caps/Shift/Ctrl/Alt */
+}
+
+/* Hit-test a click at desktop coordinates (dx,dy).  If it lands on a key,
+ * set *out_char to the character to feed (0 for a modifier that was just
+ * toggled) and return 1; otherwise return 0.  The layout math here mirrors
+ * softkbd_draw() exactly so the clickable cells match what is painted. */
+int softkbd_hit(int dx, int dy, int *out_char)
+{
+    window_t *self = &softkbd_win;
+    int cx0 = self->x + 4;
+    int cy0 = self->y + WM_TITLEBAR_H + 4;
+    int cw  = self->width  - 8;
+    int ch  = self->height - WM_TITLEBAR_H - 7;
+    int row_count = 5;
+
+    *out_char = 0;
+    if (ch < row_count * 12) return 0;
+
+    int row_h  = ch / row_count;
+    int cell_h = row_h - 2;
+
+    int max_units = 0;
+    for (int r = 0; r < row_count; r++) {
+        int n = row_unit_count(rows[r]);
+        if (n > max_units) max_units = n;
+    }
+    if (max_units == 0) return 0;
+    int unit_w = cw / max_units;
+    if (unit_w < 8) unit_w = 8;
+
+    for (int r = 0; r < row_count; r++) {
+        int n_units = row_unit_count(rows[r]);
+        int row_w = n_units * unit_w;
+        int x = cx0 + (cw - row_w) / 2;
+        int y = cy0 + r * row_h;
+        if (dy < y || dy >= y + cell_h) continue;     /* not in this row band */
+        for (const key_t *k = rows[r]; k->label; k++) {
+            int kw  = (k->w ? k->w : 1) * unit_w;
+            int pad = 2;
+            if (dx >= x + pad && dx < x + kw - pad) {  /* hit this key cell */
+                if (0 == strcmp(k->label, "Shift")) { kbd_shift = !kbd_shift; return 1; }
+                if (0 == strcmp(k->label, "Caps"))  { kbd_caps  = !kbd_caps;  return 1; }
+                if (0 == strcmp(k->label, "Ctrl") ||
+                    0 == strcmp(k->label, "Alt"))   { return 1; }   /* no-op */
+                *out_char = key_char(k->label);
+                kbd_shift = 0;                         /* one-shot shift clears */
+                return 1;
+            }
+            x += kw;
+        }
+        return 0;                                      /* in the band, between keys */
+    }
+    return 0;
 }
 
 #endif /* _XINU_PLATFORM_ARM_RPI3_ */

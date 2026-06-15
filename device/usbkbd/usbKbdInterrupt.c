@@ -6,6 +6,7 @@
 #include <usbkbd.h>
 #include <usb_core_driver.h>
 #include <string.h>
+#include <interrupt.h>
 
 #define HID_BOOT_LEFT_CTRL   (1 << 0)
 #define HID_BOOT_LEFT_SHIFT  (1 << 1)
@@ -116,12 +117,45 @@ static   uchar    g_kbd_repeat_usage  = 0;     /* usage id of the repeat key   *
  * Called when the USB transfer request from a USB keyboard's IN interrupt
  * endpoint completes or fails.
  */
+/* ---- diagnostics (read via /api/kbdstat) -------------------------------- *
+ * Localises the "physical keyboard dies after using the soft keyboard" bug:
+ *   int_calls   bumps every time the HID completion callback fires (i.e. the
+ *               keyboard's interrupt transfer completed and was re-armed).
+ *   int_reports bumps on each well-formed 8-byte report actually parsed.
+ *   last_status records req->status of the most recent callback.
+ *   inject_cnt  bumps on each soft-key usbKbdInject().
+ * If pressing a physical key no longer bumps int_calls, the USB transfer has
+ * halted at the HCD level; if int_calls bumps but no char appears, the bug is
+ * above the HCD (ring/delivery). */
+volatile unsigned g_kbd_int_calls   = 0;
+volatile unsigned g_kbd_int_reports = 0;
+volatile int      g_kbd_last_status = -999;
+volatile unsigned g_kbd_inject_cnt  = 0;
+volatile unsigned g_kbd_resubmit_fail = 0;
+
+void usbKbdDiag(unsigned *calls, unsigned *reports, int *last_status,
+                unsigned *injects, int *icount, int *istart, unsigned *resub_fail)
+{
+    struct usbkbd *kbd = &usbkbds[0];
+    if (calls)       *calls       = g_kbd_int_calls;
+    if (reports)     *reports     = g_kbd_int_reports;
+    if (last_status) *last_status = g_kbd_last_status;
+    if (injects)     *injects     = g_kbd_inject_cnt;
+    if (icount)      *icount      = (int)kbd->icount;
+    if (istart)      *istart      = (int)kbd->istart;
+    if (resub_fail)  *resub_fail  = g_kbd_resubmit_fail;
+}
+
 void usbKbdInterrupt(struct usb_xfer_request *req)
 {
     struct usbkbd *kbd = req->private;
 
+    g_kbd_int_calls++;
+    g_kbd_last_status = (int)req->status;
+
     if (req->status == USB_STATUS_SUCCESS && req->actual_size == 8)
     {
+        g_kbd_int_reports++;
         /* An 8 byte report was successfully received from the USB keyboard.
          * Note that we're using the boot protocol, so the interpretation of
          * this data is fixed and not affected by the HID report descriptor.  */
@@ -222,5 +256,37 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
         USBKBD_TRACE("Bad xfer: status=%d, actual_size=%u",
                      req->status, req->actual_size);
     }
-    usb_submit_xfer_request(req);
+    if (USB_STATUS_SUCCESS != usb_submit_xfer_request(req))
+        g_kbd_resubmit_fail++;     /* re-arm failed: keyboard would go dead */
+}
+
+/**
+ * Inject a synthetic character into USBKBD0's input ring, exactly as the HID
+ * interrupt handler would.  This lets the on-screen soft keyboard deliver its
+ * keystrokes through the SAME single-consumer path as the physical keyboard
+ * (the gwin_kbd_bridge thread draining getc(USBKBD0)), so only one thread ever
+ * calls gwm_feed_key — avoiding the data race that froze keyboard input when
+ * the soft keyboard fed the window editors directly from the wm/mouse thread.
+ *
+ * @param c  character code to inject (0..255)
+ */
+void usbKbdInject(int c)
+{
+    irqmask im;
+    struct usbkbd *kbd = &usbkbds[0];        /* USBKBD0 — the bridge's device */
+    int queued = 0;
+
+    g_kbd_inject_cnt++;
+
+    im = disable();
+    if (kbd->initialized && kbd->icount < USBKBD_IBLEN)
+    {
+        kbd->in[(kbd->istart + kbd->icount) % USBKBD_IBLEN] = (uchar)c;
+        kbd->icount++;
+        queued = 1;
+    }
+    restore(im);
+
+    if (queued)
+        signaln(kbd->isema, 1);              /* wake the bridge's usbKbdRead */
 }
