@@ -912,6 +912,20 @@ void abcl_xinu_gui_tick_all(void)
     }
 }
 
+/* Drop every registered line, ticker and button.  Used by the AIPL window's
+ * `end` command (abcl_rotate4_end) to fully tear down a graphics demo so the
+ * screen clears and nothing is ticked/drawn afterwards. */
+void abcl_xinu_gui_clear(void)
+{
+    int i;
+    lines_ensure_init();
+    wait(lines_mu);
+    for (i = 0; i < MAX_GLINES; i++) { g_lines[i].valid = 0; g_lines[i].has_prev = 0; }
+    signal(lines_mu);
+    g_n_tickers = 0;
+    g_n_buttons = 0;
+}
+
 /* ============================================================
  *  G1: framebuffer drawing primitives (callable from AIPL).
  *

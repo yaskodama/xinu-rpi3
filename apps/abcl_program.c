@@ -2768,16 +2768,32 @@ static void dispatch_Controller(int self_id, int sender_id, const char* method, 
 static int g_rotate4 = -1;
 int abcl_rotate4_init(void) {
   if (g_rotate4 >= 0) return g_rotate4;    /* already running */
-  /* Diagnostic test line (idx 7, not used by the spinners): drawn directly so
-   * the AIPL window can tell a render problem (line absent) from an actor
-   * problem (line present but the spinner lines absent). */
-  xinu_gui_set_line(8, (value_t[]){ mk_int(7L), mk_int(180L), mk_int(60L),
-      mk_int(420L), mk_int(300L), mk_int(255L), mk_int(255L), mk_int(0L) });
   g_rotate4 = create_obj(CLASS_Controller, 0, NULL);
   return g_rotate4;
 }
 void abcl_rotate4_start(void) { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "start", 0, NULL); }
 void abcl_rotate4_stop(void)  { if (g_rotate4 >= 0) enqueue(-1, g_rotate4, "stop",  0, NULL); }
+
+/* Fully end the Rotate4Lines demo: reap the Controller + 4 Spinner actors,
+ * drop the GUI lines/tickers/buttons, and allow a fresh `run` afterwards. */
+static void rotate4_reap(int oid) {
+  if (oid < 0 || objects[oid].dead) return;
+  tid_typ t = objects[oid].tid;
+  objects[oid].dead = 1;
+  if (!isbadtid(t)) { signal(objects[oid].mbox.items); kill(t); }
+}
+void abcl_rotate4_end(void) {
+  extern void abcl_xinu_gui_clear(void);
+  int cid = g_rotate4, f;
+  if (cid < 0) return;
+  for (f = F_Controller_s1; f <= F_Controller_s4; f++) {
+    value_t sv = objects[cid].fields[f];
+    if (sv.tag == V_OBJ) rotate4_reap(sv.obj_id);
+  }
+  rotate4_reap(cid);
+  abcl_xinu_gui_clear();
+  g_rotate4 = -1;
+}
 
 /* ============================================================ *
  *  PingPong — two actors bounce a message back and forth,      *

@@ -14,6 +14,7 @@
 #include <gwm.h>
 #include <gvideo.h>
 #include <gsoftkbd.h>
+#include <fat.h>        /* AIPL `files`: list *.avm on the SD card */
 
 #define DESKTOP_BG     0xFF003366U   /* dark navy "desktop"          */
 #define DEFAULT_FPS    20            /* content repaint: 1 frame / 50 ms */
@@ -2134,6 +2135,7 @@ static void basic_run_button(int inst, int idx)
 extern int  abcl_rotate4_init(void);
 extern void abcl_rotate4_start(void);
 extern void abcl_rotate4_stop(void);
+extern void abcl_rotate4_end(void);
 extern void abcl_pingpong_init(void);
 extern void abcl_xinu_gui_render(void);
 extern void abcl_xinu_gui_tick_all(void);
@@ -2240,17 +2242,85 @@ void aipl_feed(int c) {
     }
   }
 }
+/* true if `s` ends in ".avm" (case-insensitive). */
+static int aipl_is_avm(const char *s) {
+  int n = 0; while (s[n]) n++;
+  if (n < 4) return 0;
+  const char *x = s + n - 4;
+  return x[0] == '.' && (x[1]=='a'||x[1]=='A') && (x[2]=='v'||x[2]=='V') && (x[3]=='m'||x[3]=='M');
+}
+/* `files` SD scan: emit each *.avm entry in the SD card's FAT root. */
+static int aipl_avm_cb(const struct fat_dirent *e, void *ctx) {
+  int *n = (int *)ctx;
+  if (!e->is_dir && aipl_is_avm(e->name)) { aipl_emit("  "); aipl_emit(e->name); aipl_emit("\n"); (*n)++; }
+  return 0;
+}
+/* Read a named .avm off the SD into aipl_vmbuf; tries /microsd then USB /sd.
+ * Returns the byte count, or -1 if not found / too big / read error. */
+static unsigned char aipl_vmbuf[8192];
+static int aipl_vmlen;
+static int aipl_vm_read_cb(const unsigned char *b, int len, void *ctx) {
+  (void)ctx;
+  if (aipl_vmlen + len > (int)sizeof aipl_vmbuf) return 1;
+  memcpy(aipl_vmbuf + aipl_vmlen, b, len); aipl_vmlen += len; return 0;
+}
+static int aipl_read_avm_from(const char *name) {   /* current fat blkdev */
+  struct fat_dirent e;
+  aipl_vmlen = 0;
+  if (fat_mount() != 0 || fat_find_root(name, &e) != 0 || e.is_dir) return -1;
+  if (fat_read_file(e.cluster, e.size, aipl_vm_read_cb, 0) != 0) return -1;
+  return aipl_vmlen;
+}
+static int aipl_load_avm(const char *name) {
+  extern int usbmsc_fat_select(void);
+  int n;
+  fat_set_blkdev(0, 0);                     /* on-board /microsd */
+  n = aipl_read_avm_from(name);
+  if (n < 0 && usbmsc_fat_select() == 0)    /* fall back to USB /sd */
+    n = aipl_read_avm_from(name);
+  fat_set_blkdev(0, 0);
+  return n;
+}
 static void aipl_exec_line(const char *line) {
   const char *p = line; while (*p == ' ' || *p == '\t') p++;
   if (*p == 0) { return; }
   if (0 == strncmp(p, "files", 5)) {
-    int i; aui.gfx = 0; aui.full = 1; aipl_capture = 0; aipl_emit("AIPL programs:\n");
+    int i, navm; extern int usbmsc_fat_select(void);
+    aui.gfx = 0; aui.full = 1; aipl_capture = 0; aipl_emit("AIPL programs:\n");
     for (i = 0; i < AIPL_NFILE; i++) { aipl_emit("  "); aipl_emit(aipl_files[i]); aipl_emit("\n"); }
+    /* actor binaries (*.avm) on the on-board /microsd ... */
+    navm = 0; aipl_emit("On /microsd:\n");
+    fat_set_blkdev(0, 0);
+    if (fat_mount() == 0) fat_list_root(aipl_avm_cb, &navm);
+    if (navm == 0) aipl_emit("  (none)\n");
+    /* ... and on a USB card reader at /sd */
+    navm = 0; aipl_emit("On /sd (USB):\n");
+    if (usbmsc_fat_select() == 0 && fat_mount() == 0) fat_list_root(aipl_avm_cb, &navm);
+    else aipl_emit("  (no USB SD)\n");
+    if (navm == 0) aipl_emit("  (none)\n");
+    fat_set_blkdev(0, 0);
   } else if (0 == strncmp(p, "list", 4) || 0 == strncmp(p, "cat", 3)) {
     int i; aui.gfx = 0; aui.full = 1; aipl_capture = 0; for (i = 0; i < AIPL_NSRC; i++) { aipl_emit(aipl_src[i]); aipl_emit("\n"); }
   } else if (0 == strncmp(p, "run", 3)) {
-    /* pick the program by name (default Rotate4Lines); PingPong is text-only. */
-    if (strstr(p, "Ping") || strstr(p, "ping")) {
+    /* run "NAME.avm": load the actor bytecode off the SD and run it on the
+     * dynamic VM (same as an HTTP /actor/loadvm); draws in the VM graphics window. */
+    char nm[64]; int nl = 0; const char *q = strchr(p, '"');
+    if (q) { q++; while (*q && *q != '"' && nl < 63) nm[nl++] = *q++; }
+    nm[nl] = 0;
+    if (nl > 0 && aipl_is_avm(nm)) {
+      int n;
+      aui.gfx = 0; aui.running = 0; aipl_capture = 1; aui.full = 1;
+      aipl_emit("loading "); aipl_emit(nm); aipl_emit(" from SD...\n");
+      n = aipl_load_avm(nm);
+      if (n > 0) {
+        extern int abcl_vm_loadrun(const unsigned char *, int);
+        int id = abcl_vm_loadrun(aipl_vmbuf, n);
+        if (id >= 0) aipl_emit("running (see the VM graphics window).\n");
+        else         aipl_emit("load failed (not a valid .avm)\n");
+      } else aipl_emit("not found on /microsd or /sd\n");
+    }
+    /* pick the built-in program by name (default Rotate4Lines); PingPong is text-only. */
+    else if (strstr(p, "Ping") || strstr(p, "ping")) {
       aipl_emit("running PingPong.abcl (abcl2c->C->actors):\n");
       aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_capture = 1;
       abcl_pingpong_init();
@@ -2269,6 +2339,10 @@ static void aipl_exec_line(const char *line) {
     abcl_rotate4_start(); aui.gfx = 1; aui.running = 1; aui.full = 1; aipl_emit("started\n");
   } else if (0 == strncmp(p, "stop", 4)) {
     abcl_rotate4_stop(); aipl_emit("stopped\n");
+  } else if (0 == strncmp(p, "end", 3) || 0 == strncmp(p, "quit", 4)) {
+    /* fully end Rotate4Lines: stop+reap actors, clear lines, back to editor */
+    aui.running = 0; aui.gfx = 0; abcl_rotate4_end();
+    aui.full = 1; aipl_capture = 0; aipl_emit("ended Rotate4Lines\n");
   } else if (0 == strncmp(p, "text", 4)) {        /* leave graphics mode -> editor */
     aui.gfx = 0; aui.running = 0; aui.full = 1; aipl_capture = 0; aipl_emit("text mode\n");
   } else if (0 == strncmp(p, "help", 4)) {
@@ -2297,7 +2371,8 @@ thread aipl_win_main(void) {
 static int aipl_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static const struct { const char *label, *cmd; } aipl_btns[] = {
   { "files", "files" }, { "list", "list" }, { "rotate", "run \"Rotate4Lines.abcl\"" },
-  { "pingpong", "run \"PingPong.abcl\"" }, { "start", "start" }, { "stop", "stop" }, { "text", "text" },
+  { "pingpong", "run \"PingPong.abcl\"" }, { "start", "start" }, { "stop", "stop" },
+  { "end", "end" }, { "text", "text" },
 };
 #define AIPL_NBTN ((int)(sizeof(aipl_btns) / sizeof(aipl_btns[0])))
 static void aipl_btn_rect(window_t *self, int i, int *bx, int *by, int *bw, int *bh) {
