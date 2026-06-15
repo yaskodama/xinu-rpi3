@@ -76,6 +76,23 @@ static void draw_key(int x, int y, int w, int h, const char *lbl,
     draw_string_at(gx, gy, lbl, fg, face);
 }
 
+static int key_char(const char *lbl);   /* resolved char for a single-glyph key */
+
+/* The on-screen label for a key, reflecting the live Shift/Caps state:
+ * single-glyph keys show the character they will actually type (upper-case
+ * letters, shifted symbols), multi-glyph keys show their fixed name. */
+static void key_display(const key_t *k, char *buf)
+{
+    if (k->label[1] == 0) {                  /* single glyph -> resolved char */
+        buf[0] = (char)key_char(k->label);
+        buf[1] = 0;
+    } else {
+        int i = 0;
+        for (; k->label[i] && i < 7; i++) buf[i] = k->label[i];
+        buf[i] = 0;
+    }
+}
+
 void softkbd_draw(window_t *self, unsigned int frame)
 {
     extern int g_force_redraw;     /* apps/gwm.c: set only on a full repaint */
@@ -112,6 +129,10 @@ void softkbd_draw(window_t *self, unsigned int frame)
     unsigned int face   = 0xFF202830U;
     unsigned int border = 0xFF608090U;
     unsigned int fg     = 0xFFE8F0F8U;
+    /* Lit modifier keys (Shift one-shot / Caps lock active). */
+    unsigned int on_face   = 0xFFE08020U;     /* amber */
+    unsigned int on_border = 0xFFFFD080U;
+    unsigned int on_fg     = 0xFF101010U;
 
     for (int r = 0; r < row_count; r++) {
         int n_units = row_unit_count(rows[r]);
@@ -119,12 +140,36 @@ void softkbd_draw(window_t *self, unsigned int frame)
         int x = cx0 + (cw - row_w) / 2;
         int y = cy0 + r * row_h;
         for (const key_t *k = rows[r]; k->label; k++) {
-            int kw = (k->w ? k->w : 1) * unit_w;
+            int kw  = (k->w ? k->w : 1) * unit_w;
             int pad = 2;
-            draw_key(x + pad, y, kw - 2 * pad, cell_h, k->label,
-                     face, border, fg);
+            char lbl[8];
+            int lit = (kbd_shift && 0 == strcmp(k->label, "Shift")) ||
+                      (kbd_caps  && 0 == strcmp(k->label, "Caps"));
+            key_display(k, lbl);
+            draw_key(x + pad, y, kw - 2 * pad, cell_h, lbl,
+                     lit ? on_face   : face,
+                     lit ? on_border : border,
+                     lit ? on_fg     : fg);
             x += kw;
         }
+    }
+
+    /* Status badge in the title-bar strip: explicit SHIFT / CAPS indicator. */
+    {
+        char st[24]; int n = 0;
+        st[n++] = '[';
+        st[n++] = kbd_shift ? 'S' : '-';
+        st[n++] = 'h';
+        st[n++] = kbd_caps  ? 'C' : '-';
+        st[n++] = 'a';
+        st[n++] = ']';
+        st[n]   = 0;
+        /* draw at the right end of the title bar */
+        draw_string_at(self->x + self->width - 8 * FONT_WIDTH,
+                       self->y + (WM_TITLEBAR_H - FONT_HEIGHT) / 2,
+                       st,
+                       (kbd_shift || kbd_caps) ? 0xFFFFD080U : 0xFF806040U,
+                       0xFF704020U /* title_bg of softkbd_win */);
     }
 }
 
@@ -162,9 +207,10 @@ static int key_char(const char *lbl)
 
 /* Hit-test a click at desktop coordinates (dx,dy).  If it lands on a key,
  * set *out_char to the character to feed (0 for a modifier that was just
- * toggled) and return 1; otherwise return 0.  The layout math here mirrors
- * softkbd_draw() exactly so the clickable cells match what is painted. */
-int softkbd_hit(int dx, int dy, int *out_char)
+ * toggled), set *out_repaint when the visible Shift/Caps state changed (so
+ * the caller can repaint the keyboard), and return 1; otherwise return 0.
+ * The layout math here mirrors softkbd_draw() exactly. */
+int softkbd_hit(int dx, int dy, int *out_char, int *out_repaint)
 {
     window_t *self = &softkbd_win;
     int cx0 = self->x + 4;
@@ -174,6 +220,7 @@ int softkbd_hit(int dx, int dy, int *out_char)
     int row_count = 5;
 
     *out_char = 0;
+    *out_repaint = 0;
     if (ch < row_count * 12) return 0;
 
     int row_h  = ch / row_count;
@@ -198,12 +245,12 @@ int softkbd_hit(int dx, int dy, int *out_char)
             int kw  = (k->w ? k->w : 1) * unit_w;
             int pad = 2;
             if (dx >= x + pad && dx < x + kw - pad) {  /* hit this key cell */
-                if (0 == strcmp(k->label, "Shift")) { kbd_shift = !kbd_shift; return 1; }
-                if (0 == strcmp(k->label, "Caps"))  { kbd_caps  = !kbd_caps;  return 1; }
+                if (0 == strcmp(k->label, "Shift")) { kbd_shift = !kbd_shift; *out_repaint = 1; return 1; }
+                if (0 == strcmp(k->label, "Caps"))  { kbd_caps  = !kbd_caps;  *out_repaint = 1; return 1; }
                 if (0 == strcmp(k->label, "Ctrl") ||
                     0 == strcmp(k->label, "Alt"))   { return 1; }   /* no-op */
                 *out_char = key_char(k->label);
-                kbd_shift = 0;                         /* one-shot shift clears */
+                if (kbd_shift) { kbd_shift = 0; *out_repaint = 1; }  /* one-shot shift cleared -> labels revert */
                 return 1;
             }
             x += kw;

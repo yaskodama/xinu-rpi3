@@ -132,6 +132,13 @@ volatile unsigned g_kbd_int_reports = 0;
 volatile int      g_kbd_last_status = -999;
 volatile unsigned g_kbd_inject_cnt  = 0;
 volatile unsigned g_kbd_resubmit_fail = 0;
+volatile unsigned g_kbd_err_resubmits = 0;   /* throttled re-arms after errors */
+volatile unsigned g_kbd_clear_halts   = 0;   /* CLEAR_FEATURE(ENDPOINT_HALT) recoveries */
+
+/* Set by usbKbdInterrupt when an errored transfer's re-arm is deferred; the
+ * throttle thread (usbKbdResubmitPending) re-submits it at a low rate. */
+static struct usb_xfer_request *g_kbd_intr_req;
+volatile int g_kbd_resubmit_pending = 0;
 
 void usbKbdDiag(unsigned *calls, unsigned *reports, int *last_status,
                 unsigned *injects, int *icount, int *istart, unsigned *resub_fail)
@@ -256,8 +263,46 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
         USBKBD_TRACE("Bad xfer: status=%d, actual_size=%u",
                      req->status, req->actual_size);
     }
-    if (USB_STATUS_SUCCESS != usb_submit_xfer_request(req))
-        g_kbd_resubmit_fail++;     /* re-arm failed: keyboard would go dead */
+    /* Re-arm the interrupt transfer.  On SUCCESS, re-submit immediately for
+     * low typing latency.  On an ERROR (notably USB_STATUS_HARDWARE_ERROR from
+     * split/transaction errors that the mouse's bus traffic provokes), do NOT
+     * re-submit here: blindly re-arming spins at thousands/sec, saturating the
+     * shared bus so the keyboard endpoint never recovers (this is exactly the
+     * "physical keyboard dies after using the soft keyboard" failure).  Defer
+     * the re-arm to a ~25 ms throttle (usbKbdResubmitPending), which breaks the
+     * spin and lets the endpoint recover once the bus calms down. */
+    if (req->status == USB_STATUS_SUCCESS)
+    {
+        if (USB_STATUS_SUCCESS != usb_submit_xfer_request(req))
+            g_kbd_resubmit_fail++;
+    }
+    else
+    {
+        g_kbd_intr_req = req;
+        g_kbd_resubmit_pending = 1;
+    }
+}
+
+/**
+ * Re-arm a keyboard interrupt transfer that a previous error left deferred.
+ * Called at a steady, low rate from a bridge thread (kbd_repeat_bridge in
+ * system/main.c) so an error storm retries at ~tens/sec instead of hot-
+ * spinning at thousands/sec.  Safe to call when nothing is pending.
+ */
+void usbKbdResubmitPending(void)
+{
+    /* Throttled re-arm only.  (An earlier CLEAR_FEATURE(ENDPOINT_HALT)
+     * recovery here was REMOVED: issuing control transfers every ~250 ms from
+     * this thread saturated the shared USB host and took down the mouse too,
+     * and it did not actually recover the keyboard — the wedge is a bus-level
+     * transaction error, not a device endpoint halt.) */
+    if (g_kbd_resubmit_pending && g_kbd_intr_req)
+    {
+        g_kbd_resubmit_pending = 0;
+        g_kbd_err_resubmits++;
+        if (USB_STATUS_SUCCESS != usb_submit_xfer_request(g_kbd_intr_req))
+            g_kbd_resubmit_fail++;
+    }
 }
 
 /**

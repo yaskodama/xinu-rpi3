@@ -1976,14 +1976,19 @@ thread webactor_server(void)
             if (0 == strncmp(reqbuf, "GET /api/kbdstat", 16)) {
                 extern void usbKbdDiag(unsigned*, unsigned*, int*, unsigned*,
                                        int*, int*, unsigned*);
+                extern volatile unsigned g_kbd_err_resubmits;
+                extern volatile int g_kbd_resubmit_pending;
+                extern volatile unsigned g_kbd_clear_halts;
                 unsigned calls=0, reports=0, injects=0, resub=0;
                 int last=0, icount=0, istart=0;
                 static char kb[256], kbh[96]; int kl, kh;
                 usbKbdDiag(&calls, &reports, &last, &injects, &icount, &istart, &resub);
                 kl = sprintf(kb,
                     "int_calls=%u int_reports=%u last_status=%d "
-                    "inject_cnt=%u resubmit_fail=%u icount=%d istart=%d\n",
-                    calls, reports, last, injects, resub, icount, istart);
+                    "inject_cnt=%u resubmit_fail=%u icount=%d istart=%d "
+                    "err_resubmits=%u defer_pending=%d clear_halts=%u\n",
+                    calls, reports, last, injects, resub, icount, istart,
+                    g_kbd_err_resubmits, g_kbd_resubmit_pending, g_kbd_clear_halts);
                 kh = sprintf(kbh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", kl);
                 write(tcpdev, kbh, kh); write(tcpdev, kb, kl);

@@ -71,10 +71,12 @@ static thread kbd_repeat_bridge(void)
     extern volatile char     g_kbd_repeat_seq[3];
     extern volatile int      g_kbd_repeat_len;
     extern volatile unsigned g_kbd_repeat_gen;
+    extern void usbKbdResubmitPending(void);   /* throttled re-arm after USB error */
     const int TICK = 25, DELAY = 350, INTERVAL = 45;   /* ms */
     unsigned seen = 0; int held = 0, acc = 0;
     for (;;) {
         sleep(TICK);
+        usbKbdResubmitPending();   /* break the HARDWARE_ERROR re-arm hot-spin */
         int len = g_kbd_repeat_len;
         unsigned gen = g_kbd_repeat_gen;
         if (len <= 0) { seen = gen; held = 0; acc = 0; continue; }

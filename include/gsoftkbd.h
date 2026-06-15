@@ -12,9 +12,10 @@
 void softkbd_draw(window_t *self, unsigned int frame);
 
 /* Hit-test a click at desktop coords; on a key, sets *out_char (0 for a
- * modifier) and returns 1.  Wired into the wm click handler so clicking a
- * key feeds it to the focused window.  Defined in apps/gsoftkbd.c. */
-int softkbd_hit(int dx, int dy, int *out_char);
+ * modifier), sets *out_repaint when the Shift/Caps display changed, and
+ * returns 1.  Wired into the wm click handler so clicking a key feeds it to
+ * the focused window.  Defined in apps/gsoftkbd.c. */
+int softkbd_hit(int dx, int dy, int *out_char, int *out_repaint);
 
 extern window_t softkbd_win;
 

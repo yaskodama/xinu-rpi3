@@ -1081,10 +1081,11 @@ static void wm_drag_tick(void)
      * window editors — feeding them directly from this (wm/mouse) thread
      * raced the bridge thread and froze keyboard input after one use. */
     if (left && !prev_left) {
-        int ch = 0;
-        if (softkbd_hit(cursor_x + vp_x, cursor_y + vp_y, &ch)) {
+        int ch = 0, rp = 0;
+        if (softkbd_hit(cursor_x + vp_x, cursor_y + vp_y, &ch, &rp)) {
             extern void usbKbdInject(int);
             if (ch) usbKbdInject(ch);
+            if (rp) g_need_full = 1;   /* Shift/Caps changed -> repaint keyboard */
             prev_left = left; return;
         }
     }
