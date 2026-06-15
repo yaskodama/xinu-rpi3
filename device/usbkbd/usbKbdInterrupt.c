@@ -135,6 +135,16 @@ volatile unsigned g_kbd_resubmit_fail = 0;
 volatile unsigned g_kbd_err_resubmits = 0;   /* throttled re-arms after errors */
 volatile unsigned g_kbd_clear_halts   = 0;   /* CLEAR_FEATURE(ENDPOINT_HALT) recoveries */
 
+/* Auto re-enumeration: when the interrupt endpoint hard-errors and re-arming
+ * cannot clear it (USB_STATUS_HARDWARE_ERROR storm), software-replug the
+ * keyboard.  Counts consecutive errors; past a threshold a worker thread
+ * (usbKbdRecover, driven from kbd_repeat_bridge) re-enumerates the device. */
+#define KBD_ERR_REENUM_THRESH 40     /* ~1.5 s of solid errors before replug   */
+#define KBD_MAX_AUTO_REENUM   8      /* give up after this many failed replugs  */
+volatile unsigned g_kbd_consec_err  = 0;
+volatile int      g_kbd_need_reenum = 0;
+volatile unsigned g_kbd_reenum_cnt  = 0;     /* auto re-enumerations performed   */
+
 /* Set by usbKbdInterrupt when an errored transfer's re-arm is deferred; the
  * throttle thread (usbKbdResubmitPending) re-submits it at a low rate. */
 static struct usb_xfer_request *g_kbd_intr_req;
@@ -273,6 +283,8 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
      * spin and lets the endpoint recover once the bus calms down. */
     if (req->status == USB_STATUS_SUCCESS)
     {
+        g_kbd_consec_err = 0;            /* healthy — reset the error run */
+        g_kbd_reenum_cnt = 0;           /* and the replug budget         */
         if (USB_STATUS_SUCCESS != usb_submit_xfer_request(req))
             g_kbd_resubmit_fail++;
     }
@@ -291,7 +303,22 @@ void usbKbdInterrupt(struct usb_xfer_request *req)
         req->csplit_retries = 0;
         req->need_sof       = 0;
         g_kbd_intr_req = req;
-        g_kbd_resubmit_pending = 1;
+        g_kbd_consec_err++;
+        /* If re-arming has not cleared the error after many tries, the endpoint
+         * is hard-wedged: ask the worker thread to software-replug (re-enumerate)
+         * the keyboard, and STOP the hot re-arm loop (which only saturates the
+         * bus and can starve the mouse).  Otherwise keep the gentle throttled
+         * re-arm. */
+        if (g_kbd_consec_err >= KBD_ERR_REENUM_THRESH &&
+            !g_kbd_need_reenum && g_kbd_reenum_cnt < KBD_MAX_AUTO_REENUM)
+        {
+            g_kbd_need_reenum      = 1;
+            g_kbd_resubmit_pending = 0;
+        }
+        else if (!g_kbd_need_reenum)
+        {
+            g_kbd_resubmit_pending = 1;
+        }
     }
 }
 
@@ -315,6 +342,106 @@ void usbKbdResubmitPending(void)
         if (USB_STATUS_SUCCESS != usb_submit_xfer_request(g_kbd_intr_req))
             g_kbd_resubmit_fail++;
     }
+}
+
+/**
+ * Worker-thread tick (called from kbd_repeat_bridge in system/main.c): if the
+ * keyboard's endpoint has been hard-wedged long enough that re-arming gave up,
+ * software-replug it by re-enumerating the device on its hub port.  Runs in
+ * thread context (re-enumeration issues control transfers and sleeps).  After a
+ * replug, usbKbdBindDevice() re-arms a fresh interrupt transfer automatically.
+ */
+void usbKbdRecover(void)
+{
+    struct usbkbd *kbd = &usbkbds[0];
+
+    if (!g_kbd_need_reenum)
+        return;
+    g_kbd_need_reenum = 0;
+    g_kbd_consec_err  = 0;
+    g_kbd_reenum_cnt++;
+
+    if (kbd->initialized && NULL != kbd->intr && NULL != kbd->intr->dev)
+        usb_reenumerate_device(kbd->intr->dev);
+}
+
+/**
+ * Force-recover a wedged USB keyboard.  When the keyboard's interrupt IN
+ * transfer has hung (the "keyboard dies after the soft keyboard / AIPL window"
+ * bus-level split-transaction error), this drops any stuck buffered input,
+ * resets the request's split-transaction state, and queues a clean re-arm
+ * through the SAME throttled path the error handler uses (no control transfers
+ * are issued, so the mouse is never disturbed).  Exposed to the shell as the
+ * `kbd` command.  Returns OK if a re-arm was queued, SYSERR if the keyboard is
+ * not initialized.
+ */
+int usbKbdRevive(void)
+{
+    irqmask im;
+    struct usbkbd *kbd = &usbkbds[0];
+
+    if (!kbd->initialized || NULL == kbd->intr)
+        return SYSERR;
+
+    im = disable();
+    kbd->icount = 0;                 /* drop any stuck buffered input */
+    kbd->istart = 0;
+    kbd->intr->complete_split = 0;   /* clean START-SPLIT on the next poll */
+    kbd->intr->csplit_retries = 0;
+    kbd->intr->need_sof       = 0;
+    g_kbd_intr_req         = kbd->intr;
+    g_kbd_resubmit_pending = 1;      /* the throttle thread re-arms it */
+    restore(im);
+    return OK;
+}
+
+/**
+ * Stronger recovery (shell `kbd hard`).  A plain re-arm cannot clear a
+ * persistent USB_STATUS_HARDWARE_ERROR (-3) bus/split fault, so this also
+ * RE-INITIALISES the keyboard's HID endpoint: it re-places the keyboard in boot
+ * protocol (a SET_PROTOCOL control transfer on EP0, which is separate from the
+ * wedged interrupt-IN endpoint), resets the data toggle to DATA0, and re-arms
+ * the interrupt transfer immediately (coordinating with the throttle thread so
+ * the request is submitted exactly once).  One control transfer on demand — not
+ * the 250 ms storm that previously starved the mouse.  Returns OK if re-armed.
+ */
+#define KBD_REQ_SET_PROTOCOL  0x0B
+#define KBD_BOOT_PROTOCOL     0
+int usbKbdReviveHard(void)
+{
+    irqmask im;
+    struct usbkbd *kbd = &usbkbds[0];
+    struct usb_device *dev;
+
+    if (!kbd->initialized || NULL == kbd->intr || NULL == kbd->intr->dev)
+        return SYSERR;
+    dev = kbd->intr->dev;
+
+    im = disable();
+    g_kbd_resubmit_pending = 0;          /* take ownership from the throttle */
+    kbd->icount = 0;
+    kbd->istart = 0;
+    kbd->intr->complete_split = 0;
+    kbd->intr->csplit_retries = 0;
+    kbd->intr->need_sof       = 0;
+    kbd->intr->next_data_pid  = 0;       /* resync the data toggle to DATA0 */
+    restore(im);
+
+    /* Re-place the keyboard in boot-protocol mode (re-inits the HID endpoint).
+     * Interface 0 is the HID interface on essentially all boot keyboards. */
+    (void)usb_control_msg(dev, NULL, KBD_REQ_SET_PROTOCOL,
+                          USB_BMREQUESTTYPE_TYPE_CLASS |
+                              USB_BMREQUESTTYPE_DIR_OUT |
+                              USB_BMREQUESTTYPE_RECIPIENT_INTERFACE,
+                          KBD_BOOT_PROTOCOL, 0, NULL, 0);
+
+    if (USB_STATUS_SUCCESS != usb_submit_xfer_request(kbd->intr))
+    {
+        g_kbd_resubmit_fail++;
+        return SYSERR;
+    }
+    g_kbd_err_resubmits++;
+    return OK;
 }
 
 /**

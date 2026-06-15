@@ -17,6 +17,7 @@ window_t softkbd_win;
  * Caps is a lock.  Both are toggled by clicking their on-screen keys. */
 static int kbd_shift = 0;
 static int kbd_caps  = 0;
+static int kbd_ctrl  = 0;   /* one-shot: clears after the next character key */
 
 /* One row = sequence of (label, width_in_units).  Width 0 means
  * use the row's default 1-unit cell.  A NULL label terminates. */
@@ -144,7 +145,8 @@ void softkbd_draw(window_t *self, unsigned int frame)
             int pad = 2;
             char lbl[8];
             int lit = (kbd_shift && 0 == strcmp(k->label, "Shift")) ||
-                      (kbd_caps  && 0 == strcmp(k->label, "Caps"));
+                      (kbd_caps  && 0 == strcmp(k->label, "Caps"))  ||
+                      (kbd_ctrl  && 0 == strcmp(k->label, "Ctrl"));
             key_display(k, lbl);
             draw_key(x + pad, y, kw - 2 * pad, cell_h, lbl,
                      lit ? on_face   : face,
@@ -162,13 +164,16 @@ void softkbd_draw(window_t *self, unsigned int frame)
         st[n++] = 'h';
         st[n++] = kbd_caps  ? 'C' : '-';
         st[n++] = 'a';
+        st[n++] = ' ';
+        st[n++] = kbd_ctrl  ? 'C' : '-';
+        st[n++] = 't';
         st[n++] = ']';
         st[n]   = 0;
         /* draw at the right end of the title bar */
-        draw_string_at(self->x + self->width - 8 * FONT_WIDTH,
+        draw_string_at(self->x + self->width - 11 * FONT_WIDTH,
                        self->y + (WM_TITLEBAR_H - FONT_HEIGHT) / 2,
                        st,
-                       (kbd_shift || kbd_caps) ? 0xFFFFD080U : 0xFF806040U,
+                       (kbd_shift || kbd_caps || kbd_ctrl) ? 0xFFFFD080U : 0xFF806040U,
                        0xFF704020U /* title_bg of softkbd_win */);
     }
 }
@@ -247,9 +252,17 @@ int softkbd_hit(int dx, int dy, int *out_char, int *out_repaint)
             if (dx >= x + pad && dx < x + kw - pad) {  /* hit this key cell */
                 if (0 == strcmp(k->label, "Shift")) { kbd_shift = !kbd_shift; *out_repaint = 1; return 1; }
                 if (0 == strcmp(k->label, "Caps"))  { kbd_caps  = !kbd_caps;  *out_repaint = 1; return 1; }
-                if (0 == strcmp(k->label, "Ctrl") ||
-                    0 == strcmp(k->label, "Alt"))   { return 1; }   /* no-op */
+                if (0 == strcmp(k->label, "Ctrl"))  { kbd_ctrl  = !kbd_ctrl;  *out_repaint = 1; return 1; }
+                if (0 == strcmp(k->label, "Alt"))   { return 1; }   /* no-op */
                 *out_char = key_char(k->label);
+                if (kbd_ctrl && *out_char) {          /* Ctrl+key -> control code (e.g. Ctrl+C = 0x03) */
+                    int c = *out_char;
+                    if (c >= 'a' && c <= 'z')      c = c - 'a' + 1;
+                    else if (c >= 'A' && c <= 'Z') c = c - 'A' + 1;
+                    else if (c >= '@' && c <= '_') c = c - '@';      /* @ [ \ ] ^ _ */
+                    *out_char = c;
+                    kbd_ctrl = 0; *out_repaint = 1;                  /* one-shot Ctrl cleared */
+                }
                 if (kbd_shift) { kbd_shift = 0; *out_repaint = 1; }  /* one-shot shift cleared -> labels revert */
                 return 1;
             }

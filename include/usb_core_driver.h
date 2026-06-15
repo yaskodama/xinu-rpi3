@@ -385,6 +385,11 @@ usb_attach_device(struct usb_device *dev);
 void
 usb_free_device(struct usb_device *dev);
 
+/* Software "replug" of a single device (detach + re-enumerate on its hub port).
+ * Thread context only.  Recovers a hard-wedged keyboard endpoint. */
+usb_status_t
+usb_reenumerate_device(struct usb_device *dev);
+
 /* The following functions are intended to be used only by the USB host
  * controller driver.  */
 

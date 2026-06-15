@@ -978,7 +978,7 @@ static void dev_mark_closed(window_t *w);
 /* ---- right-click pull-down menu --------------------------------------- */
 #define MENU_W  108
 #define MENU_IH 15
-static const char *menu_labels[] = { "Shell", "BASIC", "AIPL", "PRESENT", "DEVICE" };
+static const char *menu_labels[] = { "Shell", "BASIC", "AIPL", "PRESENT", "DEVICE", "MAKINA", "WALK" };
 #define NMENU ((int)(sizeof(menu_labels) / sizeof(menu_labels[0])))
 static int menu_open, menu_x, menu_y;            /* desktop coords           */
 static void menu_exec(int sel);                  /* defined after the windows */
@@ -1014,7 +1014,7 @@ static void draw_menu(void)
 /* Process the left button each cursor poll: start / continue / end a drag. */
 static void wm_drag_tick(void)
 {
-    static int prev_left = 0, prev_right = 0;
+    static int prev_left = 0, prev_right = 0, prev_makl = 0;
     int left  = usbmouse_buttons & 1;
     int right = usbmouse_buttons & 2;
 
@@ -1091,6 +1091,35 @@ static void wm_drag_tick(void)
         }
     }
     prev_left = left;
+
+    /* MAKINA-7 3-D window: toolbar buttons rotate the model; dragging in the
+     * 3-D viewport orbits it.  Titlebar/resize corners drag/resize as usual. */
+    {
+        extern void *makina_win_ptr(void);
+        extern int  makina_drag_active(void);
+        extern void makina_drag_set(int, int, int);
+        extern void makina_drag_move(int, int);
+        extern int  makina_button_hit(int, int);
+        extern void makina_button_action(int);
+        extern int  makina_viewport_hit(int, int);
+        if (left && makina_drag_active()) { makina_drag_move(cursor_x, cursor_y); return; }
+        if (!left && makina_drag_active()) { makina_drag_set(0, 0, 0); }
+        if (left && !prev_makl) {                 /* fresh press: button? */
+            extern int makina_walk_toggle_hit(int, int);
+            int b = makina_button_hit(cursor_x + vp_x, cursor_y + vp_y);
+            if (b >= 0) { active_win = (window_t *)makina_win_ptr(); wm_raise(active_win);
+                          makina_button_action(b); prev_makl = left; g_need_full = 1; return; }
+            if (makina_walk_toggle_hit(cursor_x + vp_x, cursor_y + vp_y)) {
+                          prev_makl = left; g_need_full = 1; return; }
+        }
+        if (left && !drag_win && !makina_drag_active()
+            && makina_viewport_hit(cursor_x + vp_x, cursor_y + vp_y)) {
+            active_win = (window_t *)makina_win_ptr(); wm_raise(active_win);
+            makina_drag_set(1, cursor_x, cursor_y); prev_makl = left;
+            return;
+        }
+        prev_makl = left;
+    }
 
     if (left && !drag_win) {                         /* press: focus + maybe grab */
         window_t *w = window_at_resize(cursor_x, cursor_y);    /* corner first */
@@ -2288,6 +2317,9 @@ static void aipl_exec_line(const char *line) {
     int i, navm; extern int usbmsc_fat_select(void);
     aui.gfx = 0; aui.full = 1; aipl_capture = 0; aipl_emit("AIPL programs:\n");
     for (i = 0; i < AIPL_NFILE; i++) { aipl_emit("  "); aipl_emit(aipl_files[i]); aipl_emit("\n"); }
+    aipl_emit("Loaded 3-D actors (sent over the network):\n");
+    aipl_emit("  MAKINA      -> run \"MAKINA\"       (3-D viewer)\n");
+    aipl_emit("  MAKINA Walk -> run \"MAKINA Walk\"  (rigged walk)\n");
     /* actor binaries (*.avm) on the on-board /microsd ... */
     navm = 0; aipl_emit("On /microsd:\n");
     fat_set_blkdev(0, 0);
@@ -2307,7 +2339,18 @@ static void aipl_exec_line(const char *line) {
     char nm[64]; int nl = 0; const char *q = strchr(p, '"');
     if (q) { q++; while (*q && *q != '"' && nl < 63) nm[nl++] = *q++; }
     nm[nl] = 0;
-    if (nl > 0 && aipl_is_avm(nm)) {
+    /* MAKINA-7: the 3-D mesh/rig sent over /actor/loadmesh|loadrig (or the
+     * kernel-baked default).  "run" (re)opens its native viewer window. */
+    if (nl > 0 && (strstr(nm,"MAKINA")||strstr(nm,"Makina")||strstr(nm,"makina"))) {
+      extern int makina_window_open(void); extern int makina_walk_open(void);
+      if (strstr(nm,"alk")||strstr(nm,"ALK")||strstr(nm,"Walk")) {
+        makina_walk_open(); aipl_emit("opened MAKINA-7 Walk (rigged).\n");
+      } else {
+        makina_window_open(); aipl_emit("opened MAKINA-7 3D viewer.\n");
+      }
+      g_need_full = 1;
+    }
+    else if (nl > 0 && aipl_is_avm(nm)) {
       int n;
       aui.gfx = 0; aui.running = 0; aipl_capture = 1; aui.full = 1;
       aipl_emit("loading "); aipl_emit(nm); aipl_emit(" from SD...\n");
@@ -2352,6 +2395,8 @@ static void aipl_exec_line(const char *line) {
     aipl_emit("  list                    show the selected program's source\n");
     aipl_emit("  run \"Rotate4Lines.abcl\"  run it: 4 lines rotate (Spinner actors)\n");
     aipl_emit("  run \"PingPong.abcl\"      run it: 2 actors trade a message (AIPL console)\n");
+    aipl_emit("  run \"MAKINA\"             open the MAKINA-7 3-D viewer (sent mesh)\n");
+    aipl_emit("  run \"MAKINA Walk\"        open the rigged walking MAKINA-7\n");
     aipl_emit("  start                   resume the rotating spinners\n");
     aipl_emit("  stop                    pause the rotating spinners\n");
     aipl_emit("  text                    leave graphics mode, back to the editor\n");
@@ -2370,7 +2415,8 @@ thread aipl_win_main(void) {
 
 static int aipl_slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static const struct { const char *label, *cmd; } aipl_btns[] = {
-  { "files", "files" }, { "list", "list" }, { "rotate", "run \"Rotate4Lines.abcl\"" },
+  { "files", "files" }, { "list", "list" }, { "MAKINA", "run \"MAKINA\"" },
+  { "WALK", "run \"MAKINA Walk\"" }, { "rotate", "run \"Rotate4Lines.abcl\"" },
   { "pingpong", "run \"PingPong.abcl\"" }, { "start", "start" }, { "stop", "stop" },
   { "end", "end" }, { "text", "text" },
 };
@@ -3289,7 +3335,7 @@ void vm_print(int self_id, const char *s)         /* called on an actor thread *
 }
 
 /* ---- graphics window (actor draw output) ---- */
-#define VMG_MAX 512
+#define VMG_MAX 4096   /* lines per VM-graphics frame (raised for hi-res wireframes) */
 static window_t vmgfx_win; static int vmgfx_open = 0, vmgfx_want = 0, vmgfx_dirty = 0, vmgfx_suppress = 0;
 static int vmtxt_suppress = 0;
 static struct { short x1, y1, x2, y2; unsigned char col; } vmg_line[VMG_MAX];
@@ -3336,7 +3382,7 @@ void vm_gfx_unsuppress(void) { vmgfx_suppress = 0; vmtxt_suppress = 0; }
 static void vm_io_tick(void)
 {
     if (vmtxt_want && !vmtxt_open && !vmtxt_suppress) {
-        vmtxt_win.x = 30; vmtxt_win.y = 60; vmtxt_win.width = 520; vmtxt_win.height = 300;
+        vmtxt_win.x = 30; vmtxt_win.y = 470; vmtxt_win.width = 720; vmtxt_win.height = 440;
         title_set(&vmtxt_win, "VM print");
         vmtxt_win.chrome_color = 0xFFAACCEEU; vmtxt_win.title_bg = 0xFF103020U;
         vmtxt_win.title_fg = 0xFFFFFFFFU; vmtxt_win.content_bg = 0xFF06140AU;
@@ -3345,7 +3391,7 @@ static void vm_io_tick(void)
     }
     if (vmgfx_want && !vmgfx_open && !vmgfx_suppress) {
         vmg_drawn_n = 0;                              /* fresh window: nothing to erase yet */
-        vmgfx_win.x = 120; vmgfx_win.y = 100; vmgfx_win.width = 480; vmgfx_win.height = 360;
+        vmgfx_win.x = 120; vmgfx_win.y = 60; vmgfx_win.width = 820; vmgfx_win.height = 640;
         title_set(&vmgfx_win, "VM graphics");
         vmgfx_win.chrome_color = 0xFFAACCEEU; vmgfx_win.title_bg = 0xFF102030U;
         vmgfx_win.title_fg = 0xFFFFFFFFU; vmgfx_win.content_bg = 0xFF06100AU;
@@ -3379,6 +3425,12 @@ static void menu_exec(int sel)
         pres_open();
     } else if (sel == 4) {                       /* SMART DEVICE */
         dev_open();
+    } else if (sel == 5) {                       /* MAKINA-7 native 3-D viewer */
+        extern int makina_window_open(void);
+        makina_window_open();
+    } else if (sel == 6) {                       /* MAKINA-7 walking actor */
+        extern int makina_walk_open(void);
+        makina_walk_open();
     }
     g_need_full = 1;
 }

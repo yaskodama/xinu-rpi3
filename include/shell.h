@@ -98,6 +98,7 @@ shellcmd xsh_flashstat(int, char *[]);
 shellcmd xsh_gpiostat(int, char *[]);
 shellcmd xsh_help(int, char *[]);
 shellcmd xsh_history(int, char *[]);
+shellcmd xsh_kbd(int, char *[]);
 shellcmd xsh_kexec(int, char *[]);
 shellcmd xsh_kill(int, char *[]);
 shellcmd xsh_led(int, char *[]);

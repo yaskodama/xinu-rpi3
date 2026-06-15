@@ -47,6 +47,7 @@ const struct centry commandtab[] = {
 #endif
     {"help", FALSE, xsh_help},
     {"history", FALSE, xsh_history},
+    {"kbd", FALSE, xsh_kbd},
     {"ls", FALSE, xsh_ls},
     {"make", TRUE, xsh_make},
 #if defined(ETH0) || defined(_XINU_PLATFORM_ARM_RPI_)

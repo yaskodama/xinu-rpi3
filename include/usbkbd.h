@@ -67,6 +67,9 @@ void    usbKbdInterrupt(struct usb_xfer_request *req);
 devcall usbKbdRead(device *devptr, void *buf, uint len);
 void    usbKbdInject(int c);     /* feed a synthetic key (soft keyboard) */
 void    usbKbdResubmitPending(void);  /* throttled re-arm after a transfer error */
+void    usbKbdRecover(void);          /* worker tick: auto software-replug if wedged */
+int     usbKbdRevive(void);           /* force-recover a wedged keyboard (shell `kbd`) */
+int     usbKbdReviveHard(void);       /* stronger recovery: re-init endpoint (`kbd hard`) */
 void    usbKbdDiag(unsigned *calls, unsigned *reports, int *last_status,
                    unsigned *injects, int *icount, int *istart,
                    unsigned *resub_fail);   /* /api/kbdstat diagnostics */

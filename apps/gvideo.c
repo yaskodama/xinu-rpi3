@@ -206,6 +206,46 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     }
 }
 
+/* Fast horizontal span (one framebuffer row), viewport+clip aware, NO cursor
+ * predraw — for the software 3-D rasteriser (apps/makina3d.c), which hides the
+ * cursor once per frame rather than per span. */
+void gv_span(int x, int y, int w, unsigned int color)
+{
+    if (!fb_ready) return;
+    int sx = x - view_x, sy = y - view_y;
+    if (sy < clip_y0 || sy >= clip_y1 || sy < 0 || sy >= (int)fb_height) return;
+    if (sx < clip_x0) { w -= (clip_x0 - sx); sx = clip_x0; }
+    if (sx < 0)       { w += sx;             sx = 0; }
+    if (sx + w > clip_x1)        w = clip_x1 - sx;
+    if (sx + w > (int)fb_width)  w = (int)fb_width - sx;
+    if (w <= 0) return;
+    unsigned int *row = (unsigned int *)(fb_base + sy * fb_pitch + sx * 4);
+    for (int i = 0; i < w; i++) row[i] = color;
+}
+
+/* Blit an offscreen ARGB buffer (stride `sstride` px) to the screen at (x,y),
+ * viewport+clip aware — for flicker-free double-buffered rendering (makina3d). */
+void gv_blit(int x, int y, int w, int h, const unsigned int *src, int sstride)
+{
+    if (!fb_ready) return;
+    int sx = x - view_x, sy = y - view_y, ox = 0, oy = 0;
+    if (sx < clip_x0) { ox += clip_x0 - sx; w -= clip_x0 - sx; sx = clip_x0; }
+    if (sy < clip_y0) { oy += clip_y0 - sy; h -= clip_y0 - sy; sy = clip_y0; }
+    if (sx < 0) { ox -= sx; w += sx; sx = 0; }
+    if (sy < 0) { oy -= sy; h += sy; sy = 0; }
+    if (sx + w > clip_x1)       w = clip_x1 - sx;
+    if (sy + h > clip_y1)       h = clip_y1 - sy;
+    if (sx + w > (int)fb_width)  w = (int)fb_width  - sx;
+    if (sy + h > (int)fb_height) h = (int)fb_height - sy;
+    if (w <= 0 || h <= 0) return;
+    if (gv_predraw_rect) gv_predraw_rect(sx, sy, w, h);
+    for (int j = 0; j < h; j++) {
+        unsigned int *d = (unsigned int *)(fb_base + (sy + j) * fb_pitch + sx * 4);
+        const unsigned int *s = src + (oy + j) * sstride + ox;
+        for (int i = 0; i < w; i++) d[i] = s[i];
+    }
+}
+
 /* Raw screen-space 32bpp save/restore for the mouse-cursor backing store.
  * (x,y) are ABSOLUTE framebuffer pixels — no viewport, no clip.  The gwm
  * cursor uses these to stash the pixels under the pointer and put them back

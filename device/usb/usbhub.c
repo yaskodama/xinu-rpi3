@@ -410,6 +410,43 @@ port_detach_device(struct usb_port *port)
     }
 }
 
+/* Software "replug": detach + re-enumerate the device on its own hub port.
+ * Recovers a device (e.g. a keyboard) whose endpoint hard-errors
+ * (USB_STATUS_HARDWARE_ERROR) and cannot be re-armed — the same effect as
+ * physically unplugging and re-inserting it, but only its own port is reset so
+ * sibling devices (the mouse) are undisturbed.  MUST be called from THREAD
+ * context: it issues control transfers and sleeps.  Returns OK on success. */
+usb_status_t usb_reenumerate_device(struct usb_device *dev)
+{
+    uint i;
+    struct usb_hub *hub = NULL;
+    struct usb_port *port;
+    uint pn;
+
+    if (dev == NULL || dev->parent == NULL)
+        return SYSERR;
+
+    for (i = 0; i < MAX_NUSBHUBS; i++)
+    {
+        if (hub_structs[i].inuse && hub_structs[i].device == dev->parent)
+        {
+            hub = &hub_structs[i];
+            break;
+        }
+    }
+    if (hub == NULL)
+        return SYSERR;
+
+    pn = dev->port_number;                       /* 1-based */
+    if (pn < 1 || pn > hub->descriptor.bNbrPorts)
+        return SYSERR;
+    port = &hub->ports[pn - 1];
+
+    port_detach_device(port);                    /* frees dev; unbinds driver  */
+    port_attach_device(port);                    /* reset + enumerate + re-bind */
+    return OK;
+}
+
 /* Respond to status change on a USB port.  */
 static void
 port_status_changed(struct usb_port *port)

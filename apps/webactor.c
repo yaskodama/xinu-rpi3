@@ -327,7 +327,8 @@ thread webactor_server(void)
          * to a few seconds end-to-end. */
         n = 0;
         {
-            int header_end = -1, content_len = 0, have_cl = 0;
+            extern void makina_progress(int, int);
+            int header_end = -1, content_len = 0, have_cl = 0, is_mesh = 0;
             while (n < WEB_BUFSZ - 1)
             {
                 int want;
@@ -358,6 +359,8 @@ thread webactor_server(void)
                 }
                 n += r;
                 reqbuf[n] = '\0';
+                if (header_end >= 0 && is_mesh)
+                    makina_progress(n - header_end, content_len);
                 if (header_end < 0)
                 {
                     char *p = strstr(reqbuf, "\r\n\r\n");
@@ -365,6 +368,10 @@ thread webactor_server(void)
                     {
                         char *cl;
                         header_end = (int)(p - reqbuf) + 4;
+                        is_mesh = (0 == strncmp(reqbuf, "POST /actor/loadmesh", 20) ||
+                                   0 == strncmp(reqbuf, "GET /actor/loadmesh",  19) ||
+                                   0 == strncmp(reqbuf, "POST /actor/loadrig",  19) ||
+                                   0 == strncmp(reqbuf, "GET /actor/loadrig",   18));
                         cl = strstr(reqbuf, "Content-Length:");
                         if (NULL == cl)
                         {
@@ -776,11 +783,66 @@ thread webactor_server(void)
              * Returns the new actor id (or -1).  This is the dynamic-actor
              * loading path: an actor binary is sent and run without a kernel
              * rebuild. */
-            if (0 == strncmp(reqbuf, "POST /actor/loadvm", 18) ||
-                0 == strncmp(reqbuf, "GET /actor/loadvm",  17))
+            /* /actor/loadvm  — ordinary actor modules (capped at VM_ACTOR_MAX).
+             * /actor/loadimg — large "image/media" modules (3-D wireframes; and
+             *   later drone photo/video frames sent as actors), up to
+             *   VM_MODULE_MAX (1 MB).  Both share the streamed receive into the
+             *   1.5 MB reqbuf; they differ only in the size limit applied. */
+            /* /actor/loadmesh — POST an "MK3D" binary mesh (verts/tris/colors).
+             * Not actor bytecode: the native kernel 3-D viewer (makina3d.c)
+             * loads it as the active model and shades it.  This is how detailed
+             * 3-D data is sent to Xinu "as an actor" without a kernel rebuild. */
+            /* /actor/loadrig — POST an "MKR1" skeletal rig; the native viewer
+             * forward-kinematics it for the articulated walk (arms+legs swing). */
+            if (0 == strncmp(reqbuf, "POST /actor/loadrig", 19) ||
+                0 == strncmp(reqbuf, "GET /actor/loadrig",  18))
+            {
+                extern int makina_load_rig(const unsigned char *, int);
+                int he = -1; char *hp = strstr(reqbuf, "\r\n\r\n");
+                if (NULL != hp) he = (int)(hp - reqbuf) + 4;
+                int nt = -1, blen = 0;
+                if (he >= 0 && he <= n) {
+                    blen = n - he;
+                    nt = makina_load_rig((const unsigned char *)(reqbuf + he), blen);
+                }
+                static char rresp[256];
+                int bl = sprintf(rresp + 100, "loadrig: body=%d triangles=%d\r\n", blen, nt);
+                int hl = sprintf(rresp, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                        "Content-Length: %d\r\n\r\n", bl);
+                memcpy(rresp + hl, rresp + 100, bl);
+                write(tcpdev, rresp, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "POST /actor/loadmesh", 20) ||
+                0 == strncmp(reqbuf, "GET /actor/loadmesh",  19))
+            {
+                extern int makina_load_mesh(const unsigned char *, int);
+                int he = -1; char *hp = strstr(reqbuf, "\r\n\r\n");
+                if (NULL != hp) he = (int)(hp - reqbuf) + 4;
+                int nt = -1, blen = 0;
+                if (he >= 0 && he <= n) {
+                    blen = n - he;
+                    nt = makina_load_mesh((const unsigned char *)(reqbuf + he), blen);
+                }
+                static char mresp[256];
+                int bl = sprintf(mresp + 100, "loadmesh: body=%d triangles=%d\r\n", blen, nt);
+                int hl = sprintf(mresp, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                        "Content-Length: %d\r\n\r\n", bl);
+                memcpy(mresp + hl, mresp + 100, bl);
+                write(tcpdev, mresp, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1;
+                continue;
+            }
+            if (0 == strncmp(reqbuf, "POST /actor/loadvm",  18) ||
+                0 == strncmp(reqbuf, "GET /actor/loadvm",   17) ||
+                0 == strncmp(reqbuf, "POST /actor/loadimg", 19) ||
+                0 == strncmp(reqbuf, "GET /actor/loadimg",  18))
             {
                 extern int abcl_vm_loadrun(const unsigned char *, int);
                 extern int vm_accept_ask(const char *);
+                int is_img = (NULL != strstr(reqbuf, "/actor/loadimg"));
+                int limit  = is_img ? (1024*1024) : 65536;   /* VM_MODULE_MAX : VM_ACTOR_MAX */
                 int he = -1; char *hp = strstr(reqbuf, "\r\n\r\n");
                 if (NULL != hp) he = (int)(hp - reqbuf) + 4;
                 /* The on-screen "accept actor?" dialog is OPTIONAL: pass
@@ -793,11 +855,17 @@ thread webactor_server(void)
                 int id = -1, blen = 0, accepted = 0;
                 if (he >= 0 && he <= n) {
                     blen = n - he;
-                    if (skip_ask) accepted = 1;          /* benchmark mode: no prompt */
-                    else { char info[64]; sprintf(info, "%d bytes from the network", blen);
-                           accepted = vm_accept_ask(info); }
-                    if (accepted)
-                        id = abcl_vm_loadrun((const unsigned char *)(reqbuf + he), blen);
+                    if (blen > limit) {                  /* too big for this route */
+                        accepted = 0; id = -2;           /* id=-2 => over the size limit */
+                    } else {
+                        if (skip_ask) accepted = 1;      /* benchmark mode: no prompt */
+                        else { char info[64];
+                               sprintf(info, "%s %d bytes from the network",
+                                       is_img ? "IMAGE" : "actor", blen);
+                               accepted = vm_accept_ask(info); }
+                        if (accepted)
+                            id = abcl_vm_loadrun((const unsigned char *)(reqbuf + he), blen);
+                    }
                 }
                 static char vresp[256];
                 int bl = sprintf(vresp + 100, "loadvm: body=%d accepted=%d spawned actor id=%d\r\n",
@@ -1992,6 +2060,23 @@ thread webactor_server(void)
                 kh = sprintf(kbh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", kl);
                 write(tcpdev, kbh, kh); write(tcpdev, kb, kl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            /* /api/kbd-revive — force-recover a wedged USB keyboard over the
+             *   network (same as the shell `kbd` command).  Use this when the
+             *   physical keyboard stops responding and you cannot type. */
+            if (0 == strncmp(reqbuf, "GET /api/kbd-revive", 19) ||
+                0 == strncmp(reqbuf, "POST /api/kbd-revive", 20)) {
+                extern int usbKbdRevive(void);
+                extern int usbKbdReviveHard(void);
+                int hard = (NULL != strstr(reqbuf, "hard"));
+                int rc = hard ? usbKbdReviveHard() : usbKbdRevive();
+                static char kr[80], krh[96]; int kl, kh;
+                kl = sprintf(kr, "kbd-revive%s: %s\n", hard ? " (hard)" : "",
+                             rc == 0 ? "re-armed (try typing)" : "failed");
+                kh = sprintf(krh, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", kl);
+                write(tcpdev, krh, kh); write(tcpdev, kr, kl);
                 close(tcpdev); web_cur_tcpdev = -1; continue;
             }
             /* /api/wifi/shellring — dump the windowed shell's text ring as

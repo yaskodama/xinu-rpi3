@@ -2852,7 +2852,12 @@ void abcl_pingpong_init(void) {
 #define VM_MAX_CLASSES 16
 #define VM_MAX_METHODS 16
 #define VM_STR_MAX     64
-#define VM_MODULE_MAX  8192
+/* Normal actor modules stay small; large "image/media" modules (3-D wireframes,
+ * and — coming — drone photo/video frames sent as actors) use the big buffer.
+ * The webactor separates the two: /actor/loadvm caps at VM_ACTOR_MAX, while
+ * /actor/loadimg allows up to VM_MODULE_MAX. */
+#define VM_MODULE_MAX  (1024*1024)   /* 1 MB — image/media modules */
+#define VM_ACTOR_MAX   65536         /* 64 KB — ordinary actors */
 #define VM_STRBUF_MAX  2048
 #define VM_VSTACK      64
 typedef struct { int name, n_params, code_off, code_len; } vmmethod_t;
