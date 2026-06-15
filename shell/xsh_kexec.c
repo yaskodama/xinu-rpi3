@@ -9,6 +9,7 @@
 #include <shell.h>
 #include <stdio.h>
 #include <string.h>
+#include <fat.h>
 
 #if NETHER
 #  include <tftp.h>
@@ -20,6 +21,7 @@ static void usage(const char *command);
 
 static void kexec_from_network(int netdev);
 static void kexec_from_uart(int uartdev);
+static void kexec_from_sd(const char *file);
 
 /**
  * @ingroup shell
@@ -35,6 +37,21 @@ shellcmd xsh_kexec(int nargs, char *args[])
     {
         usage(args[0]);
         return SHELL_OK;
+    }
+
+    /* `kexec` with no arguments: boot the default (full) kernel, OS0.IMG. */
+    if (1 == nargs)
+    {
+        kexec_from_sd("OS0.IMG");
+        return SHELL_ERROR;               /* only returns if the load failed */
+    }
+
+    /* `kexec <PATH>` : load a kernel image directly off the SD and run it,
+     * e.g.  kexec /sd/OS1.IMG  or  kexec OS2.IMG  (anything not a -flag). */
+    if (2 == nargs && args[1][0] != '-')
+    {
+        kexec_from_sd(args[1]);
+        return SHELL_ERROR;               /* only returns if the load failed */
     }
 
     if (3 != nargs)
@@ -80,6 +97,10 @@ shellcmd xsh_kexec(int nargs, char *args[])
         }
         kexec_from_uart(dev);
     }
+    else if (0 == strcmp(args[1], "-s"))
+    {
+        kexec_from_sd(args[2]);          /* boot a kernel image off the SD card */
+    }
     else
     {
         usage(args[0]);
@@ -88,12 +109,84 @@ shellcmd xsh_kexec(int nargs, char *args[])
     return SHELL_ERROR;
 }
 
+/* Load a kernel image file (e.g. OS1.IMG / OS2.IMG) off the SD card into RAM
+ * and transfer control to it with kexec().  Tries the on-board /microsd first,
+ * then a USB card reader.  The 2 MB buffer lives in BSS (high RAM), well clear
+ * of the 0x8000 load address kexec() copies into.  Does not return on success. */
+static unsigned char kx_buf[2 * 1024 * 1024];
+static int           kx_len;
+static int kx_read_cb(const unsigned char *b, int len, void *ctx)
+{
+    (void)ctx;
+    if (kx_len + len > (int)sizeof kx_buf) return 1;   /* image too big */
+    memcpy(kx_buf + kx_len, b, len);
+    kx_len += len;
+    return 0;
+}
+static int kx_read_from(const char *file)
+{
+    struct fat_dirent e;
+    kx_len = 0;
+    if (fat_mount() != 0 || fat_find_root(file, &e) != 0 || e.is_dir)
+        return -1;
+    if (fat_read_file(e.cluster, e.size, kx_read_cb, 0) != 0)
+        return -1;
+    return kx_len;
+}
+/* Strip any directory prefix: "/sd/OS1.IMG" -> "OS1.IMG", "OS1.IMG" -> "OS1.IMG".
+ * The FAT layer only knows root-directory entries, so the leading /sd, /microsd
+ * etc. are cosmetic mount-point names we ignore. */
+static const char *kx_basename(const char *p)
+{
+    const char *b = p, *s;
+    for (s = p; *s; s++)
+        if (*s == '/') b = s + 1;
+    return b;
+}
+
+static void kexec_from_sd(const char *path)
+{
+    extern int usbmsc_fat_select(void);
+    const char *file = kx_basename(path);
+    int n;
+
+    /* Read the chosen image off the SD into RAM (on-board /microsd, then USB). */
+    fat_set_blkdev(0, 0);
+    n = kx_read_from(file);
+    if (n < 0 && usbmsc_fat_select() == 0)
+        n = kx_read_from(file);
+    fat_set_blkdev(0, 0);
+
+    if (n <= 0)
+    {
+        fprintf(stderr, "ERROR: could not read \"%s\" from SD.\n", file);
+        return;
+    }
+
+    /* Transfer control to the new kernel by copying it to 0x8000 and jumping
+     * (warm kexec).  NOTE: this is a WARM restart — the USB host, SD and
+     * network are NOT cold-reset, so the keyboard/mouse/Ethernet may not work
+     * in the new kernel.  The HDMI framebuffer survives, so a no-window-system
+     * kernel's on-screen text prompt does appear.  For a fully-reset switch,
+     * copy the image to kernel.img on the SD from a host and power-cycle. */
+    printf("Loaded %s (%d bytes); starting it (warm kexec)...\n", file, n);
+    kexec(kx_buf, (uint)n);              /* copies to 0x8000 and jumps — no return */
+    fprintf(stderr, "ERROR: kexec failed.\n");
+}
+
 static void usage(const char *command)
 {
         printf(
-"Usage: %s\n\n"
+"Usage: %s [PATH | -n DEV | -u DEV | -s FILE]\n\n"
 "Description:\n"
 "\tLoads and executes a new kernel.\n"
+"\tkexec <PATH>   load and run an SD image directly, e.g.\n"
+"\t                   kexec /sd/OS1.IMG     (minimal kernel)\n"
+"\t                   kexec /sd/OS2.IMG     (no window system)\n"
+"\t                   kexec OS0.IMG         (full kernel)\n"
+"\tkexec          (no args) boots the default full kernel OS0.IMG.\n"
+"\tNOTE: this is a WARM restart on the Pi3 - the HDMI text prompt appears\n"
+"\tbut USB/network may not work in the new kernel (no cold reset).\n"
 "Options:\n"
 "\t-n <NETDEV>    Load the new kernel over the specified network device.\n"
 "\t               This will bring down the corresponding network\n"
@@ -106,6 +199,7 @@ static void usage(const char *command)
 "\t               This is currently a Raspberry-Pi specific feature\n"
 "\t               and is designed to be used with \"raspbootcom\"\n"
 "\t               running on the other end of the serial connection.\n"
+"\t-s <FILE>      Same as `kexec <FILE>` (load an SD image and run it).\n"
 #endif
 "\t--help         display this help and exit\n"
 

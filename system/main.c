@@ -230,12 +230,21 @@ thread main(void)
         }
     }
 
+    /* ---- Build variants (selected via DETAIL=-D... at compile time) -------
+     *   default     full kernel: networking + AIPL + HDMI window system
+     *   OS_NO_WM    full kernel minus the window system (no gwm desktop)  -> OS2.IMG
+     *   OS_MINIMAL  minimal kernel: serial shell only (no net, no WM)     -> OS1.IMG
+     * OS_MINIMAL also implies OS_NO_WM. */
+#if defined(OS_MINIMAL) && !defined(OS_NO_WM)
+#  define OS_NO_WM
+#endif
+
     /* Open all ethernet devices.  On Pi3 B+, ETH0 is the onboard LAN78xx
      * (LAN7515): the link comes up, RX receives frames, and the system stays
      * responsive (an earlier "hang" was actually the host reading the wrong
      * serial device).  Opening ETH0 here brings up link + RX/TX so `netup
      * ETH0` can run DHCP. */
-#if NETHER
+#if NETHER && !defined(OS_MINIMAL)
     /* Bring ethernet up in a background thread (64 KB stack) so a slow USB
      * enumeration can't block boot, notably the CONSOLE shell created below. */
     ready(create((void *)eth_open_all, 65536, INITPRIO, "ethopen", 0),
@@ -253,7 +262,12 @@ thread main(void)
 #if defined(CONSOLE) && defined(SERIAL0)
     if (OK == open(CONSOLE, SERIAL0))
     {
-  #if HAVE_SHELL
+  /* Only the minimal kernel (OS1) runs an interactive shell on the serial
+   * line.  The full kernel and OS2 have other shells (HDMI desktop / HDMI
+   * text console / network), so we leave SERIAL0 OUTPUT-ONLY there: a noisy
+   * or echoed RX line would otherwise feed the serial shell an endless stream
+   * of junk "commands", flooding the console. */
+  #if HAVE_SHELL && defined(OS_MINIMAL)
         shelldevs[nshells][0] = CONSOLE;
         shelldevs[nshells][1] = CONSOLE;
         shelldevs[nshells][2] = CONSOLE;
@@ -268,13 +282,18 @@ thread main(void)
   #warning "No TTY for SERIAL0"
 #endif
 
-    /* Set up the second TTY (TTY1) if possible.  Skipped on Pi3: the window
-     * manager (gwm_main) now owns the HDMI framebuffer and repaints it every
-     * frame, so a TTY1/KBDMON0 shell writing to the same framebuffer would
-     * just fight it.  The USB keyboard is routed into the WM instead. */
-#if defined(TTY1) && !defined(_XINU_PLATFORM_ARM_RPI3_)
+    /* Set up the second TTY (TTY1).  Normally skipped on Pi3: the window
+     * manager (gwm_main) owns the HDMI framebuffer and repaints it every frame,
+     * so a TTY1/KBDMON0 shell writing to the same framebuffer would fight it.
+     * But the no-window-system builds (OS_NO_WM / OS_MINIMAL) have no gwm, so we
+     * ENABLE the KBDMON0 console there: usbKbdGetc (USB keyboard) + fbPutc
+     * (HDMI text) give a real on-screen `xsh$` prompt without a desktop. */
+#if defined(TTY1) && (!defined(_XINU_PLATFORM_ARM_RPI3_) || defined(OS_NO_WM))
   #if defined(KBDMON0)
     /* Associate TTY1 with keyboard and use framebuffer output  */
+  #ifdef OS_NO_WM
+    { extern bool minishell; minishell = TRUE; }   /* enable bottom-scroll in fbPutc */
+  #endif
     if (OK == open(TTY1, KBDMON0))
     {
     #if HAVE_SHELL
@@ -388,7 +407,7 @@ thread main(void)
      * than the generic shelldevs pool: the supervisor re-runs shell() and,
      * when the user types `exit`, dismisses the on-screen window instead of
      * leaving a dead one.  The window is re-opened from the right-click menu. */
-#if defined(_XINU_PLATFORM_ARM_RPI3_) && HAVE_SHELL
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && HAVE_SHELL && !defined(OS_NO_WM)
     {
         extern int gwin_shell_supervisor(int, int, int, int);
 #ifdef GWINCON0
@@ -436,7 +455,7 @@ thread main(void)
      * the desktop + windows + soft keyboard on the HDMI framebuffer
      * (already brought up by screenInit() at boot).  Generous stack:
      * the framebuffer render chain is deep on Cortex-A53. */
-#ifdef _XINU_PLATFORM_ARM_RPI3_
+#if defined(_XINU_PLATFORM_ARM_RPI3_) && !defined(OS_NO_WM)
     {
         extern thread gwm_main(void);
         extern thread basic_main_n(int inst);

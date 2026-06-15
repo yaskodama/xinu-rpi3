@@ -66,8 +66,32 @@ syscall kexec(const void *kernel, uint size)
 
     im = disable();
 
-    /* Copy the assembly stub into a safe location.  */
+    /* Copy the assembly stub into a safe location.  (D-cache is OFF in this
+     * kernel — see system/platforms/arm-rpi3/mmu.c — so these writes reach RAM
+     * directly.) */
     memcpy(COPY_KERNEL_ADDR, copy_kernel, sizeof(copy_kernel));
+
+    /* Warm-restart cache/MMU teardown — THE fix for "kexec hangs the new
+     * kernel".  This kernel runs with MMU + I-cache ENABLED.  After we copy the
+     * new kernel over 0x8000, the I-cache still holds the OLD kernel's
+     * instructions for that range, so `mov pc,#0x8000` would execute stale code
+     * and crash.  Drop the MMU and I-cache and invalidate them so the new
+     * kernel is fetched fresh from RAM — i.e. the same bare environment the
+     * firmware hands a cold boot.  Identity-mapped (VA==PA), so turning the MMU
+     * off keeps execution flowing. */
+    asm volatile (
+        "dsb\n isb\n"
+        "mrc p15, 0, r0, c1, c0, 0\n"   /* read SCTLR                       */
+        "bic r0, r0, #(1 << 0)\n"       /* M = 0  -> MMU off                */
+        "bic r0, r0, #(1 << 12)\n"      /* I = 0  -> I-cache off            */
+        "mcr p15, 0, r0, c1, c0, 0\n"
+        "mov r0, #0\n"
+        "mcr p15, 0, r0, c7, c5, 0\n"   /* ICIALLU — invalidate I-cache     */
+        "mcr p15, 0, r0, c7, c5, 6\n"   /* BPIALL  — invalidate branch pred */
+        "mcr p15, 0, r0, c8, c7, 0\n"   /* TLBIALL — invalidate TLB         */
+        "dsb\n isb\n"
+        : : : "r0", "memory"
+    );
 
     /* Enter the assembly stub to copy the new kernel into its final location,
      * then pass control to it.  */

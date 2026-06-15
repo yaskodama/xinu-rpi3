@@ -198,8 +198,12 @@ int sd_read_block(unsigned long lba, void *buf)
     return 0;
 }
 
-/* Writing is not needed for `ls /microsd`; left unimplemented to avoid any
- * risk to the card the kernel boots from. */
+/* On-board SD WRITE is intentionally DISABLED.  A first CMD24 implementation
+ * here corrupted the FAT: a failed/partial write still issues the write command
+ * and the card commits indeterminate data to the target sector.  Until a fully
+ * verified (and atomically safe) write path exists, return failure WITHOUT
+ * issuing any command, so a broken write can never damage the boot card.  Note:
+ * kexec no longer needs this — it loads images read-only and warm-jumps. */
 int sd_write_block(unsigned long lba, const void *buf)
 {
     (void)lba; (void)buf;
