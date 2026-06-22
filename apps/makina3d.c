@@ -79,8 +79,10 @@ static void mk_line(int x0,int y0,int x1,int y1,int bw,int bh,unsigned int col){
 }
 
 #define MK_TB 26            /* toolbar height */
-#define MK_NBTN 5
-static const char *mk_btn[MK_NBTN] = { "Y-", "Y+", "P-", "P+", "SPIN" };
+#define MK_NBTN 7
+/* Y-/Y+/P-/P+ orbit the camera; PLAY starts the turntable, PAUSE stops it
+ * (中断), END closes the display window (終了). */
+static const char *mk_btn[MK_NBTN] = { "Y-", "Y+", "P-", "P+", "PLAY", "PAUSE", "END" };
 
 void makina_orbit(int dx, int dy) { g_yaw = (g_yaw - dx) & 255; g_pitch = (g_pitch + dy) & 255; g_dirty = 1; }
 int  makina_drag_active(void) { return mk_drag; }
@@ -108,11 +110,14 @@ int makina_button_hit(int sx, int sy){
     return -1;
 }
 void makina_button_action(int i){
+    extern void wm_remove(window_t *);
     if (i==0) makina_orbit( 12,0);
     else if (i==1) makina_orbit(-12,0);
     else if (i==2) makina_orbit(0,-12);
     else if (i==3) makina_orbit(0, 12);
-    else if (i==4) { g_spin = !g_spin; g_dirty = 1; }
+    else if (i==4) { g_spin = 1; g_dirty = 1; }              /* PLAY  : start turntable */
+    else if (i==5) { g_spin = 0; g_dirty = 1; }              /* PAUSE : 中断             */
+    else if (i==6) { g_spin = 0; mk_open = 0; wm_remove(&mk_win); }  /* END : 終了 (close) */
 }
 /* 1 if (sx,sy) is inside the 3-D viewport (below the toolbar) */
 int makina_viewport_hit(int sx, int sy){
@@ -232,7 +237,10 @@ static void mk_render(window_t *self){
     fill_rect(gx, gy, cw, MK_TB-2, 0xFF1A2030U);
     int bx,by,bbw,bh2;
     for (i=0;i<MK_NBTN;i++){ mk_btn_rect(i,&bx,&by,&bbw,&bh2);
-        unsigned int f = (i==4 && g_spin) ? 0xFF2E8B40U : 0xFF38506EU;
+        /* PLAY lit green while spinning; PAUSE lit while stopped; END red. */
+        unsigned int f = (i==4 && g_spin) ? 0xFF2E8B40U
+                       : (i==5 && !g_spin) ? 0xFF2E8B40U
+                       : (i==6) ? 0xFFA0382EU : 0xFF38506EU;
         fill_rect(bx,by,bbw,bh2,f);
         draw_string_at(bx+5,by+(bh2-FONT_HEIGHT)/2,mk_btn[i],0xFFFFFFFFU,f);
     }
