@@ -354,7 +354,7 @@ void makina_progress(int recv, int total){
     int bx = 310, by = 350, bw = 320, bh = 44;
     fill_rect(bx-2, by-2, bw+4, bh+4, 0xFF0A0E18U);
     fill_rect(bx, by, bw, bh, 0xFF182233U);
-    draw_string_at(bx+8, by+5, "Receiving mesh", 0xFFFFFFFFU, 0xFF182233U);
+    draw_string_at(bx+8, by+5, "Loading binary actor", 0xFFFFFFFFU, 0xFF182233U);
     /* percent text, right-aligned-ish */
     char ps[6]; int m=0;
     if (pct >= 100) { ps[m++]='1'; ps[m++]='0'; ps[m++]='0'; }

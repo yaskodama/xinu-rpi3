@@ -2971,6 +2971,9 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
                  long col = VPOP(), y2 = VPOP(), x2 = VPOP(), y1 = VPOP(), x1 = VPOP();
                  vm_line((int)x1, (int)y1, (int)x2, (int)y2, (int)col); } break;
     case 0x46: { extern void vm_cls(void); vm_cls(); } break;                   /* CLS */
+    case 0x47: { extern void vm_fill_triangle(int,int,int,int,int,int,int);     /* TRI x1,y1,x2,y2,x3,y3,col */
+                 long col = VPOP(), y3 = VPOP(), x3 = VPOP(), y2 = VPOP(), x2 = VPOP(), y1 = VPOP(), x1 = VPOP();
+                 vm_fill_triangle((int)x1,(int)y1,(int)x2,(int)y2,(int)x3,(int)y3,(int)col); } break;
     case 0x43: pc = clen; break;
     default:   pc = clen; break;
     }

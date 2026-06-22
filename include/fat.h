@@ -64,4 +64,9 @@ void fat_set_blkdev(int (*reader)(unsigned long lba, void *buf),
  * success, -1 on error (disk full / root full / write error). */
 int fat_write_root(const char *name, const unsigned char *data, unsigned long size);
 
+/* Delete a root-directory file by (long or 8.3) name: free its cluster chain
+ * and mark its directory slot (+ preceding LFN entries) deleted.  Returns 0 if
+ * found and deleted, -1 otherwise. */
+int fat_delete_root(const char *name);
+
 #endif /* _FAT_H_ */

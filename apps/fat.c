@@ -399,3 +399,76 @@ int fat_list_root(int (*cb)(const struct fat_dirent *e, void *ctx), void *ctx)
     }
     return 0;
 }
+
+/* Delete a root-directory file by (long or 8.3) name: free its cluster chain
+ * and mark its 8.3 directory slot — plus the preceding LFN run — as deleted
+ * (0xE5).  Walks the directory exactly like fat_list_root so it matches on the
+ * reassembled long name (the same name the picker shows).  Returns 0 if the
+ * file was found and deleted, -1 otherwise. */
+int fat_delete_root(const char *name)
+{
+    static unsigned char dbuf[SD_BLOCK_SIZE] __attribute__((aligned(4)));
+    char lfn[256];
+    int have_lfn = 0;
+    /* (lba,off) of the current run's LFN slots, so they can be marked 0xE5. */
+    struct { unsigned long lba; int off; } slot[24];
+    int nslot = 0, k;
+    unsigned long clus;
+
+    if (fat_mount() != 0) return -1;
+    lfn[0] = 0;
+
+    for (clus = fat_root_clus; clus >= 2 && clus < 0x0FFFFFF8UL; clus = fat_next(clus)) {
+        unsigned s;
+        for (s = 0; s < fat_spc; s++) {
+            unsigned long lba = clus_to_lba(clus) + s;
+            int e;
+            if (g_blk(lba, dbuf) != 0) return -1;
+            for (e = 0; e < SD_BLOCK_SIZE; e += 32) {
+                unsigned char *d = dbuf + e;
+                unsigned char attr;
+
+                if (d[0] == 0x00) return -1;                    /* end of dir */
+                if (d[0] == 0xE5) { have_lfn = 0; nslot = 0; continue; }
+                attr = d[11];
+                if (attr == 0x0F) {                             /* LFN slot   */
+                    if (d[0] & 0x40) { int i; for (i = 0; i < 256; i++) lfn[i] = 0; nslot = 0; }
+                    lfn_chars(d, lfn);
+                    have_lfn = 1;
+                    if (nslot < 24) { slot[nslot].lba = lba; slot[nslot].off = e; nslot++; }
+                    continue;
+                }
+                if (attr & 0x08) { have_lfn = 0; nslot = 0; continue; }   /* vol label */
+                if (attr & 0x02) { have_lfn = 0; nslot = 0; continue; }   /* hidden    */
+                if (d[0] == '.') { have_lfn = 0; nslot = 0; continue; }   /* . / ..    */
+
+                {
+                    char nm[256];
+                    if (have_lfn && lfn[0]) {
+                        int i; for (i = 0; i < 255 && lfn[i]; i++) nm[i] = lfn[i]; nm[i] = 0;
+                    } else {
+                        short_name(d, nm);
+                    }
+                    if (fat_ci_eq(nm, name)) {
+                        unsigned long oc = ((unsigned long)rd16(d + 20) << 16) | rd16(d + 26);
+                        /* Mark the 8.3 entry deleted in the in-hand sector. */
+                        d[0] = 0xE5;
+                        if (g_blkw(lba, dbuf) != 0) return -1;
+                        /* Mark the LFN run deleted (re-read per slot — they may
+                         * live in an earlier sector; delete is rare so the extra
+                         * I/O is cheap). */
+                        for (k = 0; k < nslot; k++) {
+                            if (g_blk(slot[k].lba, dbuf) != 0) return -1;
+                            dbuf[slot[k].off] = 0xE5;
+                            if (g_blkw(slot[k].lba, dbuf) != 0) return -1;
+                        }
+                        fat_free_chain(oc);             /* release data clusters */
+                        return 0;
+                    }
+                    have_lfn = 0; nslot = 0;
+                }
+            }
+        }
+    }
+    return -1;
+}

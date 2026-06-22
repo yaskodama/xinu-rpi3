@@ -913,6 +913,14 @@ static void vm_io_tick(void);                    /* open pending VM print/gfx wi
 static void vm_dialog_draw(void);                /* modal "accept actor?" dialog */
 static int  vm_dialog_click(int sx, int sy);
 static void vm_io_mark_closed(window_t *w);
+/* "Run AIPL actor" picker: a modal popup listing *.avm on /microsd + /sd; each
+ * row shows the file size and a red [x] delete mark.  A double-click on the row
+ * launches it; clicking the [x] asks to confirm, then deletes the file. */
+static void apick_draw(void);
+static int  apick_click(int sx, int sy);
+static void apick_open_window(void);
+static int  apick_open = 0;                       /* 1 = picker popup is up   */
+static int  apick_confirm = -1;                   /* row pending delete confirm, -1=none */
 
 static void wm_close_window(window_t *w)
 {
@@ -978,7 +986,7 @@ static void dev_mark_closed(window_t *w);
 /* ---- right-click pull-down menu --------------------------------------- */
 #define MENU_W  108
 #define MENU_IH 15
-static const char *menu_labels[] = { "Shell", "BASIC", "AIPL", "PRESENT", "DEVICE", "MAKINA", "WALK" };
+static const char *menu_labels[] = { "Shell", "BASIC", "AIPL", "PRESENT", "DEVICE", "MAKINA", "WALK", "Actors" };
 #define NMENU ((int)(sizeof(menu_labels) / sizeof(menu_labels[0])))
 static int menu_open, menu_x, menu_y;            /* desktop coords           */
 static void menu_exec(int sel);                  /* defined after the windows */
@@ -1021,6 +1029,10 @@ static void wm_drag_tick(void)
     /* Modal "accept actor?" dialog intercepts all clicks while it is up. */
     if (left && !prev_left && vm_ask_pending && vm_ask_result == 0) {
         vm_dialog_click(cursor_x, cursor_y); prev_left = left; prev_right = right; return;
+    }
+    /* The "Run AIPL actor" picker is modal too: a click selects/launches a row. */
+    if (left && !prev_left && apick_open) {
+        apick_click(cursor_x, cursor_y); prev_left = left; prev_right = right; return;
     }
 
     /* Right-click opens the pull-down menu at the cursor. */
@@ -1268,6 +1280,7 @@ void wm_run(void)
         draw_wifi_indicator();   /* WiFi status mark, bottom-right corner */
         draw_menu();             /* right-click pull-down menu, if open    */
         vm_dialog_draw();        /* modal "accept actor?" dialog, on top   */
+        apick_draw();            /* "Run AIPL actor" picker, on top         */
 
         /* Disarm the lazy lift.  Only re-stash + redraw the sprite if the
          * content pass actually hid it (i.e. something drew underneath it);
@@ -3341,11 +3354,59 @@ static int vmtxt_suppress = 0;
 static struct { short x1, y1, x2, y2; unsigned char col; } vmg_line[VMG_MAX];
 static struct { short x1, y1, x2, y2; } vmg_drawn[VMG_MAX]; static int vmg_drawn_n = 0;
 static int vmg_n = 0;
+/* Filled polygons (op_tri) — the kernel "Blender" solid display.  A frame with
+ * any triangle is repainted in full (fills can't be incrementally un-drawn like
+ * line strokes). */
+#define VMG_TRI_MAX 12000
+static struct { short x1, y1, x2, y2, x3, y3; unsigned char col; } vmg_tri[VMG_TRI_MAX];
+static int vmg_tri_n = 0;
+
+/* Scanline-fill one triangle (window-local coords + gx,gy offset), clipped to
+ * the window content rect.  Same integer raster as apps/makina3d.c. */
+static void vmg_fill_tri(window_t *self, int gx, int gy, int idx)
+{
+    int x0 = gx + vmg_tri[idx].x1, y0 = gy + vmg_tri[idx].y1;
+    int x1 = gx + vmg_tri[idx].x2, y1 = gy + vmg_tri[idx].y2;
+    int x2 = gx + vmg_tri[idx].x3, y2 = gy + vmg_tri[idx].y3;
+    int clipL = self->x + 1, clipR = self->x + self->width - 2;
+    int clipT = self->y + WM_TITLEBAR_H + 2, clipB = self->y + self->height - 3;
+    unsigned int color = bas_palette(vmg_tri[idx].col);
+    int s;
+    if (y1 < y0) { s=x0;x0=x1;x1=s; s=y0;y0=y1;y1=s; }
+    if (y2 < y0) { s=x0;x0=x2;x2=s; s=y0;y0=y2;y2=s; }
+    if (y2 < y1) { s=x1;x1=x2;x2=s; s=y1;y1=y2;y2=s; }
+    if (y2 == y0) return;
+    for (int yy = y0; yy <= y2; yy++) {
+        if (yy < clipT || yy > clipB) continue;
+        int xa = x0 + (int)((long)(x2 - x0) * (yy - y0) / (y2 - y0)), xb;
+        if (yy < y1 && y1 != y0) xb = x0 + (int)((long)(x1 - x0) * (yy - y0) / (y1 - y0));
+        else if (y2 != y1)       xb = x1 + (int)((long)(x2 - x1) * (yy - y1) / (y2 - y1));
+        else                     xb = x1;
+        if (xa > xb) { s = xa; xa = xb; xb = s; }
+        if (xa < clipL) xa = clipL;
+        if (xb > clipR) xb = clipR;
+        if (xa <= xb) draw_line(xa, yy, xb, yy, color);   /* horizontal span */
+    }
+}
 static void vmgfx_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     if (!g_force_redraw && !vmgfx_dirty) return; vmgfx_dirty = 0;
     int gx = self->x + 4, gy = self->y + WM_TITLEBAR_H + 4, i;
+    /* Solid (op_tri) frame: fills can't be un-drawn incrementally, so repaint the
+     * whole content once, scanline-fill every triangle (painter order = call
+     * order), then stroke any lines (grid / gizmo) on top. */
+    if (vmg_tri_n > 0) {
+        fill_rect(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+                  self->width - 2, self->height - WM_TITLEBAR_H - 3, self->content_bg);
+        for (i = 0; i < vmg_tri_n; i++) vmg_fill_tri(self, gx, gy, i);
+        for (i = 0; i < vmg_n; i++)
+            draw_line(gx + vmg_line[i].x1, gy + vmg_line[i].y1,
+                      gx + vmg_line[i].x2, gy + vmg_line[i].y2, bas_palette(vmg_line[i].col));
+        vmg_drawn_n = 0;                 /* nothing to incrementally erase next frame */
+        vm_draw_grip(self);
+        return;
+    }
     /* Flicker-free animation: instead of clearing the whole content (a visible
      * erase->redraw flash), on an incremental redraw we only un-draw last
      * frame's line segments (paint them in the background colour), then stroke
@@ -3370,10 +3431,21 @@ void vm_line(int x1, int y1, int x2, int y2, int color)   /* called on an actor 
         vmg_line[vmg_n].x2 = x2; vmg_line[vmg_n].y2 = y2; vmg_line[vmg_n].col = (unsigned char)color; vmg_n++; }
     vmgfx_want = 1; vmgfx_dirty = 1;
 }
-/* cls() resets the buffer but does NOT mark dirty: a frame is only redrawn once
- * its line()s have rebuilt the set, so we never flash a blank between cls and
- * the first line. */
-void vm_cls(void) { vmg_n = 0; vmgfx_want = 1; }
+/* op_tri: a filled, shaded polygon — the kernel "Blender" solid display. */
+void vm_fill_triangle(int x1, int y1, int x2, int y2, int x3, int y3, int color)
+{
+    if (vmg_tri_n < VMG_TRI_MAX) {
+        vmg_tri[vmg_tri_n].x1 = x1; vmg_tri[vmg_tri_n].y1 = y1;
+        vmg_tri[vmg_tri_n].x2 = x2; vmg_tri[vmg_tri_n].y2 = y2;
+        vmg_tri[vmg_tri_n].x3 = x3; vmg_tri[vmg_tri_n].y3 = y3;
+        vmg_tri[vmg_tri_n].col = (unsigned char)color; vmg_tri_n++;
+    }
+    vmgfx_want = 1; vmgfx_dirty = 1;
+}
+/* cls() resets the buffers but does NOT mark dirty: a frame is only redrawn once
+ * its line()s/tri()s have rebuilt the set, so we never flash a blank between cls
+ * and the first primitive. */
+void vm_cls(void) { vmg_n = 0; vmg_tri_n = 0; vmgfx_want = 1; }
 /* Re-enable the VM windows after they were closed (called when a new module is
  * loaded, so a fresh send re-opens them). */
 void vm_gfx_unsuppress(void) { vmgfx_suppress = 0; vmtxt_suppress = 0; }
@@ -3407,6 +3479,214 @@ static void vm_io_mark_closed(window_t *w)
     if (w == &vmgfx_win) { vmgfx_open = 0; vmgfx_want = 0; vmgfx_suppress = 1; vmg_drawn_n = 0; }
 }
 
+/* ===== "Run AIPL actor" picker ==========================================
+ * A modal popup listing every *.avm on /microsd (M:) and the USB /sd (S:).
+ * The row under the pointer is inverted; a DOUBLE-click loads it off the card
+ * and runs it on the dynamic VM (draws in the VM graphics window). */
+#define APICK_MAX 40
+static struct { char name[32]; char vol; unsigned long size; } apick_list[APICK_MAX];
+static int  apick_n = 0;
+static int  apick_last_row = -1, apick_dbl = 0;   /* double-click arming (frames) */
+static char apick_vol_tag;
+
+static int apick_collect_cb(const struct fat_dirent *e, void *ctx)
+{
+    (void)ctx;
+    if (!e->is_dir && aipl_is_avm(e->name) && apick_n < APICK_MAX) {
+        int i = 0; for (; e->name[i] && i < 31; i++) apick_list[apick_n].name[i] = e->name[i];
+        apick_list[apick_n].name[i] = 0;
+        apick_list[apick_n].vol = apick_vol_tag;
+        apick_list[apick_n].size = e->size;
+        apick_n++;
+    }
+    return 0;
+}
+/* Human-readable file size into out[] ("224B" / "88.5K" / "1.4M"). */
+static void apick_fmt_size(unsigned long sz, char *out)
+{
+    unsigned u = (unsigned)sz;
+    if (u >= 1048576U)   sprintf(out, "%u.%uM", u >> 20, ((u >> 10) & 1023) * 10 / 1024);
+    else if (u >= 1024U) sprintf(out, "%u.%uK", u >> 10, (u & 1023) * 10 / 1024);
+    else                 sprintf(out, "%uB", u);
+}
+static void apick_scan(void)
+{
+    extern int usbmsc_fat_select(void);
+    apick_n = 0;
+    apick_vol_tag = 'M'; fat_set_blkdev(0, 0);             /* on-board /microsd */
+    if (fat_mount() == 0) fat_list_root(apick_collect_cb, 0);
+    apick_vol_tag = 'S';                                   /* USB card reader /sd */
+    if (usbmsc_fat_select() == 0 && fat_mount() == 0) fat_list_root(apick_collect_cb, 0);
+    fat_set_blkdev(0, 0);
+}
+static void apick_open_window(void)
+{
+    apick_scan(); apick_open = 1; apick_last_row = -1; apick_dbl = 0;
+    apick_confirm = -1; g_need_full = 1;
+}
+static void apick_rect(int *x, int *y, int *w, int *h)
+{
+    int rows = apick_n > 0 ? apick_n : 1;
+    *w = 320; *h = 28 + rows * 15 + 6;
+    if (*h > 360) *h = 360;
+    *x = (WM_DESKTOP_W - *w) / 2; *y = (WM_DESKTOP_H - *h) / 2;
+}
+/* Red [x] delete-mark rect for row r (desktop coords). */
+static void apick_xmark_rect(int r, int *mx, int *my, int *mw, int *mh)
+{
+    int x, y, w, h; apick_rect(&x, &y, &w, &h);
+    *mw = 12; *mh = 12;
+    *mx = x + w - 18;
+    *my = y + 26 + r * 15 - 1;
+}
+/* Centred "delete this actor?" confirm box (desktop coords). */
+static void apick_confirm_geom(int *bx, int *by, int *bw, int *bh)
+{
+    *bw = 280; *bh = 84;
+    *bx = (WM_DESKTOP_W - *bw) / 2;
+    *by = (WM_DESKTOP_H - *bh) / 2;
+}
+/* Red [x] close box at the popup's top-left corner — dismisses the picker. */
+static void apick_close_rect(int *cx, int *cy, int *cw, int *ch)
+{
+    int x, y, w, h; apick_rect(&x, &y, &w, &h); (void)w; (void)h;
+    *cw = 12; *ch = 12; *cx = x + 3; *cy = y + 5;
+}
+static int apick_row_at(int sx, int sy)
+{
+    int x, y, w, h; apick_rect(&x, &y, &w, &h);
+    int dx = sx + vp_x, dy = sy + vp_y;
+    if (dx < x || dx >= x + w) return -1;
+    int rel = dy - (y + 26);
+    if (rel < 0) return -1;
+    int r = rel / 15;
+    if (r < 0 || r >= apick_n) return -1;
+    return r;
+}
+static void apick_draw(void)
+{
+    if (!apick_open) return;
+    if (apick_dbl > 0) apick_dbl--;                        /* double-click window */
+    int x, y, w, h; apick_rect(&x, &y, &w, &h);
+    video_set_viewport(vp_x, vp_y);
+    fill_rect(x - 3, y - 3, w + 6, h + 6, 0xFF000000U);
+    fill_rect(x, y, w, h, 0xFF14100AU);
+    fill_rect(x, y, w, 3, 0xFFFFB060U);
+    /* close box (X) at the popup's top-left — click to dismiss the window */
+    {
+        int cx, cy, cw, ch; apick_close_rect(&cx, &cy, &cw, &ch);
+        fill_rect(cx, cy, cw, ch, 0xFFC0382EU);
+        draw_rect(cx, cy, cw, ch, 0xFFFFFFFFU);
+        draw_string_at(cx + 2, cy + 2, "x", 0xFFFFFFFFU, 0xFFC0382EU);
+    }
+    draw_string_at(x + 20, y + 8, "Actors - dbl-click=run, [x]=delete", 0xFFFFE0A0U, 0xFF14100AU);
+    int hot = apick_row_at(cursor_x, cursor_y);
+    for (int i = 0; i < apick_n; i++) {
+        int ry = y + 26 + i * 15;
+        unsigned int bg = (i == hot) ? 0xFFFFE0A0U : 0xFF14100AU;
+        unsigned int fg = (i == hot) ? 0xFF101010U : 0xFFCFE8FFU;
+        if (i == hot) fill_rect(x + 2, ry - 1, w - 4, 15, bg);
+        /* name (vol-tagged), truncated to leave room for the size + [x] columns */
+        char line[28]; int p = 0;
+        line[p++] = apick_list[i].vol; line[p++] = ':'; line[p++] = ' ';
+        for (int k = 0; apick_list[i].name[k] && p < 24; k++) line[p++] = apick_list[i].name[k];
+        line[p] = 0;
+        draw_string_at(x + 8, ry, line, fg, bg);
+        /* file size, right-aligned just left of the [x] mark (8px/char font) */
+        char sz[12]; apick_fmt_size(apick_list[i].size, sz);
+        int slen = 0; while (sz[slen]) slen++;
+        draw_string_at(x + w - 26 - slen * 8, ry, sz, fg, bg);
+        /* red [x] delete mark */
+        int mx, my, mw, mh; apick_xmark_rect(i, &mx, &my, &mw, &mh);
+        fill_rect(mx, my, mw, mh, 0xFFC0382EU);
+        draw_rect(mx, my, mw, mh, 0xFFFFFFFFU);
+        draw_string_at(mx + 2, my + 2, "x", 0xFFFFFFFFU, 0xFFC0382EU);
+    }
+    if (apick_n == 0)
+        draw_string_at(x + 8, y + 26, "(no .avm on /microsd or /sd)", 0xFF888888U, 0xFF14100AU);
+
+    /* delete-confirmation box, drawn on top of the list */
+    if (apick_confirm >= 0 && apick_confirm < apick_n) {
+        int bx, by, bw, bh; apick_confirm_geom(&bx, &by, &bw, &bh);
+        fill_rect(bx - 3, by - 3, bw + 6, bh + 6, 0xFF000000U);
+        fill_rect(bx, by, bw, bh, 0xFF201410U);
+        fill_rect(bx, by, bw, 3, 0xFFFF6060U);
+        draw_string_at(bx + 10, by + 10, "Delete this actor file?", 0xFFFFD0D0U, 0xFF201410U);
+        char nm[34]; int q = 0;
+        nm[q++] = apick_list[apick_confirm].vol; nm[q++] = ':'; nm[q++] = ' ';
+        for (int k = 0; apick_list[apick_confirm].name[k] && q < 33; k++)
+            nm[q++] = apick_list[apick_confirm].name[k];
+        nm[q] = 0;
+        draw_string_at(bx + 10, by + 26, nm, 0xFFFFFFFFU, 0xFF201410U);
+        /* Yes (red) / No (grey) buttons */
+        fill_rect(bx + 18,      by + 50, 100, 22, 0xFFC0382EU);
+        draw_rect(bx + 18,      by + 50, 100, 22, 0xFFFFFFFFU);
+        draw_string_at(bx + 50, by + 57, "Delete", 0xFFFFFFFFU, 0xFFC0382EU);
+        fill_rect(bx + bw - 118, by + 50, 100, 22, 0xFF404040U);
+        draw_rect(bx + bw - 118, by + 50, 100, 22, 0xFFFFFFFFU);
+        draw_string_at(bx + bw - 86, by + 57, "Cancel", 0xFFFFFFFFU, 0xFF404040U);
+    }
+}
+static int apick_click(int sx, int sy)
+{
+    int x, y, w, h; apick_rect(&x, &y, &w, &h);
+    int dx = sx + vp_x, dy = sy + vp_y;
+
+    /* Modal delete-confirmation takes priority over everything else. */
+    if (apick_confirm >= 0) {
+        int bx, by, bw, bh; apick_confirm_geom(&bx, &by, &bw, &bh);
+        if (dx >= bx + 18 && dx < bx + 118 && dy >= by + 50 && dy < by + 72) {
+            /* Delete: select the file's volume, unlink it, then rescan. */
+            int r = apick_confirm; char nm[32]; int i = 0;
+            for (; apick_list[r].name[i] && i < 31; i++) nm[i] = apick_list[r].name[i]; nm[i] = 0;
+            char vol = apick_list[r].vol;
+            extern int usbmsc_fat_select(void);
+            if (vol == 'S') usbmsc_fat_select(); else fat_set_blkdev(0, 0);
+            fat_delete_root(nm);
+            fat_set_blkdev(0, 0);                          /* restore on-board microSD */
+            apick_confirm = -1; apick_last_row = -1;
+            apick_scan();                                  /* row indices change after delete */
+            g_need_full = 1; return 1;
+        }
+        if (dx >= bx + bw - 118 && dx < bx + bw - 18 && dy >= by + 50 && dy < by + 72) {
+            apick_confirm = -1; g_need_full = 1; return 1; /* Cancel */
+        }
+        return 1;                                          /* ignore clicks while confirming */
+    }
+
+    /* [x] close box at the top-left corner dismisses the picker window. */
+    {
+        int cx, cy, cw, ch; apick_close_rect(&cx, &cy, &cw, &ch);
+        if (dx >= cx && dx < cx + cw && dy >= cy && dy < cy + ch) {
+            apick_open = 0; apick_confirm = -1; g_need_full = 1; return 1;
+        }
+    }
+
+    if (dx < x - 3 || dx >= x + w + 3 || dy < y - 3 || dy >= y + h + 3) {
+        apick_open = 0; g_need_full = 1; return 1;        /* click outside closes */
+    }
+    int r = apick_row_at(sx, sy);
+    if (r < 0) { apick_last_row = -1; return 1; }
+    /* [x] delete mark on this row -> ask to confirm */
+    {
+        int mx, my, mw, mh; apick_xmark_rect(r, &mx, &my, &mw, &mh);
+        if (dx >= mx && dx < mx + mw && dy >= my && dy < my + mh) {
+            apick_confirm = r; apick_last_row = -1; apick_dbl = 0;
+            g_need_full = 1; return 1;
+        }
+    }
+    if (r == apick_last_row && apick_dbl > 0) {           /* double-click -> launch */
+        char nm[32]; int i = 0;
+        for (; apick_list[r].name[i] && i < 31; i++) nm[i] = apick_list[r].name[i]; nm[i] = 0;
+        apick_open = 0; g_need_full = 1;
+        int n = aipl_load_avm(nm);
+        if (n > 0) { extern int abcl_vm_loadrun(const unsigned char *, int); abcl_vm_loadrun(aipl_vmbuf, n); }
+        return 1;
+    }
+    apick_last_row = r; apick_dbl = 12;                   /* arm ~0.6s @20fps */
+    return 1;
+}
+
 static void menu_exec(int sel)
 {
     if (sel == 0) {                              /* Shell: open a closed slot */
@@ -3431,6 +3711,8 @@ static void menu_exec(int sel)
     } else if (sel == 6) {                       /* MAKINA-7 walking actor */
         extern int makina_walk_open(void);
         makina_walk_open();
+    } else if (sel == 7) {                       /* Run AIPL actor (picker) */
+        apick_open_window();
     }
     g_need_full = 1;
 }
