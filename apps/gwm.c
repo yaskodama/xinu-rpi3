@@ -3358,7 +3358,10 @@ static int vmg_n = 0;
  * any triangle is repainted in full (fills can't be incrementally un-drawn like
  * line strokes). */
 #define VMG_TRI_MAX 12000
-static struct { short x1, y1, x2, y2, x3, y3; unsigned char col; } vmg_tri[VMG_TRI_MAX];
+/* col holds either a 16-colour palette index (0..15) OR, when bit 24 is set, a
+ * full 24-bit 0xRRGGBB true colour — so actors can drive the kernel "Blender"
+ * display in full colour, not just the 16-colour palette. */
+static struct { short x1, y1, x2, y2, x3, y3; unsigned int col; } vmg_tri[VMG_TRI_MAX];
 static int vmg_tri_n = 0;
 
 /* Scanline-fill one triangle (window-local coords + gx,gy offset), clipped to
@@ -3370,7 +3373,9 @@ static void vmg_fill_tri(window_t *self, int gx, int gy, int idx)
     int x2 = gx + vmg_tri[idx].x3, y2 = gy + vmg_tri[idx].y3;
     int clipL = self->x + 1, clipR = self->x + self->width - 2;
     int clipT = self->y + WM_TITLEBAR_H + 2, clipB = self->y + self->height - 3;
-    unsigned int color = bas_palette(vmg_tri[idx].col);
+    unsigned int cv = vmg_tri[idx].col;
+    unsigned int color = (cv & 0x1000000u) ? (0xFF000000u | (cv & 0xFFFFFFu))
+                                           : bas_palette(cv);   /* bit24 = true colour */
     int s;
     if (y1 < y0) { s=x0;x0=x1;x1=s; s=y0;y0=y1;y1=s; }
     if (y2 < y0) { s=x0;x0=x2;x2=s; s=y0;y0=y2;y2=s; }
@@ -3438,7 +3443,7 @@ void vm_fill_triangle(int x1, int y1, int x2, int y2, int x3, int y3, int color)
         vmg_tri[vmg_tri_n].x1 = x1; vmg_tri[vmg_tri_n].y1 = y1;
         vmg_tri[vmg_tri_n].x2 = x2; vmg_tri[vmg_tri_n].y2 = y2;
         vmg_tri[vmg_tri_n].x3 = x3; vmg_tri[vmg_tri_n].y3 = y3;
-        vmg_tri[vmg_tri_n].col = (unsigned char)color; vmg_tri_n++;
+        vmg_tri[vmg_tri_n].col = (unsigned int)color; vmg_tri_n++;
     }
     vmgfx_want = 1; vmgfx_dirty = 1;
 }

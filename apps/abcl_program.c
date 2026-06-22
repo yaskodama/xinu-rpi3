@@ -9,8 +9,12 @@
 #include <rcu.h>       /* RCU: lock-free actor-registry reads (concurrency_safety=rcu) */
 
 /* P3: bumped from 16 to 64 so the lock-free MPSC ring can sustain
-   higher producer fan-in without back-pressure dropping messages. */
-#define MAX_MAILBOX 64
+   higher producer fan-in without back-pressure dropping messages.
+   P4: bumped 64 -> 1024 so a 3-D-data actor can stream a high-resolution
+   mesh (~700 triangles per chunk) to the "Blender display" actor without
+   the receiver's mailbox overflowing.  ~296 KB/object * 128 obj ~= 38 MB
+   .bss — fine on the Pi 3's 1 GB. */
+#define MAX_MAILBOX 1024
 /* MAX_OBJECTS bumped 16 -> 32 -> 128.  alloc_obj() never recycles slots
  * (it just does n_objects++), and DiningBench_run() spawns a fresh batch of
  * 5 Forks + 5 Philosophers on every run without reaping the old batch (the
