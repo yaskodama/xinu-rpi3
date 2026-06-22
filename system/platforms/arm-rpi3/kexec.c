@@ -103,3 +103,64 @@ syscall kexec(const void *kernel, uint size)
     restore(im);
     return SYSERR;
 }
+
+/**
+ * Hardened chainload — boot a freshly-uploaded kernel image from RAM without a
+ * power cycle, the rpi4-style way.  This is the robust sibling of kexec(): the
+ * body called by webactor's /chainload route, and what fixes the "kexec
+ * sometimes hard-hangs / resets to the SD kernel" instability.
+ *
+ * Two reliability differences vs kexec():
+ *
+ *   1. It masks BOTH IRQ *and FIQ* (cpsid if).  kexec()'s disable() masks IRQ
+ *      only; an FIQ arriving after we drop the MMU/I-cache — but before the new
+ *      kernel installs its own vectors — would vector through 0x1C, which by
+ *      then holds the *new* image's bytes, and crash.  Masking FIQ closes that
+ *      window.
+ *
+ *   2. It is self-contained: it does the MMU/cache teardown itself with
+ *      interrupts already masked, instead of relying on the caller to have
+ *      called mmu_disable() first (which /kexec did from thread context with
+ *      IRQs still live — a race that could fault).
+ *
+ * The copy is forward (src high in .bss, dst = 0x8000, so src > dst) and thus
+ * memmove-safe even if the ranges overlap.  RAM-only: a bad image just needs a
+ * power cycle, the SD is untouched.  Never returns.
+ *
+ * @param kernel  pointer to the new kernel image (anywhere in RAM above 0x8000)
+ * @param size    image size in bytes
+ */
+void kernel_chainload(const void *kernel, uint size)
+{
+    /* Mask IRQ + FIQ atomically — we are committing, nothing may preempt us. */
+    asm volatile ("cpsid if\n dsb\n isb\n" : : : "memory");
+
+    /* Relocate the copy/jump stub just below the load address (D-cache is OFF,
+     * so this write lands in RAM directly). */
+    memcpy(COPY_KERNEL_ADDR, copy_kernel, sizeof(copy_kernel));
+
+    /* Warm-restart teardown: drop MMU + I-cache and invalidate I-cache, branch
+     * predictor and TLB so the new kernel is fetched fresh from RAM (the same
+     * bare state firmware hands a cold boot).  Identity-mapped, so turning the
+     * MMU off keeps execution flowing from the same instructions. */
+    asm volatile (
+        "dsb\n isb\n"
+        "mrc p15, 0, r0, c1, c0, 0\n"   /* read SCTLR                       */
+        "bic r0, r0, #(1 << 0)\n"       /* M = 0  -> MMU off                */
+        "bic r0, r0, #(1 << 12)\n"      /* I = 0  -> I-cache off            */
+        "mcr p15, 0, r0, c1, c0, 0\n"
+        "mov r0, #0\n"
+        "mcr p15, 0, r0, c7, c5, 0\n"   /* ICIALLU — invalidate I-cache     */
+        "mcr p15, 0, r0, c7, c5, 6\n"   /* BPIALL  — invalidate branch pred */
+        "mcr p15, 0, r0, c8, c7, 0\n"   /* TLBIALL — invalidate TLB         */
+        "dsb\n isb\n"
+        : : : "r0", "memory"
+    );
+
+    extern void *atags_ptr;
+    (( void (*)(const void *, ulong, void *))(COPY_KERNEL_ADDR))
+                (kernel, (size + 3) / 4, atags_ptr);
+
+    /* Unreachable. */
+    while (1) { }
+}

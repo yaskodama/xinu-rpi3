@@ -368,10 +368,16 @@ thread webactor_server(void)
                     {
                         char *cl;
                         header_end = (int)(p - reqbuf) + 4;
+                        /* Show the on-screen load bar for ANY binary upload:
+                         * meshes/rigs AND .avm actor modules (loadvm/loadimg). */
                         is_mesh = (0 == strncmp(reqbuf, "POST /actor/loadmesh", 20) ||
                                    0 == strncmp(reqbuf, "GET /actor/loadmesh",  19) ||
                                    0 == strncmp(reqbuf, "POST /actor/loadrig",  19) ||
-                                   0 == strncmp(reqbuf, "GET /actor/loadrig",   18));
+                                   0 == strncmp(reqbuf, "GET /actor/loadrig",   18) ||
+                                   0 == strncmp(reqbuf, "POST /actor/loadvm",   18) ||
+                                   0 == strncmp(reqbuf, "GET /actor/loadvm",    17) ||
+                                   0 == strncmp(reqbuf, "POST /actor/loadimg",  19) ||
+                                   0 == strncmp(reqbuf, "GET /actor/loadimg",   18));
                         cl = strstr(reqbuf, "Content-Length:");
                         if (NULL == cl)
                         {
@@ -1444,6 +1450,84 @@ thread webactor_server(void)
                 kexec(upload_slot_data, (uint)sz);
                 /* defensive — kexec returns SYSERR if jump failed */
                 while (1) { }
+            }
+            /* /chainload — rpi4-style hardened RAM kernel boot.  Same network
+             * update loop as /kexec, but jumps via kernel_chainload() which
+             * masks IRQ *and* FIQ and tears down the MMU/cache atomically
+             * (kexec()'s racy "mmu_disable() from the thread, then kexec()"
+             * sequence is what made warm updates hard-hang / reset to SD).
+             *
+             *   1. Mac: curl --data-binary @xinu.boot http://<pi>:8080/upload
+             *   2. Mac: curl -X POST          http://<pi>:8080/chainload
+             *   3. Pi : 200 OK, drain TCP, then boot the staged image at 0x8000
+             *           with no power cycle (HDMI shows the new kernel).
+             *
+             * RAM-only: a bad image just needs a power cycle, the SD is
+             * untouched.  (Helper: tools/chainload.sh does both steps.) */
+            if (0 == strncmp(reqbuf, "POST /chainload", 15) ||
+                0 == strncmp(reqbuf, "GET /chainload", 14))
+            {
+                extern void kernel_chainload(const void *, uint);
+                int sz = upload_slot_size;
+                if (sz < 32 * 1024)
+                {
+                    static char cresp[220];
+                    int blen = sprintf(cresp + 110,
+                        "chainload refused: upload too small (%d B, need >= 32 KB)\r\n"
+                        "POST a kernel image to /upload first.\r\n", sz);
+                    int hlen = sprintf(cresp,
+                        "HTTP/1.0 400 Bad Request\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", blen);
+                    memcpy(cresp + hlen, cresp + 110, blen);
+                    write(tcpdev, cresp, hlen + blen);
+                    close(tcpdev);
+                    web_cur_tcpdev = -1;
+                    continue;
+                }
+                /* Respond OK BEFORE we commit — Mac needs the 200 first. */
+                static char cok[160];
+                int blen = sprintf(cok + 100,
+                    "chainload %d bytes — booting staged kernel...\r\n", sz);
+                int hlen = sprintf(cok,
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n"
+                    "\r\n", blen);
+                memcpy(cok + hlen, cok + 100, blen);
+                write(tcpdev, cok, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                /* Drain TCP to the wire so Mac sees the 200, then commit. */
+                sleep(50);
+                kprintf("[chainload] booting staged kernel (%d B)\r\n", sz);
+                kernel_chainload(upload_slot_data, (uint)sz);   /* never returns */
+                while (1) { }
+            }
+            /* /api/buildtag — return the compile-time BUILD_TAG string.  Lets a
+             * Mac-side script confirm over the network which kernel image is
+             * actually running (e.g. to verify a /chainload swapped in the NEW
+             * image: GET this before and after; a changed tag proves the new
+             * kernel booted and the network survived the warm restart). */
+            if (0 == strncmp(reqbuf, "GET /api/buildtag", 17) ||
+                0 == strncmp(reqbuf, "POST /api/buildtag", 18))
+            {
+#ifndef BUILD_TAG
+#define BUILD_TAG "untagged"
+#endif
+                static char btresp[160];
+                int blen = sprintf(btresp + 90, "%s\r\n", BUILD_TAG);
+                int hlen = sprintf(btresp,
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n"
+                    "\r\n", blen);
+                memcpy(btresp + hlen, btresp + 90, blen);
+                write(tcpdev, btresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
             }
             /* /api/mmu:
              *   Report MMU enable state + SCTLR + TTBR0 + page-table base.
