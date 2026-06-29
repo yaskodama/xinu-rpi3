@@ -321,6 +321,21 @@ static long wa_bench_nqueens(int n)
     }
     return total;
 }
+/* N-Queens partial: count solutions for first-queen columns [c0,c1) at board
+ * size n (single-core).  Used by the /nqpart distributed route. */
+static long wa_bench_nqueens_range(int n, int c0, int c1)
+{
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    int c;
+    if (c0 < 0) c0 = 0;
+    if (c1 > n) c1 = n;
+    for (c = c0; c < c1; c++) {
+        unsigned bit = 1u << c;
+        total += wa_nq_solve(bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
 static volatile unsigned wa_din_sink = 0;
 static long wa_bench_dining(int np, long tables)
 {
@@ -2663,6 +2678,32 @@ thread webactor_server(void)
              *   for each to collect partial counts, sums them.
              *   Used by tools/nqueens-bench.py for the Mac+Pi 3
              *   distributed benchmark. */
+            /* /nqpart?n=N&c0=A&c1=B — distributed N-Queens partial: count
+             *   solutions for first-queen columns [c0,c1) at board size n
+             *   (single-core).  A Mac orchestrator hands each board a disjoint
+             *   column range and sums the partials. */
+            if (0 == strncmp(reqbuf, "GET /nqpart", 11) ||
+                0 == strncmp(reqbuf, "POST /nqpart", 12))
+            {
+                int n  = fb_q_int(reqbuf, "n", 13);
+                if (n < 1)  n = 1;
+                if (n > 16) n = 16;
+                int c0 = fb_q_int(reqbuf, "c0", 0);
+                int c1 = fb_q_int(reqbuf, "c1", n);
+                static char qr[256];
+                unsigned long t0 = clktime * 1000UL + clkticks;
+                long sol = wa_bench_nqueens_range(n, c0, c1);
+                unsigned long ms = (clktime * 1000UL + clkticks) - t0;
+                int bl = sprintf(qr + 100,
+                    "nqueens-partial n=%d c0=%d c1=%d solutions=%ld ms=%lu cores=1\r\n",
+                    n, c0, c1, sol, ms);
+                int hl = sprintf(qr,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", bl);
+                memcpy(qr + hl, qr + 100, bl);
+                write(tcpdev, qr, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /bench?kind=nqueens|dining|primes[&n=N] — unified single-core
              *   benchmark.  Same fields as the rpi4/rpi5 SMP /bench (with
              *   cores_online=1, speedup x100=100) so the Mesh Control Center
