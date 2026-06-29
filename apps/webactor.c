@@ -32,6 +32,7 @@
 #include "sd_block.h"  /* sd_init / sd_read_block for /sd-test route */
 #include <shell.h>     /* commandtab / lexan for the /shell remote-login route */
 #include <interrupt.h> /* disable()/restore() around ready() in webshell_run    */
+#include <clock.h>     /* clktime + clkticks (ms) for the /bench route */
 
 /* Latest /upload payload — file-scope so /api/upload-info can read it
  * back.  Single slot (last upload wins).  64 KB is generous enough for
@@ -245,6 +246,100 @@ static int webshell_run(char *line, char *outbuf, int maxout)
     return n;
 }
 
+/* Query-string helpers for the /fb screen-mirror route.  `req` is the full
+ * request line, e.g. "GET /fb?off=0&w=160 HTTP/1.1". */
+static int fb_q_int(const char *req, const char *key, int dflt)
+{
+    const char *q = req;
+    int kl = 0;
+    while (key[kl]) kl++;
+    while (*q && *q != ' ') q++;        /* skip the method ("GET") */
+    while (*q == ' ') q++;              /* to the start of the URL */
+    while (*q && *q != '?' && *q != ' ' && *q != '\r' && *q != '\n') q++;
+    if (*q != '?') return dflt;
+    q++;
+    while (*q && *q != ' ' && *q != '\r' && *q != '\n')
+    {
+        if (0 == strncmp(q, key, kl) && q[kl] == '=')
+        {
+            int neg = 0, v = 0;
+            q += kl + 1;
+            if (*q == '-') { neg = 1; q++; }
+            while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+            return neg ? -v : v;
+        }
+        while (*q && *q != '&' && *q != ' ') q++;
+        if (*q == '&') q++; else break;
+    }
+    return dflt;
+}
+
+static int fb_has(const char *req, const char *key)
+{
+    const char *q = req;
+    int kl = 0;
+    while (key[kl]) kl++;
+    while (*q && *q != ' ') q++;        /* skip the method ("GET") */
+    while (*q == ' ') q++;              /* to the start of the URL */
+    while (*q && *q != '?' && *q != ' ' && *q != '\r' && *q != '\n') q++;
+    if (*q != '?') return 0;
+    q++;
+    while (*q && *q != ' ' && *q != '\r' && *q != '\n')
+    {
+        if (0 == strncmp(q, key, kl) && q[kl] == '=') return 1;
+        while (*q && *q != '&' && *q != ' ') q++;
+        if (*q == '&') q++; else break;
+    }
+    return 0;
+}
+
+/* ---- Single-core benchmarks for the unified /bench route ----
+ * Pi 3 (xinu-raz) has no SMP worker pool, so these run on one core: the
+ * 1-core and N-core times are identical (speedup 1.00).  The output fields
+ * match the SMP boards (rpi4/rpi5) so the Mesh Control Center tabulates all
+ * three uniformly. */
+static long wa_nq_solve(unsigned cols, unsigned d1, unsigned d2, unsigned all)
+{
+    if (cols == all) return 1;
+    long count = 0;
+    unsigned avail = ~(cols | d1 | d2) & all;
+    while (avail) {
+        unsigned bit = avail & (unsigned)(-(long)avail);   /* lowest set bit */
+        avail -= bit;
+        count += wa_nq_solve(cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1, all);
+    }
+    return count;
+}
+static long wa_bench_nqueens(int n)
+{
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    int c;
+    for (c = 0; c < n; c++) {
+        unsigned bit = 1u << c;
+        total += wa_nq_solve(bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+static volatile unsigned wa_din_sink = 0;
+static long wa_bench_dining(int np, long tables)
+{
+    long meals = 0, t;
+    unsigned acc = 2654435761u;
+    int round, p;
+    for (t = 0; t < tables; t++)
+        for (round = 0; round < 24; round++)
+            for (p = 0; p < np; p++) {
+                int l = p, r = (p + 1) % np;
+                int fa = (l < r) ? l : r;
+                int fb = (l < r) ? r : l;
+                acc = acc * 1103515245u + 12345u + (unsigned)(fa * 131 + fb);
+                meals++;
+            }
+    wa_din_sink ^= acc;
+    return meals;
+}
+
 /* HTTP server thread: accept one connection at a time, deliver the message to
  * the AIPL actor, answer with a tiny HTTP 200, then accept the next. */
 thread webactor_server(void)
@@ -412,6 +507,75 @@ thread webactor_server(void)
         if (n > 0)
         {
             reqbuf[n] = '\0';
+            /* GET /fb[?w=W] -> "DW DH SRCW SRCH" (HDMI thumbnail dims);
+             * GET /fb?off=N&w=W -> a chunk of the down-scaled RGB565 (LE)
+             * framebuffer.  Lets the aice-avm desktop page (served from the
+             * Mac) mirror this Pi 3's HDMI in a window over HTTP.  CORS on. */
+            if (0 == strncmp(reqbuf, "GET /fb", 7))
+            {
+                extern ulong framebufferAddress;
+                extern int   pitch;
+                extern unsigned int video_screen_width(void), video_screen_height(void);
+                static char fbhdr[160];
+                static char fbbody[1100];
+                unsigned srcw = video_screen_width(), srch = video_screen_height();
+                const volatile unsigned char *fb =
+                    (const volatile unsigned char *)framebufferAddress;
+                unsigned fbp = (unsigned)pitch;
+                const char *ctype;
+                int blen = 0, hlen;
+                int dw = fb_q_int(reqbuf, "w", 160);
+                if (dw < 16)  dw = 16;
+                if (dw > 480) dw = 480;
+                int dh = (srcw && srch) ? (int)((unsigned)dw * srch / srcw)
+                                        : (dw * 3 / 4);
+                if (dh < 1) dh = 1;
+                if (!fb_has(reqbuf, "off"))
+                {
+                    ctype = "text/plain";
+                    blen = sprintf(fbbody, "%d %d %d %d\n",
+                                   dw, dh, (int)srcw, (int)srch);
+                }
+                else
+                {
+                    int total = dw * dh * 2;
+                    int off = fb_q_int(reqbuf, "off", 0);
+                    int chunk = 1024;
+                    if (off < 0) off = 0;
+                    if (off & 1) off++;
+                    if (off + chunk > total) chunk = total - off;
+                    if (chunk < 0) chunk = 0;
+                    ctype = "application/octet-stream";
+                    if (fb && fbp)
+                    {
+                        int p0 = off / 2, np = chunk / 2, k;
+                        for (k = 0; k < np; k++)
+                        {
+                            int pi = p0 + k, ox = pi % dw, oy = pi / dw;
+                            unsigned sx = (unsigned)ox * srcw / (unsigned)dw;
+                            unsigned sy = (unsigned)oy * srch / (unsigned)dh;
+                            unsigned px = *(const volatile unsigned int *)
+                                          (fb + sy * fbp + sx * 4);
+                            unsigned r = (px >> 16) & 0xFF;
+                            unsigned g = (px >> 8) & 0xFF;
+                            unsigned b = px & 0xFF;
+                            unsigned v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                            fbbody[blen++] = (char)(v & 0xFF);
+                            fbbody[blen++] = (char)((v >> 8) & 0xFF);
+                        }
+                    }
+                }
+                hlen = sprintf(fbhdr,
+                               "HTTP/1.0 200 OK\r\n"
+                               "Content-Type: %s\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Content-Length: %d\r\n\r\n", ctype, blen);
+                write(tcpdev, fbhdr, hlen);
+                if (blen > 0) write(tcpdev, fbbody, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* POST /compile — body is C source.  MVP: only the trivial
              * program "int main() { return N; }".  Emits ARM32 (movw/movt
              * + bx lr) into a fresh kmalloc buffer, calls it, returns
@@ -2499,6 +2663,60 @@ thread webactor_server(void)
              *   for each to collect partial counts, sums them.
              *   Used by tools/nqueens-bench.py for the Mac+Pi 3
              *   distributed benchmark. */
+            /* /bench?kind=nqueens|dining|primes[&n=N] — unified single-core
+             *   benchmark.  Same fields as the rpi4/rpi5 SMP /bench (with
+             *   cores_online=1, speedup x100=100) so the Mesh Control Center
+             *   tabulates all three boards uniformly. */
+            if (0 == strncmp(reqbuf, "GET /bench", 10) ||
+                0 == strncmp(reqbuf, "POST /bench", 11))
+            {
+                int is_dining = (NULL != strstr(reqbuf, "kind=dining"));
+                int is_primes = (NULL != strstr(reqbuf, "kind=primes"));
+                static char br[512];
+                unsigned long t0, t1, ms;
+                long r;
+                const char *label, *mkey;
+                if (is_dining) {
+                    int np = fb_q_int(reqbuf, "n", 5);
+                    if (np < 2)  np = 2;
+                    if (np > 64) np = 64;
+                    t0 = clktime * 1000UL + clkticks;
+                    r  = wa_bench_dining(np, 40000L);
+                    t1 = clktime * 1000UL + clkticks;
+                    label = "dining"; mkey = "meals";
+                } else if (is_primes) {
+                    int n = fb_q_int(reqbuf, "n", 200000);
+                    if (n < 1) n = 1;
+                    long cnt = 0, x, d;
+                    t0 = clktime * 1000UL + clkticks;
+                    for (x = 2; x < n; x++) {
+                        int pr = 1;
+                        for (d = 2; d * d <= x; d++) if (x % d == 0) { pr = 0; break; }
+                        cnt += pr;
+                    }
+                    t1 = clktime * 1000UL + clkticks;
+                    r = cnt; label = "primes"; mkey = "primes";
+                } else {
+                    int n = fb_q_int(reqbuf, "n", 11);
+                    if (n < 1)  n = 1;
+                    if (n > 13) n = 13;      /* single A53: keep it snappy */
+                    t0 = clktime * 1000UL + clkticks;
+                    r  = wa_bench_nqueens(n);
+                    t1 = clktime * 1000UL + clkticks;
+                    label = "nqueens"; mkey = "solutions";
+                }
+                ms = t1 - t0;
+                int bl = sprintf(br + 160,
+                    "SMP bench kind=%s\r\ncores_online = 1\r\n%s = %ld\r\n"
+                    "1-core   ms  = %lu\r\nN-core   ms  = %lu\r\nspeedup x100 = 100\r\n",
+                    label, mkey, r, ms, ms);
+                int hl = sprintf(br,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", bl);
+                memcpy(br + hl, br + 160, bl);
+                write(tcpdev, br, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             /* /api/loadbal/nqueens-result — the Dispatcher push-aggregates
              *   each worker's partial count; this returns the running total
              *   so the Mac polls ONE endpoint instead of every task.
