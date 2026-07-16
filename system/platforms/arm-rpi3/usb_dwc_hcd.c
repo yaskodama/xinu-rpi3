@@ -85,6 +85,29 @@
 /** Determines whether a pointer is word-aligned or not.  */
 #define IS_WORD_ALIGNED(ptr) ((ulong)(ptr) % sizeof(ulong) == 0)
 
+/**
+ * Whether a transfer must go through the driver's DMA bounce buffer rather
+ * than DMA directly to/from the caller's buffer.
+ *
+ * Without the D-cache, only unaligned buffers need bouncing (the hardware
+ * requires word-aligned DMA).  With the D-cache ON (DCACHE_ON), EVERY transfer
+ * must bounce: the caller's buffers are Normal cacheable, so a direct DMA would
+ * be incoherent with the CPU's cache.  Cleaning/invalidating them per transfer
+ * is unsafe here — the buffers come from an 8-byte-granular heap (memget, so a
+ * DMA buffer shares its first/last 64-byte cache line with a neighbouring
+ * allocation and with the usb_xfer_request header) and even from the stack
+ * (smsc9512 register access DMAs 4 bytes to a local), and invalidating a shared
+ * line would discard live data.  Instead we bounce through a dedicated
+ * Non-cacheable arena (see aligned_bufs), which needs no maintenance at all:
+ * the CPU's writes/reads to it go straight to RAM, exactly as the DMA engine
+ * sees them.  This trades a memcpy per transfer for structural correctness.
+ */
+#ifdef DCACHE_ON
+#  define DWC_MUST_BOUNCE(ptr) (1)
+#else
+#  define DWC_MUST_BOUNCE(ptr) (!IS_WORD_ALIGNED(ptr))
+#endif
+
 /** Pointer to the memory-mapped registers of the Synopsys DesignWare Hi-Speed
  * USB 2.0 OTG Controller.  */
 static volatile struct dwc_regs * const regs = (void*)DWC_REGS_BASE;
@@ -158,9 +181,27 @@ static semaphore chfree_sema;
  */
 static struct usb_xfer_request *channel_pending_xfers[DWC_NUM_CHANNELS];
 
-/** Aligned buffers for DMA.  */
+/** Aligned buffers for DMA.
+ *
+ * Under DCACHE_ON this is the Non-cacheable bounce arena that ALL transfers go
+ * through (see DWC_MUST_BOUNCE).  It is 1 MB, 1 MB-aligned so it occupies its
+ * own L1 section with no neighbours — dwc_setup_dma_mode() maps exactly this
+ * region Non-cacheable via mmu_set_range_noncached().  The per-channel slice is
+ * 128 KB, larger than a full ethernet burst (~19 KB), so size never forces a
+ * split; only the hardware's own packet-count loop runs.  It lives in .bss
+ * (zero-init), so the 1 MB costs RAM, not image size.
+ *
+ * Without DCACHE_ON it is the original small per-channel packet buffer, used
+ * only for unaligned transfers. */
+#ifdef DCACHE_ON
+#  define DWC_DMA_ARENA_BYTES 0x100000u                     /* exactly one 1 MB section */
+#  define DWC_DMA_SLICE       (DWC_DMA_ARENA_BYTES / DWC_NUM_CHANNELS)
+static uint8_t aligned_bufs[DWC_NUM_CHANNELS][DWC_DMA_SLICE]
+                                __attribute__((aligned(0x100000)));
+#else
 static uint8_t aligned_bufs[DWC_NUM_CHANNELS][WORD_ALIGN(USB_MAX_PACKET_SIZE)]
                                 __aligned(4);
+#endif
 
 /* Find index of first set bit in a nonzero word.  */
 static inline ulong first_set_bit(ulong word)
@@ -276,6 +317,18 @@ dwc_setup_dma_mode(void)
     regs->rx_fifo_size = rx_words;
     regs->nonperiodic_tx_fifo_size = (tx_words << 16) | rx_words;
     regs->host_periodic_tx_fifo_size = (ptx_words << 16) | (rx_words + tx_words);
+
+#ifdef DCACHE_ON
+    /* Map the bounce arena Non-cacheable before any DMA can touch it.  With the
+     * D-cache on, this is what makes the whole scheme correct with zero
+     * per-transfer maintenance: CPU accesses to the arena bypass the cache and
+     * hit RAM directly, exactly as the DMA engine sees it.  Must happen after
+     * mmu_init (it re-maps live) but before DMA is enabled below. */
+    {
+        extern void mmu_set_range_noncached(unsigned long pa, unsigned long len);
+        mmu_set_range_noncached((unsigned long)aligned_bufs, sizeof(aligned_bufs));
+    }
+#endif
 
     /* Actually enable DMA by setting the appropriate flag; also set an extra
      * flag available only in Broadcom's instantiation of the Synopsys USB block
@@ -985,9 +1038,10 @@ dwc_channel_start_xfer(uint chan, struct usb_xfer_request *req)
     }
 
     /* Set up DMA buffer.  */
-    if (IS_WORD_ALIGNED(data))
+    if (!DWC_MUST_BOUNCE(data))
     {
-        /* Can DMA directly from source or to destination if word-aligned.  */
+        /* Can DMA directly from source or to destination if word-aligned
+         * (and, under DCACHE_ON, never — see DWC_MUST_BOUNCE).  */
 #ifdef _XINU_PLATFORM_ARM_RPI3_
         /* The DWC DMA engine sees VideoCore bus addresses; with the D-cache
          * off the uncached 0xC0000000 alias points at the same RAM. */
@@ -1267,8 +1321,10 @@ dwc_handle_normal_channel_halted(struct usb_xfer_request *req, uint chan,
              * impossible to determine the length of short packets...)  */
             bytes_transferred = req->attempted_bytes_remaining -
                                 chanptr->transfer.size;
-            /* Copy data from DMA buffer if needed */
-            if (!IS_WORD_ALIGNED(req->cur_data_ptr))
+            /* Copy data back from the bounce buffer if one was used.  This
+             * condition MUST mirror the setup site's DWC_MUST_BOUNCE(data)
+             * exactly, or IN data lands in the wrong place. */
+            if (DWC_MUST_BOUNCE(req->cur_data_ptr))
             {
                 memcpy(req->cur_data_ptr,
                        &aligned_bufs[chan][req->attempted_size -
