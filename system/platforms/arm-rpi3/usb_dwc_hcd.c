@@ -108,6 +108,24 @@
 #  define DWC_MUST_BOUNCE(ptr) (!IS_WORD_ALIGNED(ptr))
 #endif
 
+/**
+ * Drain memory writes to RAM before/after a DMA hand-off.
+ *
+ * The bounce arena is mapped Normal Non-cacheable under DCACHE_ON.  Writes to
+ * Non-cacheable memory still pass through the write buffer and are NOT
+ * guaranteed to have reached RAM until a DSB — so without this, a TX buffer
+ * memcpy'd into the arena can still be sitting in the write buffer when the
+ * DMA engine reads the arena from RAM, and the device receives stale bytes.
+ * That silently broke ethernet bring-up (the smsc9512 register writes are OUT
+ * control transfers through the bounce): "ETH0 never came up".  A DSB before
+ * enabling a channel drains the arena to RAM first; one before an IN copy-back
+ * pairs with it.  No-op when the D-cache is off (the old, working behaviour). */
+#ifdef DCACHE_ON
+#  define DWC_DMA_BARRIER() __asm__ volatile("dsb" ::: "memory")
+#else
+#  define DWC_DMA_BARRIER() ((void)0)
+#endif
+
 /** Pointer to the memory-mapped registers of the Synopsys DesignWare Hi-Speed
  * USB 2.0 OTG Controller.  */
 static volatile struct dwc_regs * const regs = (void*)DWC_REGS_BASE;
@@ -840,6 +858,9 @@ dwc_channel_start_transaction(uint chan, struct usb_xfer_request *req)
     characteristics = chanptr->characteristics;
     characteristics.odd_frame = next_frame & 1;
     characteristics.channel_enable = 1;
+    /* Drain any TX data just memcpy'd into the Non-cacheable bounce arena to
+     * RAM before the DMA engine (started by the write below) reads it. */
+    DWC_DMA_BARRIER();
     chanptr->characteristics = characteristics;
 
     /* Set the channel's interrupt mask to any interrupts we need to ensure that
@@ -1326,6 +1347,9 @@ dwc_handle_normal_channel_halted(struct usb_xfer_request *req, uint chan,
              * exactly, or IN data lands in the wrong place. */
             if (DWC_MUST_BOUNCE(req->cur_data_ptr))
             {
+                /* Ensure the DMA engine's writes into the arena are globally
+                 * visible in RAM before we read them back out. */
+                DWC_DMA_BARRIER();
                 memcpy(req->cur_data_ptr,
                        &aligned_bufs[chan][req->attempted_size -
                                            req->attempted_bytes_remaining],
