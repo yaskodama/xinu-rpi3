@@ -153,6 +153,20 @@ void mmu_init(void)
     }
 
 #ifdef DCACHE_ON
+    /* Bake the USB DMA bounce arena Non-cacheable into the shared table NOW,
+     * before the D-cache is enabled and before smp_init() starts the secondary
+     * cores.  Its address is a link-time constant (1 MB-aligned, one section),
+     * so unlike the framebuffer it needs no runtime remap — and doing it here
+     * means every core's MMU comes up already agreeing the region is
+     * Non-cacheable, with no stale-TLB window.  See dwc_dma_arena in
+     * usb_dwc_hcd.c. */
+    {
+        extern uint8_t dwc_dma_arena[];
+        uint32_t s = ((uint32_t)(unsigned long)dwc_dma_arena) >> 20;
+        if (s < L1_ENTRIES)
+            l1_table[s] = (s << 20) | ATTR_NC;
+    }
+
     /* ★ ORDER IS LOAD-BEARING.  Both of these must happen BEFORE SCTLR.C is
      * set below:
      *   - The caches hold garbage out of reset, not zeroes.  Enabling the

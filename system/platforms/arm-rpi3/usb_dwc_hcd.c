@@ -203,19 +203,29 @@ static struct usb_xfer_request *channel_pending_xfers[DWC_NUM_CHANNELS];
  *
  * Under DCACHE_ON this is the Non-cacheable bounce arena that ALL transfers go
  * through (see DWC_MUST_BOUNCE).  It is 1 MB, 1 MB-aligned so it occupies its
- * own L1 section with no neighbours — dwc_setup_dma_mode() maps exactly this
- * region Non-cacheable via mmu_set_range_noncached().  The per-channel slice is
- * 128 KB, larger than a full ethernet burst (~19 KB), so size never forces a
- * split; only the hardware's own packet-count loop runs.  It lives in .bss
- * (zero-init), so the 1 MB costs RAM, not image size.
+ * own L1 section with no neighbours.  The per-channel slice is 128 KB, larger
+ * than a full ethernet burst (~19 KB), so size never forces a split.  It lives
+ * in .bss (zero-init), so the 1 MB costs RAM, not image size.
+ *
+ * ★ It has EXTERNAL LINKAGE and a fixed compile-time address on purpose: mmu.c
+ * bakes this exact section Non-cacheable in the identity table during
+ * mmu_init(), BEFORE the D-cache is enabled and BEFORE the SMP worker cores
+ * start.  An earlier version instead re-mapped it at runtime from
+ * dwc_setup_dma_mode() with a single-core TLB invalidate — but by then the
+ * secondary cores were already up holding a stale *cacheable* TLB entry for
+ * this section, so the mapping was inconsistent across cores.  Baking it in the
+ * shared table up front gives every core the same Non-cacheable view from the
+ * instant its MMU turns on.  (The framebuffer can't do this — its address is
+ * only known at runtime from the GPU — but the arena's is a link-time constant.)
  *
  * Without DCACHE_ON it is the original small per-channel packet buffer, used
  * only for unaligned transfers. */
 #ifdef DCACHE_ON
 #  define DWC_DMA_ARENA_BYTES 0x100000u                     /* exactly one 1 MB section */
 #  define DWC_DMA_SLICE       (DWC_DMA_ARENA_BYTES / DWC_NUM_CHANNELS)
-static uint8_t aligned_bufs[DWC_NUM_CHANNELS][DWC_DMA_SLICE]
+uint8_t dwc_dma_arena[DWC_NUM_CHANNELS][DWC_DMA_SLICE]
                                 __attribute__((aligned(0x100000)));
+#  define aligned_bufs dwc_dma_arena
 #else
 static uint8_t aligned_bufs[DWC_NUM_CHANNELS][WORD_ALIGN(USB_MAX_PACKET_SIZE)]
                                 __aligned(4);
@@ -336,17 +346,9 @@ dwc_setup_dma_mode(void)
     regs->nonperiodic_tx_fifo_size = (tx_words << 16) | rx_words;
     regs->host_periodic_tx_fifo_size = (ptx_words << 16) | (rx_words + tx_words);
 
-#ifdef DCACHE_ON
-    /* Map the bounce arena Non-cacheable before any DMA can touch it.  With the
-     * D-cache on, this is what makes the whole scheme correct with zero
-     * per-transfer maintenance: CPU accesses to the arena bypass the cache and
-     * hit RAM directly, exactly as the DMA engine sees it.  Must happen after
-     * mmu_init (it re-maps live) but before DMA is enabled below. */
-    {
-        extern void mmu_set_range_noncached(unsigned long pa, unsigned long len);
-        mmu_set_range_noncached((unsigned long)aligned_bufs, sizeof(aligned_bufs));
-    }
-#endif
+    /* Note: under DCACHE_ON the bounce arena (dwc_dma_arena) is already mapped
+     * Non-cacheable — mmu_init() baked it into the identity table before the
+     * caches and the SMP secondaries came up.  Nothing to do here. */
 
     /* Actually enable DMA by setting the appropriate flag; also set an extra
      * flag available only in Broadcom's instantiation of the Synopsys USB block
