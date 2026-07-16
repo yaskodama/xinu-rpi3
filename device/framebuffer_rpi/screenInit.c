@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <framebuffer.h>
+#include <cache.h>
 #include <stdlib.h>
 #include <shell.h> /* for banner */
 #include <kernel.h>
@@ -46,10 +47,25 @@ void screenInit() {
 #endif
 }
 
+/* ★ Under DCACHE_ON this MUST NOT be a stack local.  The GPU reads it, and the
+ * cache maintenance below operates on whole 64-byte lines: invalidating a line
+ * that straddled live stack (return addresses, saved registers) would corrupt
+ * this function's own frame.  A dedicated 64-byte aligned, 64-byte padded
+ * static shares its lines with nothing, which makes the maintenance safe.
+ * (The GPU itself only requires 16-byte alignment.) */
+static struct framebuffer fb_req __attribute__((aligned (64)));
+static char fb_req_pad[64] __attribute__((used));
+
+/* Byte size of the framebuffer the GPU actually allocated (it, not us, decides
+ * the pitch and hence the size).  Exposed so mmu_set_range_noncached() can
+ * re-map exactly that region under DCACHE_ON.  Valid only after a successful
+ * framebufferInit(); zero before that. */
+ulong framebuffer_size_bytes(void) { return (ulong)fb_req.size; }
+
 /* Initializes the framebuffer used by the GPU. Returns OK on success; SYSERR on failure. */
 int framebufferInit() {
-    //GPU expects this struct to be 16 byte aligned
-    struct framebuffer frame __attribute__((aligned (16)));
+    struct framebuffer *pframe = &fb_req;
+#define frame (*pframe)
 
 	frame.width_p = DEFAULT_WIDTH; //must be less than 4096
 	frame.height_p = DEFAULT_HEIGHT; //must be less than 4096
@@ -63,16 +79,28 @@ int framebufferInit() {
 	frame.size = 0;
 
 #ifdef _XINU_PLATFORM_ARM_RPI3_
-    /* Pass the struct's UNCACHED bus alias (0xC0000000 | phys).  Xinu runs
-     * with the D-cache off, so CPU writes are already in RAM; giving the GPU
-     * the uncached alias makes it read RAM directly instead of a stale GPU-L2
-     * view (the 0x0 cached alias), which left address/size = 0. */
+    /* Pass the struct's UNCACHED bus alias (0xC0000000 | phys), so the GPU
+     * reads RAM directly rather than a stale GPU-L2 view (the 0x0 cached
+     * alias), which left address/size = 0. */
+  #ifdef DCACHE_ON
+    /* The original code relied on "Xinu runs with the D-cache off, so CPU
+     * writes are already in RAM".  That premise is gone: push the request out
+     * of the D-cache ourselves, or the GPU reads a stale struct and returns
+     * address = 0 (SYSERR, no display). */
+    dcache_clean_range(&frame, sizeof(frame));
+  #endif
     mailboxWrite(physToBus(&frame));
 #else
     mailboxWrite((ulong)&frame);
 #endif
 
 	ulong result = mailboxRead();
+
+#ifdef DCACHE_ON
+    /* Symmetrically: the GPU wrote address/size/pitch straight to RAM, so drop
+     * any lines we may have speculatively pulled in before reading them. */
+    dcache_invalidate_range(&frame, sizeof(frame));
+#endif
 
 	/* Error checking */
 	if (result) { //if anything but zero
@@ -99,6 +127,7 @@ int framebufferInit() {
     foreground = WHITE;
     minishell = FALSE;
 	return OK;
+#undef frame
 }
 
 /* Clear the framebuffer console and move the cursor home.  Called by the

@@ -107,6 +107,15 @@ INCLUDE := -I$(TOPDIR)/include -I$(TOPDIR)/system/platforms/$(PLATFORM) -I$(TOPD
 
 # Override this as -DDETAIL to enable certain debugging messages in Embedded
 # Xinu.
+# Build variants (see docs/smp_report for why each exists):
+#   make PLATFORM=arm-rpi3
+#       default: D-cache OFF.  The shipping kernel.
+#   make PLATFORM=arm-rpi3 DETAIL="-DDCACHE_EXPERIMENT -DDCACHE_ON -DOS_MINIMAL"
+#       D-cache ON measurement variant.  OS_MINIMAL drops net+WM, and
+#       DCACHE_EXPERIMENT additionally skips screenInit and usbinit, so that NO
+#       non-coherent agent (GPU, DWC USB DMA) touches memory.  That is what
+#       makes C=1 safe without any of the DMA cache-maintenance work.
+#       Results go to the serial console; there is no network in this variant.
 DETAIL  :=
 
 # Set default additional defines.  platformVars can add extra defines if needed.

@@ -81,11 +81,33 @@ void nulluser(void)
 #ifdef _XINU_PLATFORM_ARM_RPI3_
     /* Bring up the HDMI framebuffer via the VideoCore mailbox.  Done here
      * (rather than in start.S like the Pi1 path) so the serial console is
-     * already usable and a mailbox stall would be visible on UART. */
+     * already usable and a mailbox stall would be visible on UART.
+     *
+     * ★ Note this runs AFTER platforminit(), i.e. after mmu_init has already
+     * turned the D-cache on under DCACHE_ON.  Two things therefore need care,
+     * and both are handled rather than avoided so that HDMI keeps working:
+     *   - the mailbox request struct — screenInit.c moves it off the stack and
+     *     cleans/invalidates around the handshake;
+     *   - the framebuffer itself — remapped non-cacheable just below, once the
+     *     GPU has told us where it put it. */
     {
         extern void screenInit(void);
         screenInit();
     }
+  #ifdef DCACHE_ON
+    /* The GPU scans the framebuffer out of RAM continuously and never snoops
+     * us, so pixels must not linger in the D-cache.  The address is only known
+     * now, which is why this is a runtime re-map rather than a table entry
+     * baked in by mmu_init. */
+    {
+        extern void  mmu_set_range_noncached(ulong pa, ulong len);
+        extern ulong framebufferAddress;
+        extern ulong framebuffer_size_bytes(void);
+        if (framebufferAddress)
+            mmu_set_range_noncached(framebufferAddress,
+                                    framebuffer_size_bytes());
+    }
+  #endif
 #endif
 
     /* General initialization  */
@@ -233,7 +255,17 @@ static int sysinit(void)
     }
 #endif
 
-#ifdef WITH_USB
+#if defined(WITH_USB) && !defined(DCACHE_EXPERIMENT)
+    /* ★ Skipped under DCACHE_EXPERIMENT.  The DWC USB engine is this kernel's
+     * only DMA agent, and it is the one site that page-table attributes cannot
+     * fix: usb_dwc_hcd.c hands it the caller's pointer verbatim, and callers
+     * pass HEAP buffers (memget aligns to 8, not to a 64-byte line, so they
+     * share lines with neighbours) and even STACK addresses (smsc9512.c reg
+     * access DMAs 4 bytes to/from a local).  Invalidating a 64-byte line
+     * around a stack local would discard live return addresses.  Solving that
+     * needs a bounce arena and is deliberately out of scope here — the
+     * experiment answers "does cached memory work scale on 4 cores?", which
+     * needs no USB.  This also removes ethernet, hence the serial harness. */
     { extern void usbmsc_init(void); usbmsc_init(); }  /* register USB MSC before enumeration */
     usbinit();
 #endif

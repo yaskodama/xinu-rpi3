@@ -17,6 +17,7 @@
 
 #include <smp.h>
 #include <interrupt.h>   /* disable()/restore() — see smp_pool_acquire() */
+#include <cache.h>       /* DCACHE_ON: clean before releasing cores with caches off */
 
 /* ---- start.S handoff -------------------------------------------------
  * These live in start.S's .data (NOT .bss) on purpose: a secondary core may
@@ -116,6 +117,22 @@ void smp_init(void)
         smp_job_done[c] = 0;
         smp_stacktop[c] = (unsigned long)(smp_stack[c] + SMP_STACK_BYTES);
     }
+    /* Stage the release addresses for the start.S park path. */
+    for (c = 1; c < SMP_NCORES; c++)
+        smp_release[c] = (unsigned long)&_smp_start;
+
+#ifdef DCACHE_ON
+    /* ★ Write these back before releasing anyone.  A secondary core reads
+     * smp_stacktop[] and smp_release[] from _smp_start while its OWN MMU and
+     * caches are still off — those reads go straight to RAM and do not snoop
+     * this core's D-cache.  Without the clean, a released core would load a
+     * null stack pointer and die on its first push.  (Everything after
+     * mmu_enable_secondary() is hardware-coherent via SMPEN and needs no
+     * maintenance; this is the one window where it is not.) */
+    dcache_clean_range((const void *)smp_stacktop, sizeof(smp_stacktop));
+    dcache_clean_range((const void *)smp_release,  sizeof(smp_release));
+    dcache_clean_range((const void *)smp_stack,    sizeof(smp_stack));
+#endif
     dsb();                                   /* stacks visible before release */
 
     /* Release each secondary via BOTH mechanisms, then SEV:
@@ -124,10 +141,8 @@ void smp_init(void)
      *   (b) smp_release[], which start.S's own park_secondary path polls — in
      *       case a firmware instead drops all four cores into _start.
      * Whichever path a core is on, it converges on _smp_start. */
-    for (c = 1; c < SMP_NCORES; c++) {
-        smp_release[c] = (unsigned long)&_smp_start;
+    for (c = 1; c < SMP_NCORES; c++)
         *ARM_LOCAL_MBOX3_SET(c) = (unsigned long)&_smp_start;
-    }
     dsb_sev();
 
     /* Wait (bounded) for each to announce itself online. */

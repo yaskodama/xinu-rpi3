@@ -230,6 +230,17 @@ thread main(void)
         }
     }
 
+#ifdef DCACHE_EXPERIMENT
+    /* The D-cache experiment has no network (its USB stack is compiled out —
+     * the DWC DMA engine cannot coexist with SCTLR.C=1), so it cannot serve
+     * /bench.  Run the same workloads here and report to the console instead.
+     * Runs once, at boot, before anything else can perturb the measurement. */
+    {
+        extern void smpbench_run_all(void);
+        smpbench_run_all();
+    }
+#endif
+
     /* ---- Build variants (selected via DETAIL=-D... at compile time) -------
      *   default     full kernel: networking + AIPL + HDMI window system
      *   OS_NO_WM    full kernel minus the window system (no gwm desktop)  -> OS2.IMG

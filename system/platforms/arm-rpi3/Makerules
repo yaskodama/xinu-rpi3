@@ -13,6 +13,7 @@ S_FILES = ctxsw.S          \
 
 C_FILES = setupStack.c       \
           bcm2835_power.c    \
+          cache.c            \
           dispatch.c         \
           kexec.c            \
           mmu.c              \
