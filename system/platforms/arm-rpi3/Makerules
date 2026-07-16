@@ -17,6 +17,7 @@ C_FILES = setupStack.c       \
           kexec.c            \
           mmu.c              \
           platforminit.c     \
+          smp.c              \
           timer.c            \
           usb_dwc_hcd.c      \
           watchdog.c

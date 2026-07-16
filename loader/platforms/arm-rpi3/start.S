@@ -62,8 +62,18 @@ _in_svc:
 	b reset_handler
 
 park_secondary:
-	wfe
-	b park_secondary
+	/* This core was released into _start alongside core 0.  The stock 32-bit
+	 * firmware does not do this (it holds cores 1-3 in the armstub spin
+	 * table instead — see smp_init), but some firmwares do, so handle it:
+	 * sleep in low-power WFE until smp_init() publishes our release address
+	 * in smp_release[], then join the worker pool.  Until then a stray core
+	 * costs no power and cannot trample core 0's kernel.  r4 = our core id. */
+	ldr r5, =smp_release
+1:	wfe
+	ldr r6, [r5, r4, lsl #2]
+	cmp r6, #0
+	beq 1b
+	bx r6
 	.endfunc
 
 /* ARM exception vector table.  This is copied to address 0.  See A2.6
@@ -237,3 +247,59 @@ bssloopa:
 	 * parameters and never returns.  */
 	b nulluser
 	.endfunc
+
+/* ============================================================
+ * _smp_start — secondary core entry for the worker pool (smp.c).
+ *
+ * Reached either from the armstub spin table (smp_init() wrote this address
+ * into the core's ARM-local mailbox 3 at 0x4000008C + 0x10*core — how the
+ * stock 32-bit Pi 3 firmware actually holds cores 1-3), or from
+ * park_secondary above.  Both converge here.
+ *
+ * The MMU is off on entry; smp_secondary_entry() turns it back on against
+ * core 0's shared identity-mapped L1 table.  That is safe because VA == PA
+ * throughout, so these very instructions keep executing across the switch.
+ * ============================================================ */
+	.func _smp_start
+	.globl _smp_start
+_smp_start:
+	/* Normalise the entry mode the same way the primary path does: the
+	 * armstub may hand us SVC or HYP depending on firmware. */
+	mrs r12, cpsr
+	and r3, r12, #0x1f
+	cmp r3, #0x1a                /* 0x1a = HYP mode? */
+	bne _smp_in_svc
+	bic r12, r12, #0x1f
+	orr r12, r12, #0xd3          /* SVC mode, IRQ+FIQ masked */
+	msr spsr_cxsf, r12
+	adr r12, _smp_in_svc
+	msr elr_hyp, r12
+	eret
+_smp_in_svc:
+	/* Workers are pure compute and share core 0's vector table, whose
+	 * handlers are not reentrant — so never take an interrupt here.  The
+	 * BCM2837 routes GPU IRQs to core 0 only; this masks the rest. */
+	cpsid if
+	mrc p15, 0, r4, c0, c0, 5    /* read MPIDR */
+	and r4, r4, #3               /* Aff0 = core id 0..3 */
+	ldr r5, =smp_stacktop
+	ldr sp, [r5, r4, lsl #2]     /* per-core stack top, set by smp_init */
+	mov r0, r4                   /* arg0 = core id */
+	bl smp_secondary_entry       /* never returns */
+_smp_dead:
+	wfe
+	b _smp_dead
+	.endfunc
+
+/* Secondary-core handoff slots, read by the code above and written by smp.c.
+ * ★ Deliberately in .data, NOT .bss: a core parked in park_secondary polls
+ * smp_release[] while core 0 may still be clearing .bss, so these must read 0
+ * from the moment the GPU loads the image — .bss is only zeroed later. */
+	.section .data
+	.align 2
+	.globl smp_release
+smp_release:
+	.word 0, 0, 0, 0
+	.globl smp_stacktop
+smp_stacktop:
+	.word 0, 0, 0, 0

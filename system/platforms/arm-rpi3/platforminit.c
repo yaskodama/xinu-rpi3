@@ -127,5 +127,13 @@ int platforminit(void)
         extern void mmu_init(void);
         mmu_init();
     }
+    /* Bring cores 1-3 up as compute workers.  Must run AFTER mmu_init (a
+     * worker points TTBR0 at the table core 0 just built) and BEFORE any
+     * thread starts.  Bounded: cores that do not answer stay offline and
+     * parallel jobs simply run on core 0, so boot never stalls on this. */
+    {
+        extern void smp_init(void);
+        smp_init();
+    }
     return OK;
 }

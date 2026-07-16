@@ -174,6 +174,54 @@ void mmu_init(void)
     mmu_enabled = 1;
 }
 
+/* Bring a secondary core's MMU/cache configuration in line with core 0's:
+ * point TTBR0 at the SAME identity-mapped L1 table core 0 already built, then
+ * enable MMU + I-cache (D-cache stays off, as on core 0).
+ *
+ * A worker core must never rebuild the table — it only borrows it.  Sharing is
+ * safe: the map is identity and read-only after mmu_init(), and page-table
+ * walks are non-cacheable here (TTBR0 RGN/IRGN = 0), so no walker coherency
+ * problem arises between cores.
+ *
+ * Matching core 0 exactly matters for more than tidiness: the whole worker
+ * pool assumes D-cache off for its lock-free job mailbox (see smp.h), and
+ * equal cache config is what makes a 4-core timing comparison honest.
+ *
+ * Called from smp_secondary_entry() with the MMU still off.  Enabling it
+ * mid-function is safe because VA == PA. */
+void mmu_enable_secondary(void)
+{
+    asm volatile (
+        /* (1) TTBR0 = core 0's table base */
+        "mcr p15, 0, %0, c2, c0, 0\n"
+        /* (2) TTBCR = 0 */
+        "mov r1, #0\n"
+        "mcr p15, 0, r1, c2, c0, 2\n"
+        /* (3) DACR — all 16 domains = client */
+        "movw r1, #0x5555\n"
+        "movt r1, #0x5555\n"
+        "mcr p15, 0, r1, c3, c0, 0\n"
+        /* (4) Invalidate TLB + I-cache + branch predictor on THIS core */
+        "mov r1, #0\n"
+        "mcr p15, 0, r1, c8, c7, 0\n"   /* TLBIALL */
+        "mcr p15, 0, r1, c7, c5, 0\n"   /* ICIALLU */
+        "mcr p15, 0, r1, c7, c5, 6\n"   /* BPIALL  */
+        /* (5) DSB + ISB so the invalidations drain */
+        "dsb\n"
+        "isb\n"
+        /* (6) SCTLR — M + I only, exactly as core 0 (C stays off) */
+        "mrc p15, 0, r1, c1, c0, 0\n"
+        "orr r1, r1, #(1 << 0)\n"       /* M = MMU enable */
+        "orr r1, r1, #(1 << 12)\n"      /* I = instruction cache enable */
+        "mcr p15, 0, r1, c1, c0, 0\n"
+        /* (7) ISB so the next fetch is translated */
+        "isb\n"
+        :
+        : "r" (l1_table)
+        : "r1", "memory"
+    );
+}
+
 /* Disable MMU.  Safe because the identity-map means VA==PA throughout —
  * after we clear SCTLR.M, accesses go straight to PA and execution
  * continues from the same instructions.  Caches were off so no flush

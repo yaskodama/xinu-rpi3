@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <rcu.h>       /* RCU: lock-free actor-registry reads (concurrency_safety=rcu) */
+#include <smp.h>       /* worker pool: Worker.compute_nq spreads over 4 cores */
 
 /* P3: bumped from 16 to 64 so the lock-free MPSC ring can sustain
    higher producer fan-in without back-pressure dropping messages.
@@ -1305,6 +1306,7 @@ static void Dispatcher_submit_nq(int self_id, int sender_id,
 static void Dispatcher_submit_nq(int self_id, int sender_id,
                                  value_t* args, int n_args);
 int abcl_nq_count_partial(int n, int first_col);
+int abcl_nq_count_partial_smp(int n, int first_col, int nc);
 
 static void Dispatcher_restart_worker(int self_id, int sender_id,
                                       value_t* args, int n_args) {
@@ -1593,9 +1595,15 @@ static void Worker_compute_nq(int self_id, int sender_id,
   long idx       = objects[self_id].fields[F_Worker_my_idx].i;
   int  disp      = objects[self_id].fields[F_Worker_dispatcher].obj_id;
 
-  long t0 = (long)(clkticks * 10);
-  long result = (long)abcl_nq_count_partial((int)n, (int)first_col);
-  long elapsed = (long)(clkticks * 10) - t0;
+  /* Spread this column's count over the worker pool.  The kernel calls around
+   * it (fields, print, enqueue) stay on core 0 — only the pure counting goes
+   * to the workers.  Timed with clkcount()'s 1 MHz free-running counter: the
+   * old clkticks reading always came out 0, because clkticks is bumped by the
+   * timer interrupt, which does not reliably fire on this board. */
+  int  ncores = smp_cores_online();
+  unsigned long t0 = clkcount();
+  long result = (long)abcl_nq_count_partial_smp((int)n, (int)first_col, ncores);
+  long elapsed = (long)((clkcount() - t0) / 1000UL);   /* us -> ms */
 
   objects[self_id].fields[F_Worker_last_n]      = mk_int(n);
   objects[self_id].fields[F_Worker_last_result] = mk_int(result);
@@ -1729,6 +1737,64 @@ int abcl_nq_count_partial(int n, int first_col) {
   if (first_col < 0 || first_col >= n) return 0;
   cols[0] = first_col;
   return nq_recurse(n, 1, cols);
+}
+
+/* ---- The same partial, spread over the SMP worker pool -------------------
+ * This is the one place in the AIPL runtime where handing work to cores 1-3
+ * pays.  Measured on this board (see /bench): the pool costs ~7 us per job, so
+ * only a method with >= ~70 us of PURE compute is worth splitting.  Almost no
+ * AIPL method qualifies — `bump`, ping-pong and friends are a few arithmetic
+ * ops and then a send, i.e. far below the threshold, and a send/print/wait
+ * cannot run on a worker core at all.  Worker.compute_nq is the exception: one
+ * first-row column of an n=13 board is ~100 ms of pure counting with no kernel
+ * calls in it, which is 4 orders of magnitude above break-even.
+ *
+ * A single first_col is ONE recursive call, so the split happens one level
+ * down: enumerate the second row's legal columns and give each core a residue
+ * class of them.  Interleaving (rather than a contiguous cut) balances the
+ * cost, which is centre-heavy across the row — the same reason /bench
+ * interleaves the first row.
+ *
+ * ★ Each core needs its OWN board: nq_recurse mutates cols[] as it descends,
+ * so a shared array would have the cores corrupting each other's search. */
+struct nq_job {
+  int n;
+  int first;
+  int stride;
+  int cols[SMP_NCORES][16];   /* one board per core: nq_recurse mutates it */
+};
+
+static long nq_partial_par(long lo, long hi, int core, void *ud) {
+  struct nq_job *j = (struct nq_job *)ud;
+  int n = j->n, first = j->first, stride = j->stride;
+  int *cols = j->cols[core];
+  long total = 0;
+  int c, k = 0;
+  (void)hi;
+  cols[0] = first;
+  for (c = 0; c < n; c++) {
+    /* Row 1 legality against row 0 — same rule as nq_recurse's inner check
+     * (same column, or one step along a diagonal). */
+    int dc = first - c;
+    if (dc < 0) dc = -dc;
+    if (first == c || dc == 1) continue;
+    if ((k++ % stride) != (int)lo) continue;     /* not this core's class */
+    cols[1] = c;
+    total += nq_recurse(n, 2, cols);
+  }
+  return total;
+}
+
+int abcl_nq_count_partial_smp(int n, int first_col, int nc) {
+  struct nq_job j;
+  if (n < 1 || n > 16) return 0;
+  if (first_col < 0 || first_col >= n) return 0;
+  /* n < 3 has no second row to split on (and no solutions anyway); nc < 2
+   * means there is nothing to split across. */
+  if (n < 3 || nc < 2) return abcl_nq_count_partial(n, first_col);
+  if (nc > SMP_NCORES) nc = SMP_NCORES;
+  j.n = n; j.first = first_col; j.stride = nc;
+  return (int)smp_parallel_sum(nq_partial_par, &j, nc, nc);
 }
 
 /* djb2 — small portable string hash for sticky routing keys.

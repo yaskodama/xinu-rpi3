@@ -33,6 +33,7 @@
 #include <shell.h>     /* commandtab / lexan for the /shell remote-login route */
 #include <interrupt.h> /* disable()/restore() around ready() in webshell_run    */
 #include <clock.h>     /* clktime + clkticks (ms) for the /bench route */
+#include <smp.h>       /* worker pool: 4-core /bench and /nqpart */
 
 /* Latest /upload payload — file-scope so /api/upload-info can read it
  * back.  Single slot (last upload wins).  64 KB is generous enough for
@@ -293,11 +294,25 @@ static int fb_has(const char *req, const char *key)
     return 0;
 }
 
-/* ---- Single-core benchmarks for the unified /bench route ----
- * Pi 3 (xinu-raz) has no SMP worker pool, so these run on one core: the
- * 1-core and N-core times are identical (speedup 1.00).  The output fields
- * match the SMP boards (rpi4/rpi5) so the Mesh Control Center tabulates all
- * three uniformly. */
+/* ---- Benchmarks for the unified /bench route ----
+ * Each kind runs twice: once serially on core 0 for the baseline, then across
+ * the worker pool (see include/smp.h) for the N-core time.  The output fields
+ * match the rpi4/rpi5 SMP boards so the Mesh Control Center tabulates all
+ * three uniformly.
+ *
+ * Load balancing: a worker chunk is fixed at post time (there is no shared
+ * work queue — a dynamic one would need LDREX/STREX, which faults on this
+ * port's non-cacheable D-cache-off mappings).  So where per-index cost is
+ * skewed, the chunks are INTERLEAVED by stride rather than contiguous:
+ *   - nqueens: first-row subtree cost is centre-heavy and mirror-symmetric,
+ *     so contiguous chunks would give the middle cores several times the work.
+ *   - primes:  trial division costs ~sqrt(x), so the top contiguous chunk
+ *     would cost ~3x the bottom one (capping speedup near 2.9 instead of 4).
+ *   - dining:  uniform cost per table, so plain contiguous chunks balance.
+ * The stride job's range [lo,hi) is a per-core seed, not an index span: core c
+ * takes lo, lo+stride, lo+2*stride, ...  Job parameters travel in the file
+ * statics below because smp_range_fn carries no user-data pointer; that is
+ * safe only because /bench is serialised on core 0's single webactor thread. */
 static long wa_nq_solve(unsigned cols, unsigned d1, unsigned d2, unsigned all)
 {
     if (cols == all) return 1;
@@ -321,28 +336,16 @@ static long wa_bench_nqueens(int n)
     }
     return total;
 }
-/* N-Queens partial: count solutions for first-queen columns [c0,c1) at board
- * size n (single-core).  Used by the /nqpart distributed route. */
-static long wa_bench_nqueens_range(int n, int c0, int c1)
-{
-    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
-    long total = 0;
-    int c;
-    if (c0 < 0) c0 = 0;
-    if (c1 > n) c1 = n;
-    for (c = c0; c < c1; c++) {
-        unsigned bit = 1u << c;
-        total += wa_nq_solve(bit, bit << 1, bit >> 1, all);
-    }
-    return total;
-}
-static volatile unsigned wa_din_sink = 0;
-static long wa_bench_dining(int np, long tables)
+/* Per-core sinks: each core writes only its own slot, so the sink that keeps
+ * the compiler from folding the loop away costs no cross-core sharing. */
+static volatile unsigned wa_din_sink[SMP_NCORES];
+
+static long wa_bench_dining_seats(int np, long t0, long t1, int core)
 {
     long meals = 0, t;
     unsigned acc = 2654435761u;
     int round, p;
-    for (t = 0; t < tables; t++)
+    for (t = t0; t < t1; t++)
         for (round = 0; round < 24; round++)
             for (p = 0; p < np; p++) {
                 int l = p, r = (p + 1) % np;
@@ -351,8 +354,126 @@ static long wa_bench_dining(int np, long tables)
                 acc = acc * 1103515245u + 12345u + (unsigned)(fa * 131 + fb);
                 meals++;
             }
-    wa_din_sink ^= acc;
+    wa_din_sink[core] ^= acc;
     return meals;
+}
+static long wa_bench_dining(int np, long tables)
+{
+    return wa_bench_dining_seats(np, 0, tables, 0);
+}
+
+/* ---- Job parameters for the worker pool ----
+ * Staged on the CALLER'S stack and handed to the pool via `ud`, never in file
+ * globals: core 0 is preemptive and other threads (the AIPL actors) use the
+ * same pool, so globals could be overwritten between staging and dispatch. */
+struct wa_job {
+    int n;        /* board size / prime bound / diners */
+    int stride;   /* = number of cores in the job      */
+    int c0, c1;   /* nqueens: first-row column window  */
+};
+
+/* smp_range_fn: N-Queens over the first-row columns of [j->c0, j->c1) that
+ * fall in this core's residue class — c0+lo, c0+lo+stride, ...  The window
+ * lets /nqpart (which owns only a slice of the board) share this job with
+ * /bench (which owns the whole board, c0=0 c1=n). */
+static long wa_nq_par(long lo, long hi, int core, void *ud)
+{
+    struct wa_job *j = (struct wa_job *)ud;
+    int n = j->n, stride = j->stride, c;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    (void)hi; (void)core;
+    for (c = j->c0 + (int)lo; c < j->c1; c += stride) {
+        unsigned bit = 1u << c;
+        total += wa_nq_solve(bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+
+/* Whole-board N-Queens across the worker pool. */
+static long wa_bench_nqueens_smp(int n, int nc)
+{
+    struct wa_job j;
+    j.n = n; j.c0 = 0; j.c1 = n; j.stride = nc;
+    return smp_parallel_sum(wa_nq_par, &j, nc, nc);
+}
+
+/* N-Queens partial for first-queen columns [c0,c1), across the worker pool.
+ * This is the /nqpart cluster route's solver: the Mac hands each board a
+ * column slice, and the board now spreads that slice over its own cores. */
+static long wa_bench_nqueens_range_smp(int n, int c0, int c1, int nc)
+{
+    struct wa_job j;
+    if (c0 < 0) c0 = 0;
+    if (c1 > n) c1 = n;
+    j.n = n; j.c0 = c0; j.c1 = c1; j.stride = nc;
+    return smp_parallel_sum(wa_nq_par, &j, nc, nc);
+}
+
+/* smp_range_fn: primes over x = lo, lo+stride, lo+2*stride, ... below n. */
+static long wa_primes_par(long lo, long hi, int core, void *ud)
+{
+    struct wa_job *j = (struct wa_job *)ud;
+    long n = j->n, stride = j->stride, cnt = 0, x, d;
+    (void)hi; (void)core;
+    /* Smallest x >= 2 in this core's residue class (x == lo mod stride).
+     * Stepping up by stride keeps the classes disjoint; starting at 2 keeps
+     * 0 and 1 out of the count. */
+    for (x = lo; x < 2; x += stride) { }
+    for (; x < n; x += stride) {
+        int pr = 1;
+        for (d = 2; d * d <= x; d++) if (x % d == 0) { pr = 0; break; }
+        cnt += pr;
+    }
+    return cnt;
+}
+
+/* smp_range_fn: dining over the contiguous table range [lo,hi). */
+static long wa_dining_par(long lo, long hi, int core, void *ud)
+{
+    return wa_bench_dining_seats(((struct wa_job *)ud)->n, lo, hi, core);
+}
+
+/* ---- Memory-fill benchmark: does bulk *store* work scale on 4 cores? ----
+ * This is the question that decides whether the window system could go faster
+ * on the worker pool.  Graphics here is not compute-bound: with the D-cache
+ * off (SCTLR.C=0) every framebuffer store is its own RAM transaction, so a
+ * blit is bound by memory, not by the ALU.  Whether more cores help then
+ * depends on which limit binds:
+ *   - if the memory controller is already saturated by one core, extra cores
+ *     add nothing and the WM cannot be made faster this way;
+ *   - if a single core is instead stalling on store latency, extra cores
+ *     overlap those stalls and bulk drawing scales.
+ * Only the hardware can answer, so measure it on a plain buffer, which has
+ * exactly the framebuffer's memory attributes (Normal, non-cacheable while
+ * C=0) without disturbing the live display.
+ *
+ * The buffer is 1 MB (~1/4 of a 1280x800x32 screen), but the job size is the
+ * caller's `n` words, so sweeping n traces the scaling curve and shows how big
+ * a drawing job must be before splitting it pays.  WA_FILL_PASSES keeps even
+ * small n well above the 1 us clock resolution. */
+#define WA_FILL_WORDS  (256 * 1024)
+#define WA_FILL_PASSES 8
+static unsigned wa_fill_buf[WA_FILL_WORDS];
+
+static long wa_fill_par(long lo, long hi, int core, void *ud)
+{
+    volatile unsigned *b = wa_fill_buf;
+    long i, p;
+    (void)core; (void)ud;
+    for (p = 0; p < WA_FILL_PASSES; p++)
+        for (i = lo; i < hi; i++) b[i] = (unsigned)(i + p);
+    return hi - lo;
+}
+
+/* smp_range_fn that does nothing: times the pool's own dispatch + collect
+ * cost.  That figure is the break-even point — any job shorter than it gets
+ * SLOWER when handed to the workers, which is exactly what decides whether
+ * the window system's small redraws are worth parallelising at all. */
+static long wa_null_par(long lo, long hi, int core, void *ud)
+{
+    (void)core; (void)ud;
+    return hi - lo;
 }
 
 /* HTTP server thread: accept one connection at a time, deliver the message to
@@ -2691,12 +2812,14 @@ thread webactor_server(void)
                 int c0 = fb_q_int(reqbuf, "c0", 0);
                 int c1 = fb_q_int(reqbuf, "c1", n);
                 static char qr[256];
-                unsigned long t0 = clktime * 1000UL + clkticks;
-                long sol = wa_bench_nqueens_range(n, c0, c1);
-                unsigned long ms = (clktime * 1000UL + clkticks) - t0;
+                int nc = smp_cores_online();
+                unsigned long t0 = clkcount();          /* 1 MHz free-running;
+                                                         * clkticks is stuck  */
+                long sol = wa_bench_nqueens_range_smp(n, c0, c1, nc);
+                unsigned long ms = (clkcount() - t0) / 1000UL;
                 int bl = sprintf(qr + 100,
-                    "nqueens-partial n=%d c0=%d c1=%d solutions=%ld ms=%lu cores=1\r\n",
-                    n, c0, c1, sol, ms);
+                    "nqueens-partial n=%d c0=%d c1=%d solutions=%ld ms=%lu cores=%d\r\n",
+                    n, c0, c1, sol, ms, nc);
                 int hl = sprintf(qr,
                     "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", bl);
@@ -2704,53 +2827,146 @@ thread webactor_server(void)
                 write(tcpdev, qr, hl + bl);
                 close(tcpdev); web_cur_tcpdev = -1; continue;
             }
-            /* /bench?kind=nqueens|dining|primes[&n=N] — unified single-core
-             *   benchmark.  Same fields as the rpi4/rpi5 SMP /bench (with
-             *   cores_online=1, speedup x100=100) so the Mesh Control Center
-             *   tabulates all three boards uniformly. */
+            /* /nqactor?n=N&col=C — A/B for the AIPL actor's compute path.
+             *   Runs the EXACT function Worker.compute_nq calls, serially and
+             *   then across the worker pool, on the same column.  /bench cannot
+             *   answer this: it uses the fast bitmask solver, whereas the actor
+             *   uses nq_recurse (array-based, O(row) per candidate), so the two
+             *   are different algorithms and their times are not comparable.
+             *   This route isolates the one thing in question — whether the
+             *   actor's own compute got faster on 4 cores. */
+            if (0 == strncmp(reqbuf, "GET /nqactor", 12) ||
+                0 == strncmp(reqbuf, "POST /nqactor", 13))
+            {
+                extern int abcl_nq_count_partial(int n, int first_col);
+                extern int abcl_nq_count_partial_smp(int n, int first_col, int nc);
+                int n   = fb_q_int(reqbuf, "n", 12);
+                int col = fb_q_int(reqbuf, "col", 0);
+                int nc  = smp_cores_online();
+                static char ar[320];
+                unsigned long t0;
+                long r1, rn, us1, usn;
+                if (n < 1)  n = 1;
+                if (n > 14) n = 14;
+                if (col < 0)  col = 0;
+                if (col >= n) col = n - 1;
+                t0  = clkcount();
+                r1  = abcl_nq_count_partial(n, col);
+                us1 = clkcount() - t0;
+                t0  = clkcount();
+                rn  = abcl_nq_count_partial_smp(n, col, nc);
+                usn = clkcount() - t0;
+                int bl = sprintf(ar + 120,
+                    "actor nq compute n=%d col=%d\r\ncores_online = %d\r\n"
+                    "solutions = %ld\r\n1-core   us  = %lu\r\nN-core   us  = %lu\r\n"
+                    "speedup x100 = %lu\r\nagree = %s\r\n",
+                    n, col, nc, r1, (unsigned long)us1, (unsigned long)usn,
+                    usn ? ((unsigned long)us1 * 100UL) / (unsigned long)usn : 0UL,
+                    (r1 == rn) ? "yes" : "NO");
+                int hl = sprintf(ar,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n\r\n", bl);
+                memcpy(ar + hl, ar + 120, bl);
+                write(tcpdev, ar, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            /* /bench?kind=nqueens|dining|primes|fill[&n=N] — unified SMP
+             *   benchmark.  Runs the workload serially on core 0, then again
+             *   across the worker pool, and reports both times plus the
+             *   measured speedup.  Same fields as the rpi4/rpi5 /bench so the
+             *   Mesh Control Center tabulates all three boards uniformly.
+             *
+             *   ★ Timed with clkcount(), the BCM2835 System Timer's 1 MHz
+             *   free-running counter — NOT clktime/clkticks.  Those are
+             *   incremented by the timer *interrupt*, which does not reliably
+             *   fire on this board (every run reported 0 ms, both before and
+             *   after the SMP work), and 1 ms resolution was too coarse for a
+             *   30 ms job anyway.  clkcount() is a direct hardware read: it
+             *   cannot stall, and gives microseconds.  Its 32-bit counter
+             *   wraps every ~4295 s, which unsigned subtraction handles. */
             if (0 == strncmp(reqbuf, "GET /bench", 10) ||
                 0 == strncmp(reqbuf, "POST /bench", 11))
             {
                 int is_dining = (NULL != strstr(reqbuf, "kind=dining"));
                 int is_primes = (NULL != strstr(reqbuf, "kind=primes"));
+                int is_fill   = (NULL != strstr(reqbuf, "kind=fill"));
                 static char br[512];
-                unsigned long t0, t1, ms;
-                long r;
+                struct wa_job job;
+                unsigned long t0, us1, usn;
+                long r1, rn;
+                int nc = smp_cores_online();
                 const char *label, *mkey;
                 if (is_dining) {
                     int np = fb_q_int(reqbuf, "n", 5);
                     if (np < 2)  np = 2;
                     if (np > 64) np = 64;
-                    t0 = clktime * 1000UL + clkticks;
-                    r  = wa_bench_dining(np, 40000L);
-                    t1 = clktime * 1000UL + clkticks;
+                    job.n = np; job.stride = 1;
+                    t0 = clkcount();
+                    r1 = wa_bench_dining(np, 40000L);
+                    us1 = clkcount() - t0;
+                    t0 = clkcount();                    /* cost is uniform per
+                                                         * table: contiguous  */
+                    rn = smp_parallel_sum(wa_dining_par, &job, 40000L, nc);
+                    usn = clkcount() - t0;
                     label = "dining"; mkey = "meals";
                 } else if (is_primes) {
                     int n = fb_q_int(reqbuf, "n", 200000);
                     if (n < 1) n = 1;
-                    long cnt = 0, x, d;
-                    t0 = clktime * 1000UL + clkticks;
-                    for (x = 2; x < n; x++) {
-                        int pr = 1;
-                        for (d = 2; d * d <= x; d++) if (x % d == 0) { pr = 0; break; }
-                        cnt += pr;
-                    }
-                    t1 = clktime * 1000UL + clkticks;
-                    r = cnt; label = "primes"; mkey = "primes";
+                    job.n = n;
+                    job.stride = 1;
+                    t0 = clkcount();
+                    r1 = wa_primes_par(0, 0, 0, &job);
+                    us1 = clkcount() - t0;
+                    job.stride = nc;                    /* interleave: cost
+                                                         * grows with x       */
+                    t0 = clkcount();
+                    rn = smp_parallel_sum(wa_primes_par, &job, nc, nc);
+                    usn = clkcount() - t0;
+                    label = "primes"; mkey = "primes";
+                } else if (is_fill) {
+                    long w = (long)fb_q_int(reqbuf, "n", WA_FILL_WORDS);
+                    if (w < 1) w = 1;
+                    if (w > WA_FILL_WORDS) w = WA_FILL_WORDS;
+                    t0 = clkcount();
+                    r1 = wa_fill_par(0, w, 0, &job);
+                    us1 = clkcount() - t0;
+                    t0 = clkcount();                    /* uniform per word:
+                                                         * contiguous bands   */
+                    rn = smp_parallel_sum(wa_fill_par, &job, w, nc);
+                    usn = clkcount() - t0;
+                    label = "fill"; mkey = "words";
+                } else if (NULL != strstr(reqbuf, "kind=null")) {
+                    t0 = clkcount();
+                    r1 = wa_null_par(0, nc, 0, &job);
+                    us1 = clkcount() - t0;
+                    t0 = clkcount();
+                    rn = smp_parallel_sum(wa_null_par, &job, nc, nc);
+                    usn = clkcount() - t0;               /* = pool round-trip */
+                    label = "null"; mkey = "chunks";
                 } else {
                     int n = fb_q_int(reqbuf, "n", 11);
                     if (n < 1)  n = 1;
-                    if (n > 13) n = 13;      /* single A53: keep it snappy */
-                    t0 = clktime * 1000UL + clkticks;
-                    r  = wa_bench_nqueens(n);
-                    t1 = clktime * 1000UL + clkticks;
+                    if (n > 13) n = 13;      /* keep it snappy even on 1 core */
+                    job.n = n;
+                    t0 = clkcount();
+                    r1 = wa_bench_nqueens(n);
+                    us1 = clkcount() - t0;
+                    t0 = clkcount();
+                    rn = wa_bench_nqueens_smp(n, nc);   /* interleaved: centre
+                                                         * columns cost more  */
+                    usn = clkcount() - t0;
                     label = "nqueens"; mkey = "solutions";
                 }
-                ms = t1 - t0;
+                /* The parallel run must agree with the serial one; if it ever
+                 * does not, say so loudly rather than quietly reporting a fast
+                 * wrong answer. */
                 int bl = sprintf(br + 160,
-                    "SMP bench kind=%s\r\ncores_online = 1\r\n%s = %ld\r\n"
-                    "1-core   ms  = %lu\r\nN-core   ms  = %lu\r\nspeedup x100 = 100\r\n",
-                    label, mkey, r, ms, ms);
+                    "SMP bench kind=%s\r\ncores_online = %d\r\n%s = %ld\r\n"
+                    "1-core   us  = %lu\r\nN-core   us  = %lu\r\n"
+                    "speedup x100 = %lu\r\nagree = %s\r\n",
+                    label, nc, mkey, r1, us1, usn,
+                    usn ? (us1 * 100UL) / usn : 0UL,
+                    (r1 == rn) ? "yes" : "NO");
                 int hl = sprintf(br,
                     "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", bl);
