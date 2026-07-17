@@ -212,11 +212,14 @@ int smpbench_kind_of(const char *req)
     return SMPBENCH_NQUEENS;
 }
 
-void smpbench_run(int kind, int n, struct smpbench_result *out)
+void smpbench_run(int kind, int n, int cores, struct smpbench_result *out)
 {
     struct sb_job job;
     unsigned long t0;
-    int nc = smp_cores_online();
+    int online = smp_cores_online();
+    /* `cores` caps the parallel run to a fixed core count for an Amdahl sweep;
+     * 0 (or out of range) means "use every online core". */
+    int nc = (cores >= 1 && cores <= online) ? cores : online;
 
     out->cores = nc;
     out->label = "?"; out->metric = "?";
@@ -344,22 +347,22 @@ void smpbench_run_all(void)
 
     kprintf("\r\n-- compute-bound (expect x3.2-x4.0) --\r\n");
     kprintf("  %-14s %10s %10s %8s\r\n", "bench", "1-core us", "N-core us", "speedup");
-    smpbench_run(SMPBENCH_DINING, 5, &r);       sb_print_row("dining n=5", &r);
-    smpbench_run(SMPBENCH_NQUEENS, 11, &r);     sb_print_row("nqueens n=11", &r);
-    smpbench_run(SMPBENCH_NQUEENS, 12, &r);     sb_print_row("nqueens n=12", &r);
-    smpbench_run(SMPBENCH_PRIMES, 200000, &r);  sb_print_row("primes 200k", &r);
+    smpbench_run(SMPBENCH_DINING, 5, 0, &r);       sb_print_row("dining n=5", &r);
+    smpbench_run(SMPBENCH_NQUEENS, 11, 0, &r);     sb_print_row("nqueens n=11", &r);
+    smpbench_run(SMPBENCH_NQUEENS, 12, 0, &r);     sb_print_row("nqueens n=12", &r);
+    smpbench_run(SMPBENCH_PRIMES, 200000, 0, &r);  sb_print_row("primes 200k", &r);
 
     kprintf("\r\n-- memory-store-bound: THE QUESTION (x1.0 = no benefit) --\r\n");
     kprintf("  %-14s %10s %10s %8s\r\n", "words", "1-core us", "N-core us", "speedup");
     for (i = 0; i < (int)(sizeof(fill_sizes) / sizeof(fill_sizes[0])); i++) {
         char nm[16];
-        smpbench_run(SMPBENCH_FILL, fill_sizes[i], &r);
+        smpbench_run(SMPBENCH_FILL, fill_sizes[i], 0, &r);
         sprintf(nm, "fill %d", fill_sizes[i]);
         sb_print_row(nm, &r);
     }
 
     kprintf("\r\n-- pool round trip (the parallelise/don't break-even) --\r\n");
-    smpbench_run(SMPBENCH_NULL, 0, &r);         sb_print_row("null", &r);
+    smpbench_run(SMPBENCH_NULL, 0, 0, &r);         sb_print_row("null", &r);
 
     kprintf("\r\n===== end smpbench =====\r\n");
 }

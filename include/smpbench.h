@@ -52,7 +52,7 @@ struct smpbench_result {
 
 /* Run one workload.  `n` is the kind's size parameter; pass 0 for its default
  * (board size 11, 5 diners, 200000 primes, the whole 1 MB fill). */
-void smpbench_run(int kind, int n, struct smpbench_result *out);
+void smpbench_run(int kind, int n, int cores, struct smpbench_result *out);
 
 /* Map a request string containing "kind=..." to a SMPBENCH_* value.
  * Defaults to SMPBENCH_NQUEENS when no kind is named. */

@@ -2703,7 +2703,7 @@ thread webactor_server(void)
             {
                 static char br[512];
                 struct smpbench_result r;
-                smpbench_run(smpbench_kind_of(reqbuf), fb_q_int(reqbuf, "n", 0), &r);
+                smpbench_run(smpbench_kind_of(reqbuf), fb_q_int(reqbuf, "n", 0), fb_q_int(reqbuf, "cores", 0), &r);
                 int bl = sprintf(br + 160,
                     "SMP bench kind=%s\r\ncores_online = %d\r\n%s = %ld\r\n"
                     "1-core   us  = %lu\r\nN-core   us  = %lu\r\n"
