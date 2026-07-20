@@ -62,8 +62,53 @@ _in_svc:
 	b reset_handler
 
 park_secondary:
-	wfe
-	b park_secondary
+	/* Cortex-A53 core 1..3.  Instead of spinning forever, poll this core's
+	 * slot in smp_release[] (published by smp_init in system/smp.c).  When it
+	 * becomes non-zero it holds the entry address (_smp_start); jump there to
+	 * join the worker pool.  MMU is still off here, so the read is a direct
+	 * (VA==PA) RAM access; core 0 writes smp_release with the D-cache off too,
+	 * so no cache maintenance is needed.  r4 already holds the core id. */
+	ldr r6, =smp_release
+1:	wfe
+	ldr r7, [r6, r4, lsl #2]     /* smp_release[core] */
+	cmp r7, #0
+	beq 1b
+	bx r7                        /* -> _smp_start */
+	.endfunc
+
+/* _smp_start: a released secondary core (1..3) lands here — either from the
+ * park_secondary poll above (already in SVC) or, on firmware that spin-tables
+ * the cores, straight from the armstub (possibly still in HYP).  Drop HYP->SVC
+ * defensively, allow unaligned accesses, set this core's stack, and enter the
+ * C worker entry.  Never returns. */
+	.globl _smp_start
+	.func _smp_start
+_smp_start:
+	mrs r12, cpsr
+	and r3, r12, #0x1f
+	cmp r3, #0x1a                /* HYP mode? */
+	bne _smp_in_svc
+	bic r12, r12, #0x1f
+	orr r12, r12, #0xd3          /* SVC, IRQ+FIQ masked */
+	msr spsr_cxsf, r12
+	adr r12, _smp_in_svc
+	msr elr_hyp, r12
+	eret
+_smp_in_svc:
+	/* Allow unaligned accesses (clear SCTLR.A); match core 0's reset_handler. */
+	mrc p15, 0, r1, c1, c0, 0
+	bic r1, r1, #(1 << 1)        /* A = 0 */
+	orr r1, r1, #(1 << 22)       /* legacy unaligned-support (RAO on ARMv7+) */
+	mcr p15, 0, r1, c1, c0, 0
+	isb
+	/* core id -> r0 (first C arg); SP = smp_stacktop[core]. */
+	mrc p15, 0, r0, c0, c0, 5
+	and r0, r0, #3
+	ldr r2, =smp_stacktop
+	ldr sp, [r2, r0, lsl #2]
+	bl smp_secondary_entry       /* (core) — enables MMU, runs worker loop */
+2:	wfe
+	b 2b
 	.endfunc
 
 /* ARM exception vector table.  This is copied to address 0.  See A2.6

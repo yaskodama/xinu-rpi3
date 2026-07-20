@@ -24,6 +24,7 @@
 #include <ipv4.h>
 #include <tcp.h>
 #include <string.h>
+#include <smp.h>       /* 4-core worker pool for /bench and /nqpart */
 #include <stdio.h>
 #include <clock.h>
 #include <watchdog.h>  /* watchdogset() for /reboot route */
@@ -353,6 +354,73 @@ static long wa_bench_dining(int np, long tables)
             }
     wa_din_sink ^= acc;
     return meals;
+}
+
+/* ---- 4-core SMP versions of the benchmarks ----
+ * The BCM2837 system timer (0x3F003004) is a free-running 1 MHz counter —
+ * far finer than the millisecond clkticks (which reads 0 for sub-second work),
+ * so we time the SMP runs in microseconds with it. */
+static inline unsigned long sys_us(void)
+{
+    return *(volatile unsigned int *)0x3F003004UL;
+}
+
+/* smp_range_fn shims: smp_parallel_sum() hands each core a [lo,hi) slice of a
+ * [0,n) index space; these map that slice onto the actual work. */
+static int  g_nq_n;      /* board size for the column-range shim   */
+static int  g_nq_base;   /* first column (nqpart c0)               */
+static int  g_din_np;    /* philosophers for the dining shim       */
+
+static long nq_col_range(long lo, long hi, int core)   /* columns [base+lo,base+hi) */
+{
+    (void)core;
+    unsigned all = (g_nq_n >= 32) ? 0xFFFFFFFFu : ((1u << g_nq_n) - 1u);
+    long total = 0, c;
+    for (c = lo; c < hi; c++) {
+        unsigned bit = 1u << (g_nq_base + c);
+        total += wa_nq_solve(bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+static long primes_range(long lo, long hi, int core)   /* count primes in [lo,hi) */
+{
+    (void)core;
+    long cnt = 0, x, d;
+    if (lo < 2) lo = 2;
+    for (x = lo; x < hi; x++) {
+        int pr = 1;
+        for (d = 2; d * d <= x; d++) if (x % d == 0) { pr = 0; break; }
+        cnt += pr;
+    }
+    return cnt;
+}
+static long dining_range(long lo, long hi, int core)   /* tables [lo,hi) */
+{
+    (void)core;
+    long meals = 0, t;
+    unsigned acc = 2654435761u;
+    int round, p, np = g_din_np;
+    for (t = lo; t < hi; t++)
+        for (round = 0; round < 24; round++)
+            for (p = 0; p < np; p++) {
+                int l = p, r = (p + 1) % np;
+                int fa = (l < r) ? l : r;
+                int fb = (l < r) ? r : l;
+                acc = acc * 1103515245u + 12345u + (unsigned)(fa * 131 + fb);
+                meals++;
+            }
+    wa_din_sink ^= acc;
+    return meals;
+}
+
+/* N-Queens partial over columns [c0,c1), split across `nc` cores. */
+static long wa_nqueens_range_smp(int n, int c0, int c1, int nc)
+{
+    if (c0 < 0) c0 = 0;
+    if (c1 > n) c1 = n;
+    if (c1 < c0) c1 = c0;
+    g_nq_n = n; g_nq_base = c0;
+    return smp_parallel_sum(nq_col_range, (long)(c1 - c0), nc);
 }
 
 /* HTTP server thread: accept one connection at a time, deliver the message to
@@ -2738,13 +2806,17 @@ thread webactor_server(void)
                 if (n > 16) n = 16;
                 int c0 = fb_q_int(reqbuf, "c0", 0);
                 int c1 = fb_q_int(reqbuf, "c1", n);
+                int cores = fb_q_int(reqbuf, "cores", 0);   /* 0 = all online */
+                smp_init();                                 /* idempotent, bounded */
+                int nc = smp_cores_online();
+                if (cores >= 1 && cores <= nc) nc = cores;
                 static char qr[256];
-                unsigned long t0 = clktime * 1000UL + clkticks;
-                long sol = wa_bench_nqueens_range(n, c0, c1);
-                unsigned long ms = (clktime * 1000UL + clkticks) - t0;
+                unsigned long t0 = sys_us();
+                long sol = wa_nqueens_range_smp(n, c0, c1, nc);
+                unsigned long ms = (sys_us() - t0) / 1000UL;
                 int bl = sprintf(qr + 100,
-                    "nqueens-partial n=%d c0=%d c1=%d solutions=%ld ms=%lu cores=1\r\n",
-                    n, c0, c1, sol, ms);
+                    "nqueens-partial n=%d c0=%d c1=%d solutions=%ld ms=%lu cores=%d\r\n",
+                    n, c0, c1, sol, ms, nc);
                 int hl = sprintf(qr,
                     "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", bl);
@@ -2762,43 +2834,44 @@ thread webactor_server(void)
                 int is_dining = (NULL != strstr(reqbuf, "kind=dining"));
                 int is_primes = (NULL != strstr(reqbuf, "kind=primes"));
                 static char br[512];
-                unsigned long t0, t1, ms;
-                long r;
+                unsigned long t0, us1, usN;
+                long r1, rN;
                 const char *label, *mkey;
+                smp_init();                                 /* idempotent, bounded */
+                int nc = smp_cores_online();
+                int cores = fb_q_int(reqbuf, "cores", 0);   /* 0 = all online */
+                if (cores >= 1 && cores <= nc) nc = cores;
+                smp_range_fn fn;
+                long units;
                 if (is_dining) {
                     int np = fb_q_int(reqbuf, "n", 5);
                     if (np < 2)  np = 2;
                     if (np > 64) np = 64;
-                    t0 = clktime * 1000UL + clkticks;
-                    r  = wa_bench_dining(np, 40000L);
-                    t1 = clktime * 1000UL + clkticks;
-                    label = "dining"; mkey = "meals";
+                    g_din_np = np; units = 40000L;
+                    fn = dining_range; label = "dining"; mkey = "meals";
                 } else if (is_primes) {
                     int n = fb_q_int(reqbuf, "n", 200000);
                     if (n < 1) n = 1;
-                    long cnt = 0, x, d;
-                    t0 = clktime * 1000UL + clkticks;
-                    for (x = 2; x < n; x++) {
-                        int pr = 1;
-                        for (d = 2; d * d <= x; d++) if (x % d == 0) { pr = 0; break; }
-                        cnt += pr;
-                    }
-                    t1 = clktime * 1000UL + clkticks;
-                    r = cnt; label = "primes"; mkey = "primes";
+                    units = n;
+                    fn = primes_range; label = "primes"; mkey = "primes";
                 } else {
-                    int n = fb_q_int(reqbuf, "n", 11);
+                    int n = fb_q_int(reqbuf, "n", 12);
                     if (n < 1)  n = 1;
-                    if (n > 13) n = 13;      /* single A53: keep it snappy */
-                    t0 = clktime * 1000UL + clkticks;
-                    r  = wa_bench_nqueens(n);
-                    t1 = clktime * 1000UL + clkticks;
-                    label = "nqueens"; mkey = "solutions";
+                    if (n > 14) n = 14;
+                    g_nq_n = n; g_nq_base = 0; units = n;
+                    fn = nq_col_range; label = "nqueens"; mkey = "solutions";
                 }
-                ms = t1 - t0;
+                /* Serial (1 core) then parallel (nc cores) back-to-back, timed
+                 * with the 1 MHz system timer.  agree = same total both ways. */
+                t0 = sys_us(); r1 = smp_parallel_sum(fn, units, 1);  us1 = sys_us() - t0;
+                t0 = sys_us(); rN = smp_parallel_sum(fn, units, nc); usN = sys_us() - t0;
+                unsigned long sx100 = (usN > 0) ? (us1 * 100UL / usN) : 100UL;
                 int bl = sprintf(br + 160,
-                    "SMP bench kind=%s\r\ncores_online = 1\r\n%s = %ld\r\n"
-                    "1-core   ms  = %lu\r\nN-core   ms  = %lu\r\nspeedup x100 = 100\r\n",
-                    label, mkey, r, ms, ms);
+                    "SMP bench kind=%s\r\ncores_online = %d\r\n%s = %ld\r\n"
+                    "1-core   us  = %lu\r\nN-core   us  = %lu\r\nspeedup x100 = %lu\r\n"
+                    "agree = %s\r\n",
+                    label, nc, mkey, rN, us1, usN, sx100,
+                    (r1 == rN) ? "yes" : "no");
                 int hl = sprintf(br,
                     "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                     "Content-Length: %d\r\n\r\n", bl);

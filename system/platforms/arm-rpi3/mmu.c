@@ -174,6 +174,40 @@ void mmu_init(void)
     mmu_enabled = 1;
 }
 
+/* Bring a secondary core's MMU up to the SAME configuration core 0 uses
+ * (mmu_init), reusing the L1 table core 0 already built: identity map, MMU +
+ * I-cache ON, D-cache OFF.  Called from smp_secondary_entry() (system/smp.c)
+ * on cores 1-3.  Does NOT rebuild the table.  Only SCTLR.M and .I are set
+ * (never .C) — enabling D-cache alongside the MMU without a set/way invalidate
+ * bricks the A53 (see the mmu_init note); leaving C off also keeps every core
+ * in the same cache mode, so the SMP mailbox stays coherent with no
+ * maintenance and 1-core vs 4-core timings are fair. */
+void mmu_enable_secondary(void)
+{
+    asm volatile (
+        "mcr p15, 0, %0, c2, c0, 0\n"   /* TTBR0 = l1_table (core 0's table) */
+        "mov r1, #0\n"
+        "mcr p15, 0, r1, c2, c0, 2\n"   /* TTBCR = 0 (TTBR0 covers all VA) */
+        "movw r1, #0x5555\n"
+        "movt r1, #0x5555\n"
+        "mcr p15, 0, r1, c3, c0, 0\n"   /* DACR = all-client */
+        "mov r1, #0\n"
+        "mcr p15, 0, r1, c8, c7, 0\n"   /* TLBIALL */
+        "mcr p15, 0, r1, c7, c5, 0\n"   /* ICIALLU */
+        "mcr p15, 0, r1, c7, c5, 6\n"   /* BPIALL */
+        "dsb\n"
+        "isb\n"
+        "mrc p15, 0, r1, c1, c0, 0\n"
+        "orr r1, r1, #(1 << 0)\n"       /* M — MMU enable */
+        "orr r1, r1, #(1 << 12)\n"      /* I — I-cache enable (C stays OFF) */
+        "mcr p15, 0, r1, c1, c0, 0\n"
+        "isb\n"
+        :
+        : "r" (l1_table)
+        : "r1", "memory"
+    );
+}
+
 /* Disable MMU.  Safe because the identity-map means VA==PA throughout —
  * after we clear SCTLR.M, accesses go straight to PA and execution
  * continues from the same instructions.  Caches were off so no flush
