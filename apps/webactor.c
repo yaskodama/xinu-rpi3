@@ -423,6 +423,75 @@ static long wa_nqueens_range_smp(int n, int c0, int c1, int nc)
     return smp_parallel_sum(nq_col_range, (long)(c1 - c0), nc);
 }
 
+/* ---- RTOS P1: periodic-task release-jitter harness ----
+ * A high-priority thread wakes every `period_ms` (via sleep(), the 1 kHz
+ * tick + preemptive priority scheduler under test) and timestamps each wake
+ * with the 1 MHz system timer. Release jitter = |measured period - target|.
+ * The interesting RTOS question is whether the high-priority periodic task
+ * holds its period while a low-priority CPU hog runs; the /rtos-jitter route
+ * measures both idle and under-load. All figures are microseconds. */
+struct jit_stat {
+    volatile int  done;
+    unsigned long target_us, n;
+    unsigned long min_us, max_us, sum_us;   /* measured period */
+    long          max_late_us, min_early_us;
+    unsigned long max_abs_jit_us, misses;   /* miss = |jitter| > target/2 */
+};
+static struct jit_stat g_jit;
+static volatile int    g_jit_hog_run;
+static volatile unsigned g_jit_hog_sink;
+
+/* Low-priority CPU hog: never sleeps, just burns cycles, so a truly
+ * preemptive priority scheduler must still let the periodic thread wake. */
+static void jit_hog(void)
+{
+    unsigned x = 2463534242u;
+    while (g_jit_hog_run) {
+        int i;
+        for (i = 0; i < 200000; i++) x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+        g_jit_hog_sink ^= x;
+    }
+}
+
+static void jit_measure(void)
+{
+    struct jit_stat *s = &g_jit;
+    unsigned long target = s->target_us;
+    unsigned long pms = target / 1000UL; if (pms < 1) pms = 1;
+    s->min_us = 0xffffffffUL; s->max_us = 0; s->sum_us = 0;
+    s->max_late_us = -1000000000L; s->min_early_us = 1000000000L;
+    s->max_abs_jit_us = 0; s->misses = 0;
+    unsigned long prev = sys_us();
+    unsigned long i;
+    for (i = 0; i < s->n; i++) {
+        sleep(pms);                          /* wait one period */
+        unsigned long now = sys_us();
+        unsigned long d = now - prev;        /* actual period (us) */
+        prev = now;
+        if (d < s->min_us) s->min_us = d;
+        if (d > s->max_us) s->max_us = d;
+        s->sum_us += d;
+        long jit = (long)d - (long)target;   /* +late / -early */
+        if (jit > s->max_late_us)  s->max_late_us  = jit;
+        if (jit < s->min_early_us) s->min_early_us = jit;
+        unsigned long aj = (jit < 0) ? (unsigned long)(-jit) : (unsigned long)jit;
+        if (aj > s->max_abs_jit_us) s->max_abs_jit_us = aj;
+        if (aj > target / 2UL) s->misses++;
+    }
+    s->done = 1;
+}
+
+/* Run one measurement phase at high priority; block (bounded) until it ends. */
+static void jit_run_phase(unsigned long period_ms, unsigned long samples, int prio)
+{
+    g_jit.done = 0; g_jit.target_us = period_ms * 1000UL; g_jit.n = samples;
+    tid_typ t = create((void *)jit_measure, 8192, prio, "jitter", 0);
+    if (t == (tid_typ)SYSERR) { g_jit.done = 1; return; }
+    ready(t, RESCHED_YES);
+    unsigned long guard = 0, budget = samples * (period_ms + 5) + 2000;
+    while (!g_jit.done && guard++ < budget) sleep(2);
+}
+
 /* HTTP server thread: accept one connection at a time, deliver the message to
  * the AIPL actor, answer with a tiny HTTP 200, then accept the next. */
 thread webactor_server(void)
@@ -2798,6 +2867,39 @@ thread webactor_server(void)
              *   solutions for first-queen columns [c0,c1) at board size n
              *   (single-core).  A Mac orchestrator hands each board a disjoint
              *   column range and sums the partials. */
+            /* /rtos-jitter?period_ms=P&samples=N&prio=PR&hogprio=HP — measure the
+             *   release jitter of a high-priority periodic task, idle and under a
+             *   low-priority CPU hog.  The P1 RTOS baseline (all figures in us). */
+            if (0 == strncmp(reqbuf, "GET /rtos-jitter", 16))
+            {
+                int P  = fb_q_int(reqbuf, "period_ms", 10); if (P < 1) P = 1; if (P > 1000) P = 1000;
+                int NS = fb_q_int(reqbuf, "samples", 200);   if (NS < 1) NS = 1; if (NS > 5000) NS = 5000;
+                int PR = fb_q_int(reqbuf, "prio", 55);       if (PR < 2) PR = 2; if (PR > 59) PR = 59;
+                int HP = fb_q_int(reqbuf, "hogprio", 10);    if (HP < 1) HP = 1; if (HP >= PR) HP = PR - 1;
+                /* Phase A: idle. */
+                jit_run_phase(P, NS, PR);
+                struct jit_stat a = g_jit;
+                /* Phase B: same, with a low-priority hog burning the CPU. */
+                g_jit_hog_run = 1;
+                tid_typ ht = create((void *)jit_hog, 8192, HP, "jit_hog", 0);
+                if (ht != (tid_typ)SYSERR) ready(ht, RESCHED_YES);
+                jit_run_phase(P, NS, PR);
+                struct jit_stat b = g_jit;
+                g_jit_hog_run = 0;
+                static char jr[640];
+                int bl = sprintf(jr + 128,
+                    "rtos-jitter period_ms=%d samples=%d prio=%d hogprio=%d target_us=%lu\r\n"
+                    "[idle]   mean_us=%lu min_us=%lu max_us=%lu max_jit_us=%lu late_us=%ld early_us=%ld misses=%lu\r\n"
+                    "[loaded] mean_us=%lu min_us=%lu max_us=%lu max_jit_us=%lu late_us=%ld early_us=%ld misses=%lu\r\n",
+                    P, NS, PR, HP, a.target_us,
+                    a.n ? a.sum_us / a.n : 0, a.min_us, a.max_us, a.max_abs_jit_us, a.max_late_us, a.min_early_us, a.misses,
+                    b.n ? b.sum_us / b.n : 0, b.min_us, b.max_us, b.max_abs_jit_us, b.max_late_us, b.min_early_us, b.misses);
+                int hl = sprintf(jr,
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n", bl);
+                memcpy(jr + hl, jr + 128, bl);
+                write(tcpdev, jr, hl + bl);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             if (0 == strncmp(reqbuf, "GET /nqpart", 11) ||
                 0 == strncmp(reqbuf, "POST /nqpart", 12))
             {
