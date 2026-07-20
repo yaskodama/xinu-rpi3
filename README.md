@@ -45,6 +45,14 @@ Measured on real hardware (`agree=yes`, i.e. 1-core and 4-core totals match):
 | primes (count)       | 274011 µs | 90826 µs | **3.01×** |
 | n-queens (n=12, block split) | 111313 µs | 52487 µs | 2.12× |
 
+```mermaid
+xychart-beta
+    title "Pi 3 (A53) — 4-core SMP speedup (x over 1 core)"
+    x-axis [dining, primes, "n-queens"]
+    y-axis "speedup" 0 --> 4.2
+    bar [3.99, 3.01, 2.12]
+```
+
 dining scales almost linearly (4 cores → 3.99×); n-queens is limited by the
 uneven per-column subtrees of a block split, the same effect the A72/A76 boards
 show.
@@ -66,6 +74,18 @@ all three to discover each other. Inspect convergence with `GET /manet`
   one problem as a **12-core (3×4) distributed computer**. Best 3-board result:
   N=14 (365 596 solutions) in **1 458 ms — 1.87× the fastest single board**, sum
   verified. See `mesh_report` for the capacity/granularity efficiency analysis.
+
+```mermaid
+xychart-beta
+    title "Distributed N-Queens (N=14, 365596 solutions) — wall-clock ms"
+    x-axis ["Pi4 4c", "Pi5 4c", "8-core", "9-core", "12-core"]
+    y-axis "ms (lower is better)" 0 --> 5400
+    bar [5216, 2722, 2088, 1585, 1458]
+```
+
+More cores → shorter wall-clock: 12 cores across the 3 boards solve N=14 in
+1 458 ms, 1.87× the fastest single board (heterogeneous ideal ≈ 1 172 ms, so
+~80% of the capacity ceiling; the rest is column-granularity loss).
 
 ## What works on this fork
 
