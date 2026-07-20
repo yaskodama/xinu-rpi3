@@ -2124,6 +2124,79 @@ static int wifi_ip_eq(const uint8_t *p) {
     return p[0]==wifi_ip[0] && p[1]==wifi_ip[1] && p[2]==wifi_ip[2] && p[3]==wifi_ip[3];
 }
 
+/* ================================================================== *
+ *  MANET HELLO (M14, rpi3 port) — periodic self-announce for auto      *
+ *  neighbour discovery on UDP/5000.  Mirrors the rpi4/rpi5 port so the  *
+ *  three boards populate their peer tables on the shared fixed-BSSID    *
+ *  cell without any driven traffic.                                     *
+ * ================================================================== */
+#define MN_PORT    5000
+#define MN_HELLO   6
+#define MN_HDR     16
+#define MN_MAXNBR  64
+static uint8_t   g_mn_node = 0;
+static uint8_t   g_mn_peers[MN_MAXNBR];
+static int       g_mn_peersn = 0;
+static uint32_t  g_mn_hello_tx = 0, g_mn_hello_last = 0, g_mn_rx = 0;
+static uint16_t  g_mn_seq = 0;
+
+static void mn_peer_seen(uint8_t src)
+{
+    int i;
+    if (!src || src == g_mn_node) return;
+    for (i = 0; i < g_mn_peersn; i++) if (g_mn_peers[i] == src) return;
+    if (g_mn_peersn < MN_MAXNBR) g_mn_peers[g_mn_peersn++] = src;
+}
+
+static void mn_bcast_hello(void)
+{
+    static uint8_t f[64];
+    int i, plen = MN_HDR, tot = 14 + 20 + 8 + plen;
+    uint8_t *ip, *udp, *p; uint16_t c;
+    for (i = 0; i < tot; i++) f[i] = 0;
+    for (i = 0; i < 6; i++) f[i] = 0xff;
+    for (i = 0; i < 6; i++) f[6 + i] = wifi_mac[i];
+    f[12] = 0x08; f[13] = 0x00;
+    ip = f + 14;
+    ip[0] = 0x45; ip[2] = (uint8_t)((20 + 8 + plen) >> 8); ip[3] = (uint8_t)(20 + 8 + plen);
+    ip[8] = 64; ip[9] = 17;
+    for (i = 0; i < 4; i++) ip[12 + i] = wifi_ip[i];
+    for (i = 0; i < 4; i++) ip[16 + i] = 255;
+    c = ip_cksum(ip, 20, 0); ip[10] = c >> 8; ip[11] = c & 0xFF;
+    udp = ip + 20;
+    udp[0] = (uint8_t)(MN_PORT >> 8); udp[1] = (uint8_t)MN_PORT;
+    udp[2] = (uint8_t)(MN_PORT >> 8); udp[3] = (uint8_t)MN_PORT;
+    udp[4] = (uint8_t)((8 + plen) >> 8); udp[5] = (uint8_t)(8 + plen);
+    p = udp + 8;
+    p[0] = MN_HELLO; p[1] = g_mn_node;
+    p[2] = (uint8_t)g_mn_seq; p[3] = (uint8_t)(g_mn_seq >> 8); g_mn_seq++;
+    wifi_data_tx(f, tot);
+    g_mn_hello_tx++;
+}
+
+/* Called from the wifi_net_service responder loop; self-rate-limits to ~2s. */
+static void mn_hello_tick(void)
+{
+    uint32_t now;
+    if (!wifi_have_ip) return;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    now = SYSTIMER_CLO;
+    if (g_mn_hello_last && (uint32_t)(now - g_mn_hello_last) < 2000000u) return;
+    g_mn_hello_last = now;
+    mn_bcast_hello();
+}
+
+void wifi_manet_get(int *node, unsigned *rx, unsigned *htx, int *np, unsigned char *peers)
+{
+    int i;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    if (node) *node = g_mn_node;
+    if (rx)   *rx   = g_mn_rx;
+    if (htx)  *htx  = g_mn_hello_tx;
+    if (np)   *np   = g_mn_peersn;
+    if (peers) for (i = 0; i < g_mn_peersn && i < MN_MAXNBR; i++) peers[i] = g_mn_peers[i];
+}
+
 /* Process one received 802.3 frame; reply to ARP-who-has-us and ICMP echo. */
 static int aodv_ip_in(uint8_t *e, int elen);   /* M13: AODV control / relay */
 
@@ -2166,6 +2239,15 @@ static void wifi_handle_frame(uint8_t *fr, int len, int doff)
         uint8_t *ip = e + 14;
         int ihl = (ip[0] & 0x0F) * 4;
         if (aodv_ip_in(e, elen)) return;                /* AODV control / relay */
+        if (ip[9] == 17) {                              /* UDP */
+            uint8_t *udp = ip + ihl;
+            int dport = (udp[2] << 8) | udp[3];
+            if (dport == MN_PORT && 14 + ihl + 8 + 2 <= elen) {  /* MANET HELLO */
+                uint8_t src = (udp + 8)[1];
+                if (src && src != g_mn_node) { g_mn_rx++; mn_peer_seen(src); }
+                return;
+            }
+        }
         if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {        /* ICMP to us */
             uint8_t *ic = ip + ihl;
             int iptot = (ip[2] << 8) | ip[3];
@@ -2202,6 +2284,7 @@ void wifi_net_service(void)
         wait(wl_io_sem);                       /* atomic read+reply vs client ops */
         n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
         if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        mn_hello_tick();                       /* periodic MANET HELLO (2s throttle) */
         signal(wl_io_sem);
         if (n <= 0) wifi_delay_us(2000);
     }

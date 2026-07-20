@@ -689,6 +689,33 @@ thread webactor_server(void)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /manet — MANET HELLO peer view (auto-discovered mesh neighbours). */
+            if (0 == strncmp(reqbuf, "GET /manet", 10))
+            {
+                extern void wifi_manet_get(int *, unsigned *, unsigned *,
+                                           int *, unsigned char *);
+                static char mresp[400];
+                int node = 0, np = 0, i, blen, hlen;
+                unsigned rx = 0, htx = 0;
+                unsigned char peers[64];
+                wifi_manet_get(&node, &rx, &htx, &np, peers);
+                blen = sprintf(mresp + 100,
+                               "manet node=%d rx=%d hello_tx=%d peers=%d ids=",
+                               node, (int)rx, (int)htx, np);
+                for (i = 0; i < np; i++)
+                    blen += sprintf(mresp + 100 + blen, " %d", peers[i]);
+                blen += sprintf(mresp + 100 + blen, "\n");
+                hlen = sprintf(mresp,
+                               "HTTP/1.0 200 OK\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Content-Length: %d\r\n\r\n", blen);
+                memcpy(mresp + hlen, mresp + 100, blen);
+                write(tcpdev, mresp, hlen + blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
             /* /api/actor-age?id=N — ms since the actor's last mailbox
              * activity (enq or deq).  Pi 4 equivalent: cc_actor_age. */
             if (0 == strncmp(reqbuf, "GET /api/actor-age", 18) ||
@@ -2540,6 +2567,27 @@ thread webactor_server(void)
                                rc, have, ip[0],ip[1],ip[2],ip[3], gw[0],gw[1],gw[2],gw[3], blen);
                 write(tcpdev, dhdr, hlen);
                 write(tcpdev, dbody, blen);
+                close(tcpdev);
+                web_cur_tcpdev = -1;
+                continue;
+            }
+            /* /api/wifi/disconnect — leave the current AP (DISASSOC) and clear
+             *   the IP/SSID state, so the on-screen WiFi mark + IP disappear. */
+            if (0 == strncmp(reqbuf, "GET /api/wifi/disconnect",  24) ||
+                0 == strncmp(reqbuf, "POST /api/wifi/disconnect", 25))
+            {
+                extern void wifi_disconnect(void);
+                extern int  wifi_connected(void);
+                static char xhdr[200], xbody[80];
+                int blen, hlen;
+                wifi_disconnect();
+                blen = sprintf(xbody, "disconnect ok, connected=%d (wifi mark + ip hidden)\r\n",
+                               wifi_connected());
+                hlen = sprintf(xhdr,
+                               "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                               "Content-Length: %d\r\n\r\n", blen);
+                write(tcpdev, xhdr, hlen);
+                write(tcpdev, xbody, blen);
                 close(tcpdev);
                 web_cur_tcpdev = -1;
                 continue;
