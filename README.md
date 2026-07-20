@@ -13,6 +13,60 @@ on real hardware.  Branch: `arm-rpi3-port`.
 actor table, AIPL console, shell (`xsh`), soft keyboard, and a rotating 3D
 wine-glass wireframe in the graphics window.*
 
+## Multi-core SMP & self-forming Wi-Fi mesh (2026 experiments)
+
+This fork is one of three sibling ports — **xinu-rpi3 (A53)**, **xinu-rpi4
+(A72)**, **xinu-rpi5 (A76)** — that were wired together into a single
+self-forming cluster and benchmarked. The results are written up in the
+companion `smp_report` (per-board SMP + D-cache) and `mesh_report` (the mesh +
+distributed benchmarks) PDFs.
+
+**4-core worker-pool SMP (newly ported here).** Upstream Xinu and this fork
+originally ran on core 0 only, parking cores 1–3 in `wfe`. This branch adds an
+**AArch32 worker pool** so all four Cortex-A53 cores compute:
+
+- `loader/platforms/arm-rpi3/start.S` releases the parked secondaries (they poll
+  `smp_release[]`, with an ARM-local mailbox-3 fallback) into a new `_smp_start`
+  trampoline (defensive HYP→SVC drop, per-core stack).
+- `system/platforms/arm-rpi3/mmu.c` `mmu_enable_secondary()` brings each worker's
+  MMU up on core 0's L1 table — **MMU + I-cache on, D-cache off**. Every core in
+  the same cache mode ⇒ the lock-free job mailbox is coherent with *no* cache
+  maintenance, and 1-core vs 4-core timings are fair.
+- `system/smp.c` / `include/smp.h`: online flags, a per-core job mailbox, a
+  bounded bring-up wait, and `smp_parallel_sum()` (core 0 runs chunk 0 inline and
+  takes over a stuck worker). `smp_init()` is lazy (first benchmark), so boot is
+  untouched — and it degrades safely to `cores_online = 1` if a core never comes up.
+
+Measured on real hardware (`agree=yes`, i.e. 1-core and 4-core totals match):
+
+| Benchmark            | 1-core | 4-core | Speedup |
+|----------------------|-------:|-------:|:-------:|
+| dining (philosophers)| 119627 µs | 29913 µs | **3.99×** |
+| primes (count)       | 274011 µs | 90826 µs | **3.01×** |
+| n-queens (n=12, block split) | 111313 µs | 52487 µs | 2.12× |
+
+dining scales almost linearly (4 cores → 3.99×); n-queens is limited by the
+uneven per-column subtrees of a block split, the same effect the A72/A76 boards
+show.
+
+**Self-forming Wi-Fi ad-hoc mesh.** All three boards join one IBSS cell with no
+access point: SSID `MANET`, channel 6, fixed BSSID `02:4d:41:4e:45:54`, static
+`10.0.0.n/24` (this board is **node 1 = 10.0.0.1**). A periodic **HELLO beacon**
+(UDP/5000, every 2 s) announces the node id; on receipt each board records the
+sender, so neighbour tables fill automatically — power-on and join is enough for
+all three to discover each other. Inspect convergence with `GET /manet`
+(`node`, `rx`, `hello_tx`, `peers ids=`).
+
+**Distributed benchmark routes.**
+- `GET /bench?kind=nqueens|dining|primes[&n=N][&cores=K]` — the SMP benchmark
+  above (1-core vs 4-core, µs, speedup, `agree=`).
+- `GET /nqpart?n=N&c0=A&c1=B` — count N-Queens solutions for first-queen columns
+  `[c0,c1)`, split across this board's 4 cores. A Mac orchestrator hands each
+  board a disjoint column range and sums the partials, so the whole mesh solves
+  one problem as a **12-core (3×4) distributed computer**. Best 3-board result:
+  N=14 (365 596 solutions) in **1 458 ms — 1.87× the fastest single board**, sum
+  verified. See `mesh_report` for the capacity/granularity efficiency analysis.
+
 ## What works on this fork
 
 Hardware bring-up:
