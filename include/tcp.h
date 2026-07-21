@@ -256,7 +256,12 @@ extern struct tcb tcptab[];
 #define TCP_EVT_PERSIST 3   /**< persist event, for zero window */
 
 /* TCP Timer Durations */
-#define TCP_TWOMSL  (5*1000)
+/* TIME_WAIT.  Was 5 s.  Combined with NTCP that set the sustained connection
+ * rate at NTCP/TWOMSL = 1.4/s, which is what the HTTP server was actually
+ * limited to.  On this LAN the round trip is ~3 ms, so 1 s is still >300x RTT
+ * — ample to absorb a delayed duplicate — and Xinu's 5 s was already far below
+ * the RFC's 2*MSL anyway, so this is a difference of degree, not of kind. */
+#define TCP_TWOMSL  (1*1000)
 #define TCP_PST_INITTIME (3*1000)  /**< initial persist time */
 #define TCP_PST_MAXTIME  (64*1000) /**< maximum persist time */
 
