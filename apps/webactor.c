@@ -103,6 +103,26 @@ extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 #define WEBACTOR_MASK "255.255.255.0"
 #define WEBACTOR_GW   "192.168.3.1"
 
+/* Listener pool.
+ *
+ * The server used to run ONE thread parked in open(..., TCP_PASSIVE).  While
+ * it was serving a request no socket was listening, so a SYN arriving in that
+ * window found no matching TCB and tcpSendRst answered with a RST — the client
+ * saw the connection refused outright.  Measured against 200 requests at 10 ms
+ * intervals: a flat 14% failure rate, and shortening the half-open retransmit
+ * leash did not move it at all (28/200 failures before AND after), which is
+ * what identified the cause.
+ *
+ * The concurrency that was missing is in ACCEPTING, not in processing: the
+ * median service time is 15 ms, so handling requests one at a time is fine.
+ * The pool parks WEB_NLISTEN threads in passive open and a mutex serialises
+ * everything from "connection accepted" onward, which keeps the 1.5 MB reqbuf
+ * single-owner — giving each listener its own copy would cost 3 x 1.5 MB for
+ * no benefit. */
+#define WEB_NLISTEN 3
+static short     web_pool_dev[WEB_NLISTEN];   /* dev each listener holds */
+static tid_typ   web_pool_tid[WEB_NLISTEN];
+static semaphore web_mu = SYSERR;             /* guards reqbuf + handler statics */
 static int     web_receiver_id = -1;
 static tid_typ web_server_tid   = BADTID;  /* running server thread, or BADTID */
 static short   web_cur_tcpdev   = -1;      /* TCP dev the server is parked on  */
@@ -494,7 +514,7 @@ static void jit_run_phase(unsigned long period_ms, unsigned long samples, int pr
 
 /* HTTP server thread: accept one connection at a time, deliver the message to
  * the AIPL actor, answer with a tiny HTTP 200, then accept the next. */
-thread webactor_server(void)
+thread webactor_server(int slot)
 {
     struct netif   *interface;
     struct netaddr *host;
@@ -505,6 +525,7 @@ thread webactor_server(void)
     static char reqbuf[WEB_BUFSZ];
     char   msg[256];
     int    n;
+    int    holding = 0;             /* this listener currently holds web_mu */
     /* The HDMI framebuffer is owned by the gwm window manager (gwm_main,
      * system/main.c): it renders the Info / AIPL console / Soft keyboard /
      * Actors / interactive Shell windows.  We no longer hand-draw a desktop
@@ -528,21 +549,33 @@ thread webactor_server(void)
 
     while (TRUE)
     {
+        /* Released here rather than at each of the ~80 exits in the body
+         * below: every one of them reaches the top of this loop. */
+        if (holding) { signal(web_mu); holding = 0; }
+
         tcpdev = tcpAlloc();
         if (SYSERR == (short)tcpdev)
         {
             sleep(100);
             continue;
         }
-        web_cur_tcpdev = (short)tcpdev;   /* so webactor_stop() can free it */
-        /* TCP_PASSIVE blocks until a client connects */
+        web_pool_dev[slot] = (short)tcpdev;   /* so webactor_stop() can free it */
+        /* TCP_PASSIVE blocks until a client connects.  Entered WITHOUT the
+         * mutex so the other listeners stay parked and a SYN always finds a
+         * TCB — that is the whole point of the pool. */
         if (open(tcpdev, host, NULL, WEBACTOR_PORT, NULL, TCP_PASSIVE) < 0)
         {
             close(tcpdev);
-            web_cur_tcpdev = -1;
+            web_pool_dev[slot] = -1;
             sleep(100);
             continue;
         }
+
+        /* Connection accepted.  Everything below touches the shared reqbuf
+         * and the handler statics, so serialise from here. */
+        wait(web_mu);
+        holding = 1;
+        web_cur_tcpdev = (short)tcpdev;   /* the dev being served right now */
 
         /* Read the whole HTTP request.  Xinu's tcpRead() blocks until it has
          * the full requested length (or the peer closes) — see the
@@ -3554,15 +3587,37 @@ thread webactor_server(void)
  * server is running. */
 void webactor_stop(void)
 {
+    int i;
+
     if (BADTID != web_server_tid)
     {
         kill(web_server_tid);
         web_server_tid = BADTID;
     }
+    for (i = 0; i < WEB_NLISTEN; i++)
+    {
+        if (BADTID != web_pool_tid[i])
+        {
+            kill(web_pool_tid[i]);
+            web_pool_tid[i] = BADTID;
+        }
+        if (web_pool_dev[i] >= 0)
+        {
+            close(web_pool_dev[i]);
+            web_pool_dev[i] = -1;
+        }
+    }
     if (web_cur_tcpdev >= 0)
     {
         close(web_cur_tcpdev);
         web_cur_tcpdev = -1;
+    }
+    /* A listener killed while holding the mutex would leave it locked for
+     * ever; webactor_start() creates a fresh one. */
+    if (SYSERR != web_mu)
+    {
+        semfree(web_mu);
+        web_mu = SYSERR;
     }
 }
 
@@ -3575,13 +3630,32 @@ int webactor_start(void)
 
     webactor_stop();                /* drop any previous (possibly stuck) server */
     web_receiver_id = abcl_web_init();
-    tid = create((void *)webactor_server, 8192, INITPRIO, "webactor", 0);
-    if (SYSERR == tid)
     {
-        return SYSERR;
+        int i;
+
+        web_mu = semcreate(1);
+        if (SYSERR == web_mu)
+        {
+            return SYSERR;
+        }
+        for (i = 0; i < WEB_NLISTEN; i++)
+        {
+            web_pool_dev[i] = -1;
+            web_pool_tid[i] = BADTID;
+        }
+        for (i = 0; i < WEB_NLISTEN; i++)
+        {
+            tid = create((void *)webactor_server, 8192, INITPRIO, "webactor", 1, i);
+            if (SYSERR == tid)
+            {
+                if (0 == i) return SYSERR;   /* not even one listener */
+                break;                       /* fewer listeners, still serves */
+            }
+            web_pool_tid[i] = tid;
+            ready(tid, RESCHED_NO);
+        }
     }
-    web_server_tid = tid;
-    ready(tid, RESCHED_NO);
+    web_server_tid = BADTID;        /* the pool replaces the single thread */
     return web_receiver_id;
 }
 
