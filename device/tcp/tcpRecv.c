@@ -37,6 +37,29 @@ int tcpRecv(struct packet *pkt, struct netaddr *src, struct netaddr *dst)
         return OK;
     }
 
+    /* Validate the data offset against the frame we actually received.
+     *
+     * `offset` is attacker-controlled and holds a 4-bit header length in
+     * words, so offset2octets() yields 0..60 while a header-only segment is
+     * only 20 bytes on the wire.  Nothing checked it, and tcpSeglen() is a
+     * bare `len - offset2octets(...)` evaluated in ushort: an oversized
+     * offset makes the segment length wrap to ~64 KB, and the receive path
+     * then copies that much from `tcp->data`, which itself points past the
+     * end of the frame.  The only backstop was the window clamp against
+     * TCP_IBLEN (65528), i.e. none.  tcpRecvOpts() derives its endopt from
+     * the same field, so validating here covers both.
+     *
+     * Checked before the host-order conversion below; `offset` is a single
+     * byte and needs none. */
+    if ((tcplen < TCP_HDR_LEN)
+        || (offset2octets(tcp->offset) < TCP_HDR_LEN)
+        || (offset2octets(tcp->offset) > tcplen))
+    {
+        netFreebuf(pkt);
+        TCP_TRACE("Bad data offset");
+        return OK;
+    }
+
     /* Convert TCP header fields to host order */
     tcp->srcpt = net2hs(tcp->srcpt);
     tcp->dstpt = net2hs(tcp->dstpt);

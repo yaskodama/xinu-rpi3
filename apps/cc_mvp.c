@@ -80,7 +80,9 @@ static int cc_b_actor_age(int id)
 static int cc_b_now_ms(void)
 {
     extern unsigned long clkticks;
-    return (int)(clkticks * 10);
+    /* clkticks is a within-the-second counter at 1000 Hz, not a 100 Hz
+     * millisecond counter — see abcl_now_ms() in apps/abcl_program.c. */
+    { extern unsigned long abcl_now_ms(void); return (int)abcl_now_ms(); }
 }
 
 struct sym { const char *name; void *fn; };

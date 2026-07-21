@@ -4,6 +4,21 @@
 #include <thread.h>
 #include <semaphore.h>
 #include <clock.h>     /* P3: clkticks for throughput markers */
+
+/* Monotonic milliseconds.
+ *
+ * `clkticks` is NOT a millisecond counter and is NOT monotonic: clkhandler()
+ * resets it to 0 once it reaches CLKTICKS_PER_SEC and bumps `clktime`
+ * (system/clkhandler.c), so it only ever counts within the current second.
+ * This file used to read it raw and multiply by 10 on the belief that the
+ * clock ran at 100 Hz.  It runs at 1000 Hz (include/clock.h), so every
+ * elapsed time computed here was wrong by 10x AND wrapped to a negative or
+ * absurd value at each second boundary.  Every benchmark number taken from
+ * this runtime inherited both faults. */
+unsigned long abcl_now_ms(void)
+{
+    return (unsigned long)clktime * 1000UL + (unsigned long)clkticks;
+}
 #include <stdio.h>
 #include <string.h>
 #include <rcu.h>       /* RCU: lock-free actor-registry reads (concurrency_safety=rcu) */
@@ -172,9 +187,9 @@ typedef struct {
   /* Activity timestamps for the GC sweep — both stamped on each enq/deq
    * so a "zombie" actor (no recent mailbox activity AND no progress
    * processing what's queued) shows up as old by either metric. */
-  volatile unsigned long last_enq_ticks;
-  volatile unsigned long last_deq_ticks;
-  unsigned long          birth_ticks;
+  volatile unsigned long last_enq_ms;
+  volatile unsigned long last_deq_ms;
+  unsigned long          birth_ticks;   /* abcl_now_ms() at spawn */
   volatile int           protected_from_gc;
 } object_t;
 
@@ -300,15 +315,14 @@ int abcl_object_dead(int obj_id) {
 }
 
 /* GC support: age = ms since the more recent of last_enq / last_deq.
- * On the 100 Hz Xinu clock, each clkticks unit is 10 ms.  Returns -1
- * for an invalid id. */
+ * Returns -1 for an invalid id. */
 long abcl_object_age_ms(int obj_id) {
   if (obj_id < 0 || obj_id >= rcu_n_objects()) return -1;
-  unsigned long now = clkticks;
-  unsigned long e = objects[obj_id].last_enq_ticks;
-  unsigned long d = objects[obj_id].last_deq_ticks;
+  unsigned long now = abcl_now_ms();
+  unsigned long e = objects[obj_id].last_enq_ms;
+  unsigned long d = objects[obj_id].last_deq_ms;
   unsigned long last = (e > d) ? e : d;
-  return (long)((now - last) * 10);
+  return (long)(now - last);
 }
 
 void abcl_object_protect(int obj_id, int on) {
@@ -484,7 +498,7 @@ void abcl_enqueue(int sender, int receiver, const char *method,
   /* Stamp activity timestamp early (under the same critical section is
    * not strictly needed since both clkticks read + the field are
    * single-word writes — the GC sweep tolerates a one-tick fuzz). */
-  objects[receiver].last_enq_ticks = clkticks;
+  objects[receiver].last_enq_ms = abcl_now_ms();
   mailbox_t *mb = &objects[receiver].mbox;
 #ifdef _XINU_PLATFORM_ARM_RPI3_
   /* Pi3 (Cortex-A53 with MMU / L1 D-cache OFF => strongly-ordered memory):
@@ -710,7 +724,7 @@ static int g_gc_actor = -1;
 static long g_rate_tokens       = 100;   /* current bucket level */
 static long g_rate_capacity     = 100;   /* burst cap */
 static long g_rate_per_sec      = 50;    /* refill rate */
-static long g_rate_last_refill  = 0;     /* clkticks at last refill */
+static long g_rate_last_refill  = 0;     /* abcl_now_ms() at last refill */
 static long g_rate_throttled    = 0;     /* lifetime 429-from-rate count */
 
 /* Server-side task timeout.  Collector.tick scans the task table and
@@ -784,7 +798,7 @@ static void Philosopher_init(int self_id, int sender_id, value_t* args, int n_ar
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_state] = mk_int((long)(0L));
   objects[self_id].fields[F_Philosopher_done_to] = mk_obj(0);
-  objects[self_id].fields[F_Philosopher_t_start] = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_Philosopher_t_start] = mk_int((long)abcl_now_ms());
   enqueue(self_id, self_id, "try_eat", 0, NULL);
 }
 
@@ -805,7 +819,7 @@ static void Philosopher_init_phil(int self_id, int sender_id,
   objects[self_id].fields[F_Philosopher_meal_idx] = mk_int(0L);
   objects[self_id].fields[F_Philosopher_state]    = mk_int(0L);
   objects[self_id].fields[F_Philosopher_done_to]  = mk_obj(done_to);
-  objects[self_id].fields[F_Philosopher_t_start]  = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_Philosopher_t_start]  = mk_int((long)abcl_now_ms());
   enqueue(self_id, self_id, "try_eat", 0, NULL);
 }
 
@@ -817,7 +831,7 @@ static void Philosopher_try_eat(int self_id, int sender_id, value_t* args, int n
     int orch = objects[self_id].fields[F_Philosopher_done_to].obj_id;
     if (orch > 0) {
       long t_start = objects[self_id].fields[F_Philosopher_t_start].i;
-      long elapsed = (long)(clkticks * 10) - t_start;
+      long elapsed = (long)abcl_now_ms() - t_start;
       enqueue(self_id, orch, "phil_done", 2,
               (value_t[]){ mk_int((long)_pid), mk_int(elapsed) });
     } else {
@@ -972,7 +986,7 @@ enum { F_Disp_n, F_Disp_w0, F_Disp_w1, F_Disp_w2, F_Disp_w3,
 typedef struct {
   int  task_id;        /* monotonic from dispatcher; 0 = empty slot */
   int  worker_obj;     /* dispatched-to worker obj_id, -1 if pending */
-  long submit_ms;      /* clkticks*10 when dispatched */
+  long submit_ms;      /* abcl_now_ms() when dispatched */
   long done_ms;        /* 0 while pending */
   long result;
   char kind;           /* 's' = sleep compute, 'j' = JIT compute */
@@ -1006,7 +1020,7 @@ static lb_task_t* lb_task_alloc(int task_id, char kind, int param,
   lb_tasks_next = (lb_tasks_next + 1) % LB_TASKS_MAX;
   t->task_id    = task_id;
   t->worker_obj = worker_obj;
-  t->submit_ms  = (long)(clkticks * 10);
+  t->submit_ms  = (long)abcl_now_ms();
   t->done_ms    = 0;
   t->result     = 0;
   t->kind       = kind;
@@ -1145,7 +1159,7 @@ static void Dispatcher_done(int self_id, int sender_id,
   lb_task_t *t = lb_task_lookup((int)task_id);
   long elapsed = 0;
   if (NULL != t) {
-    t->done_ms = (long)(clkticks * 10);
+    t->done_ms = (long)abcl_now_ms();
     t->result  = result;
     /* Don't overwrite a CANCELLED state — the worker explicitly
      * acknowledged the cancel.  Otherwise mark DONE. */
@@ -1593,9 +1607,9 @@ static void Worker_compute_nq(int self_id, int sender_id,
   long idx       = objects[self_id].fields[F_Worker_my_idx].i;
   int  disp      = objects[self_id].fields[F_Worker_dispatcher].obj_id;
 
-  long t0 = (long)(clkticks * 10);
+  long t0 = (long)abcl_now_ms();
   long result = (long)abcl_nq_count_partial((int)n, (int)first_col);
-  long elapsed = (long)(clkticks * 10) - t0;
+  long elapsed = (long)abcl_now_ms() - t0;
 
   objects[self_id].fields[F_Worker_last_n]      = mk_int(n);
   objects[self_id].fields[F_Worker_last_result] = mk_int(result);
@@ -1741,17 +1755,18 @@ int abcl_loadbal_hash_key(const char *s, int len) {
   return (int)(h & 0x7FFFFFFFu);
 }
 
-/* Token-bucket rate limit.  Refills based on elapsed clkticks (100 Hz)
+/* Token-bucket rate limit.  Refills based on elapsed milliseconds
  * since the last call; bucket caps at capacity.  Returns 1 if a token
  * was deducted (caller may proceed) or 0 if throttled.  Bypassed
  * entirely when caller passes priority="high" — see webactor's /submit
  * route.  All state in file-scope statics above. */
 int abcl_loadbal_rate_check(void) {
-  long now = (long)clkticks;
+  long now = (long)abcl_now_ms();
   long elapsed = now - g_rate_last_refill;
   if (elapsed > 0) {
-    /* refill = (elapsed_ticks * per_sec) / 100  [ticks-per-second] */
-    long refill = (elapsed * g_rate_per_sec) / 100;
+    /* refill = (elapsed_ms * per_sec) / 1000.  Was /100, from the same
+     * 100 Hz belief, so the bucket refilled 10x too fast. */
+    long refill = (elapsed * g_rate_per_sec) / 1000;
     if (refill > 0) {
       g_rate_tokens += refill;
       if (g_rate_tokens > g_rate_capacity) g_rate_tokens = g_rate_capacity;
@@ -1791,7 +1806,7 @@ void abcl_loadbal_timeout_set(int ms) {
  * the number freshly expired this call (for kprintf in caller). */
 int abcl_loadbal_timeout_scan(void) {
   if (g_task_timeout_ms <= 0) return 0;
-  long now_ms = (long)(clkticks * 10);
+  long now_ms = (long)abcl_now_ms();
   int  expired = 0;
   int  i;
   for (i = 0; i < LB_TASKS_MAX; i++) {
@@ -1982,7 +1997,7 @@ static void Collector_do_sweep(int self_id) {
   if (threshold < 1000L) threshold = 1000L;     /* sanity floor */
   int scanned = 0;
   int killed  = abcl_gc_sweep(threshold, 0, &scanned);
-  objects[self_id].fields[F_GC_last_sweep_ticks] = mk_int((long)clkticks);
+  objects[self_id].fields[F_GC_last_sweep_ticks] = mk_int((long)abcl_now_ms());
   objects[self_id].fields[F_GC_sweep_count] =
     mk_int(objects[self_id].fields[F_GC_sweep_count].i + 1);
   objects[self_id].fields[F_GC_last_swept_n]  = mk_int((long)killed);
@@ -2012,11 +2027,15 @@ static void Collector_tick(int self_id, int sender_id,
       signal(print_mu);
     }
   }
-  long now_ticks = (long)clkticks;
-  long last      = objects[self_id].fields[F_GC_last_sweep_ticks].i;
-  long period_ticks = objects[self_id].fields[F_GC_period_ms].i / 10;
-  if (period_ticks <= 0) period_ticks = 500;     /* 5 s floor */
-  if (now_ticks - last < period_ticks) return;   /* not yet */
+  /* All three quantities are milliseconds now.  The period used to be
+   * divided by 10 to convert ms -> "100 Hz ticks", which combined with the
+   * non-monotonic clkticks made the sweep fire either constantly or never
+   * depending on where in the second it was called. */
+  long now_ms = (long)abcl_now_ms();
+  long last   = objects[self_id].fields[F_GC_last_sweep_ticks].i;
+  long period_ms = objects[self_id].fields[F_GC_period_ms].i;
+  if (period_ms <= 0) period_ms = 5000;          /* 5 s floor */
+  if (now_ms - last < period_ms) return;         /* not yet */
   Collector_do_sweep(self_id);
 }
 
@@ -2103,7 +2122,7 @@ int abcl_gc_actor_stats(char *buf, int cap) {
   if (cap < 300) return 0;
   if (g_gc_actor < 0) return sprintf(buf, "gc-actor not initialized\n");
   int g = g_gc_actor;
-  long now_ms  = (long)(clkticks * 10);
+  long now_ms  = (long)abcl_now_ms();
   long last_ms = objects[g].fields[F_GC_last_sweep_ticks].i * 10;
   long since   = last_ms > 0 ? now_ms - last_ms : -1L;
   return sprintf(buf,
@@ -2350,7 +2369,7 @@ static void PhilCM_init_phil(int self_id, int sender_id,
   objects[self_id].fields[F_PhilCM_meals]    = mk_int(meals);
   objects[self_id].fields[F_PhilCM_meal_idx] = mk_int(0L);
   objects[self_id].fields[F_PhilCM_done_to]  = mk_obj(done_to);
-  objects[self_id].fields[F_PhilCM_t_start]  = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_PhilCM_t_start]  = mk_int((long)abcl_now_ms());
   objects[self_id].fields[F_PhilCM_req_lo]   = mk_int(0L);
   objects[self_id].fields[F_PhilCM_req_hi]   = mk_int(0L);
   abcl_enqueue(self_id, self_id, "try_eat", 0, NULL);
@@ -2365,7 +2384,7 @@ static void PhilCM_try_eat(int self_id, int sender_id,
   if (meals <= 0L) {
     int orch     = objects[self_id].fields[F_PhilCM_done_to].obj_id;
     long t_start = objects[self_id].fields[F_PhilCM_t_start].i;
-    long elapsed = (long)(clkticks * 10) - t_start;
+    long elapsed = (long)abcl_now_ms() - t_start;
     long my_id   = objects[self_id].fields[F_PhilCM_my_id].i;
     if (elapsed < 0) elapsed = 0;
     if (orch > 0) {
@@ -2495,7 +2514,7 @@ static void DiningBench_run(int self_id, int sender_id,
   objects[self_id].fields[F_DB_meals]    = mk_int(meals);
   objects[self_id].fields[F_DB_n_done]   = mk_int(0L);
   objects[self_id].fields[F_DB_max_phil] = mk_int(0L);
-  objects[self_id].fields[F_DB_t_start]  = mk_int((long)(clkticks * 10));
+  objects[self_id].fields[F_DB_t_start]  = mk_int((long)abcl_now_ms());
   objects[self_id].fields[F_DB_t_end]    = mk_int(0L);
 
   wait(print_mu);
@@ -2578,7 +2597,7 @@ static void DiningBench_phil_done(int self_id, int sender_id,
     dining_start_phil(self_id, (int)cur);
   }
   if (n_done == 5L) {
-    long t_end = (long)(clkticks * 10);
+    long t_end = (long)abcl_now_ms();
     objects[self_id].fields[F_DB_t_end] = mk_int(t_end);
     wait(print_mu);
     kprintf("[dining] mode=%ld all done in %ld ms (max_phil=%ld)\r\n",
@@ -2626,7 +2645,7 @@ int abcl_dining_status(char *buf, int cap) {
   long t_start  = objects[d].fields[F_DB_t_start].i;
   long t_end    = objects[d].fields[F_DB_t_end].i;
   long elapsed  = (t_end > 0) ? (t_end - t_start)
-                               : ((long)(clkticks * 10) - t_start);
+                               : ((long)abcl_now_ms() - t_start);
   /* Race guard: a concurrent run_bench could update t_start AFTER we
    * read clkticks; clamp to 0 instead of confusing the Mac poller
    * with negative numbers. */
@@ -3059,9 +3078,9 @@ static int alloc_obj(int class_id, int n_args, value_t* args) {
   mailbox_init(&objects[id].mbox);
   objects[id].started = 0;
   objects[id].dead = 0;
-  objects[id].birth_ticks    = clkticks;
-  objects[id].last_enq_ticks = clkticks;
-  objects[id].last_deq_ticks = clkticks;
+  objects[id].birth_ticks    = abcl_now_ms();
+  objects[id].last_enq_ms = abcl_now_ms();
+  objects[id].last_deq_ms = abcl_now_ms();
   objects[id].protected_from_gc = 0;
   /* PUBLISH: the barrier guarantees every store above is visible before the
    * new count, so a reader that observes id+1 also sees a complete slot. */
@@ -3152,7 +3171,7 @@ thread abcl_actor_main(int self_id) {
     __atomic_store_n(&mb->deq, pos + 1, __ATOMIC_RELEASE);
 #endif
     /* Stamp dequeue activity (GC sweep "age" = now - max(last_enq, last_deq)). */
-    objects[self_id].last_deq_ticks = clkticks;
+    objects[self_id].last_deq_ms = abcl_now_ms();
     abcl_log_first_recv(self_id, m.method);
     wait(counter_mu);
     idx = ++messages_processed;
