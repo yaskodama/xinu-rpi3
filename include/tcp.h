@@ -262,6 +262,11 @@ extern struct tcb tcptab[];
 
 /* TCP Retransmit */
 #define TCP_RXT_MAXCOUNT 10         /** maximum number of retransmissions */
+#define TCP_RXT_SYNMAXCOUNT 4       /**< ... but only 4 while still in
+                                      *  SYN_RCVD (~7.5 s): a half-open
+                                      *  connection has no data to protect and
+                                      *  holds the single-accept HTTP server
+                                      *  hostage — see tcpSendRxt.c */
 #define TCP_RXT_INITTIME (500)  /**< initial retransmission time */
 #define TCP_RXT_MINTIME  (100)    /**< minimum retransmission time */
 #define TCP_RXT_MAXTIME  (32*1000) /**< maximum retransmission time */

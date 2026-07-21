@@ -40,12 +40,25 @@ int tcpSendRxt(struct tcb *tcbptr)
     }
 
     /* Increment the count of retransmissions and abort connection 
-     * if maximum numer of retransmissions is reached */
+     * if maximum numer of retransmissions is reached.
+     *
+     * A half-open connection gets a much shorter leash than an established
+     * one.  In SYN_RCVD there is no data to protect — the peer never
+     * completed the handshake — yet the full schedule
+     * (0.5+1+2+4+8+16+32+32+32+32 s) holds the TCB for ~2.7 minutes.  The
+     * HTTP server (apps/webactor.c) parks a single thread in
+     * open(..., TCP_PASSIVE), so one unacknowledged SYN takes the whole
+     * server down for that long, repeatably.  Four attempts (~7.5 s) is
+     * ample for a peer that actually intends to connect. */
     tcbptr->rxtcount++;
-    if (tcbptr->rxtcount > TCP_RXT_MAXCOUNT)
     {
-        tcpFree(tcbptr);
-        return 0;
+        int maxcount = (TCP_SYNRECV == tcbptr->state)
+                     ? TCP_RXT_SYNMAXCOUNT : TCP_RXT_MAXCOUNT;
+        if (tcbptr->rxtcount > maxcount)
+        {
+            tcpFree(tcbptr);
+            return 0;
+        }
     }
 
     /* Reschedule retransmit event */
