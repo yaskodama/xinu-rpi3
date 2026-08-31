@@ -795,6 +795,56 @@ thread webactor_server(int slot)
                 web_cur_tcpdev = -1;
                 continue;
             }
+            /* /api/x/<path>?method=&args=  — web_expose で公開したアクタを叩く。
+             * /api/routes は公開済みの一覧。ホスト VM (aice-avm server.ml) と同じ形。 */
+            if (0 == strncmp(reqbuf, "GET /api/routes", 15) ||
+                0 == strncmp(reqbuf, "POST /api/routes", 16))
+            {
+                extern int vm_web_list(char *, int);
+                static char rl[900];
+                int clen = vm_web_list(rl + 120, (int)sizeof rl - 120 - 1);
+                int hlen = sprintf(rl, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                       "Content-Length: %d\r\n\r\n", clen);
+                memcpy(rl + hlen, rl + 120, clen);
+                write(tcpdev, rl, hlen + clen);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+            if (0 == strncmp(reqbuf, "GET /api/x/", 11) ||
+                0 == strncmp(reqbuf, "POST /api/x/", 12))
+            {
+                extern int vm_web_call(const char *, const char *, const char *, char *, int);
+                static char wpath[48], wmeth[32], warg[96], wbuf[600];
+                const char *url = strchr(reqbuf, ' ');
+                const char *p = (NULL != url) ? url + 1 : reqbuf;
+                int o = 0, clen, hlen, ok;
+                p += 6;                       /* "/api/x" を落とす */
+                wpath[o++] = '/';
+                if (*p == '/') p++;
+                while (*p && *p != '?' && *p != ' ' && o < (int)sizeof wpath - 1) wpath[o++] = *p++;
+                wpath[o] = 0;
+                /* method= と args= を取り出す（URL デコードはしない簡易版） */
+                wmeth[0] = 0; warg[0] = 0;
+                { const char *q = strstr(reqbuf, "method="); int k = 0;
+                  if (q) { q += 7; while (*q && *q != '&' && *q != ' ' && k < (int)sizeof wmeth - 1)
+                                       wmeth[k++] = *q++; }
+                  wmeth[k] = 0; }
+                { const char *q = strstr(reqbuf, "args="); int k = 0;
+                  if (q) { q += 5; while (*q && *q != '&' && *q != ' ' && k < (int)sizeof warg - 1)
+                                       warg[k++] = (*q == '+') ? (q++, ' ') : *q++; }
+                  warg[k] = 0; }
+                if (wmeth[0] == 0) { wmeth[0]='s'; wmeth[1]='a'; wmeth[2]='y'; wmeth[3]=0; }
+                ok = vm_web_call(wpath, wmeth, warg, wbuf + 200, (int)sizeof wbuf - 200 - 2);
+                if (!ok) clen = sprintf(wbuf + 200, "no route %s\n", wpath);
+                else { clen = 0; while (wbuf[200 + clen]) clen++;
+                       wbuf[200 + clen] = '\n'; clen++; wbuf[200 + clen] = 0; }
+                hlen = sprintf(wbuf, "HTTP/1.0 %s\r\nContent-Type: text/plain\r\n"
+                                     "Content-Length: %d\r\n\r\n",
+                               ok ? "200 OK" : "404 Not Found", clen);
+                memcpy(wbuf + hlen, wbuf + 200, clen);
+                write(tcpdev, wbuf, hlen + clen);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
+
             /* /shell?cmd=<urlenc> — remote login: run a Xinu shell command
              * and return its console output (e.g. /shell?cmd=ps).  Mirrors the
              * Pi-4 /shell route.  Same trust model as /compile (LAN, no auth). */

@@ -491,8 +491,23 @@ void abcl_log_first_recv(int self_id, const char *method) {
    pairs (GCC __atomic primitives on ARMv6+).  The trailing signal() on
    `items` is the only kernel call; it is safe to invoke from an ISR
    because Xinu's signal() handles its own irq mask. */
+/* web_expose 用（実体は下の VM 節。ここでは宣言だけ） */
+#define VM_WEB_SINK (-2)
+static char vm_web_reply[160];
+static int  vm_web_have = 0;
+static void vm_fmt_val(char *out, int cap, long v);
+
 void abcl_enqueue(int sender, int receiver, const char *method,
                   int n_args, value_t *args) {
+  if (receiver == VM_WEB_SINK) {
+    /* HTTP から呼んだアクタの返信。値を捕まえて待っている側へ渡す */
+    if (method && method[0]=='r' && method[1]=='e' && method[2]=='p'
+        && method[3]=='l' && method[4]=='y' && method[5]==0 && n_args > 0) {
+      vm_fmt_val(vm_web_reply, sizeof vm_web_reply, args[0].i);
+      vm_web_have = 1;
+    }
+    return;
+  }
   if (receiver < 0 || receiver >= n_objects) return;
   abcl_log_first_send(receiver, method);
   /* Stamp activity timestamp early (under the same critical section is
@@ -2920,6 +2935,65 @@ static void vm_fmt_val(char *out, int cap, long v)
     sprintf(out, "%ld", v);
 }
 
+
+/* ===== web_listen / web_expose =====
+ * HTTP のパスをアクタに結びつける。呼び出しの送り主を VM_WEB_SINK(-2) に
+ * しておき、そこへ来た reply を横取りして HTTP の応答にする。
+ * ホスト VM (aice-avm の avm.ml) と同じ約束。 */
+#define VM_WEB_MAX  8
+static char vm_web_path[VM_WEB_MAX][40];
+static int  vm_web_actor[VM_WEB_MAX];
+static int  vm_web_n = 0, vm_web_port = 0;
+
+/* HTTP から来た文字列を VM の値にする（ヒープに積む） */
+static long vm_intern(const char *s)
+{
+    int n = 0, off, i;
+    while (s[n]) n++;
+    if (vm_heap_n >= VM_HEAP_STR_MAX || vm_heap_used + n + 1 > VM_HEAP_BUF_MAX)
+        return VM_STR_TAG | VM_STR_HEAP | (vm_heap_n > 0 ? vm_heap_n - 1 : 0);
+    off = vm_heap_used;
+    for (i = 0; i < n; i++) vm_heapbuf[off + i] = s[i];
+    vm_heapbuf[off + n] = 0;
+    vm_heap_off[vm_heap_n] = off;
+    vm_heap_used += n + 1;
+    return VM_STR_TAG | VM_STR_HEAP | (vm_heap_n++);
+}
+
+/* 公開したパスへ HTTP から 1 回呼ぶ。返信が来るまで少し待つ。
+ * webactor.c から呼ぶ。戻り値: 1=経路あり / 0=経路なし */
+int vm_web_call(const char *path, const char *meth, const char *arg, char *out, int cap)
+{
+    extern syscall sleep(unsigned);
+    int i, k = -1, n;
+    for (i = 0; i < vm_web_n; i++) {
+        const char *a = vm_web_path[i], *b = path; int same = 1;
+        while (*a || *b) { if (*a != *b) { same = 0; break; } a++; b++; }
+        if (same) { k = i; break; }
+    }
+    if (k < 0) return 0;
+    vm_web_have = 0; vm_web_reply[0] = 0;
+    { value_t va[1]; int na = 0;
+      if (arg && arg[0]) { va[0].tag = V_INT; va[0].i = vm_intern(arg);
+                           va[0].f = 0; va[0].s = 0; va[0].obj_id = 0; na = 1; }
+      abcl_enqueue(VM_WEB_SINK, vm_web_actor[k], meth, na, va); }
+    for (n = 0; n < 40 && !vm_web_have; n++) sleep(50);   /* 最大 2 秒 */
+    { int p = 0; const char *s = vm_web_reply;
+      while (s[p] && p < cap - 1) { out[p] = s[p]; p++; }
+      out[p] = 0; }
+    return 1;
+}
+
+/* 公開済みの経路の一覧 */
+int vm_web_list(char *out, int cap)
+{
+    int i, p = 0;
+    for (i = 0; i < vm_web_n && p < cap - 60; i++)
+        p += sprintf(out + p, "%s -> a%d\r\n", vm_web_path[i], vm_web_actor[i]);
+    if (p == 0 && cap > 20) p = sprintf(out, "(no routes)\r\n");
+    out[p] = 0; return p;
+}
+
 /* a と b を文字列として並べ、ヒープに積んでタグ付き値を返す */
 static long vm_concat(long a, long b)
 {
@@ -3036,6 +3110,13 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     case 0x07: { extern syscall sleep(unsigned); long ms = VPOP(); if (ms > 0) sleep((unsigned)ms); } break; /* WAIT */
     case 0x08: { long v = sp > 0 ? stk[sp-1] : 0; VPUSH(v); } break; /* DUP */
     case 0x15: { long b = VPOP(), a = VPOP(); VPUSH(vm_concat(a, b)); } break;  /* CONCAT */
+    case 0x50: { long p = VPOP(); vm_web_port = (int)p; } break;               /* WEBLISTEN */
+    case 0x51: { long aid = VPOP(); long pv = VPOP();                          /* WEBEXPOSE */
+                 if (vm_web_n < VM_WEB_MAX) {
+                     vm_fmt_val(vm_web_path[vm_web_n], 40, pv);
+                     vm_web_actor[vm_web_n] = (int)aid; vm_web_n++;
+                     kprintf("[vm] expose %s -> a%d\r\n",
+                             vm_web_path[vm_web_n-1], vm_web_actor[vm_web_n-1]); } } break;
     case 0x42: { extern void vm_print(int, const char *); char ln[80]; long v = VPOP();
                  vm_fmt_val(ln, sizeof ln, v);
                  kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
