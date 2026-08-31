@@ -89,6 +89,15 @@ extern int  abcl_web_init(void);
 extern void abcl_web_deliver(int receiver, const char *method, const char *str);
 
 #define WEBACTOR_PORT 8080
+
+/* URL エンコードの 1 桁を数値に。16 進でなければ -1。 */
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 #define WEB_BUFSZ     1572864  /* 1.5 MB — bumped from 512 KB so a full
                                  * xinu.boot (~940 KB, grown with BASIC/gwm/
                                  * WiFi/JIT) fits in one /upload for the
@@ -828,9 +837,18 @@ thread webactor_server(int slot)
                   if (q) { q += 7; while (*q && *q != '&' && *q != ' ' && k < (int)sizeof wmeth - 1)
                                        wmeth[k++] = *q++; }
                   wmeth[k] = 0; }
+                /* '+' は空白に、%XX は 1 バイトに戻す。ai_call のプロンプトが
+                   "Once%20upon%20a%20time" のまま渡っていたため足した。 */
                 { const char *q = strstr(reqbuf, "args="); int k = 0;
-                  if (q) { q += 5; while (*q && *q != '&' && *q != ' ' && k < (int)sizeof warg - 1)
-                                       warg[k++] = (*q == '+') ? (q++, ' ') : *q++; }
+                  if (q) { q += 5;
+                    while (*q && *q != '&' && *q != ' ' && k < (int)sizeof warg - 1) {
+                      if (*q == '+') { warg[k++] = ' '; q++; }
+                      else if (*q == '%' && q[1] && q[2]) {
+                        int hi = hexval(q[1]), lo = hexval(q[2]);
+                        if (hi >= 0 && lo >= 0) { warg[k++] = (char)(hi * 16 + lo); q += 3; }
+                        else warg[k++] = *q++;
+                      } else warg[k++] = *q++;
+                    } }
                   warg[k] = 0; }
                 if (wmeth[0] == 0) { wmeth[0]='s'; wmeth[1]='a'; wmeth[2]='y'; wmeth[3]=0; }
                 ok = vm_web_call(wpath, wmeth, warg, wbuf + 200, (int)sizeof wbuf - 200 - 2);

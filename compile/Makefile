@@ -409,3 +409,4 @@ DEPFILES := $(DEPFILES:%.S=%.d)
 # Ensure the default `make' target is set correctly--- it's supposed to be
 # $(BOOTIMAGE) and defined in "platformVars".
 .DEFAULT_GOAL := $(BOOTIMAGE)
+

@@ -1,0 +1,10 @@
+# llm コンポーネント（小型 LLM: Karpathy stories260K の推論をカーネル内で行う）
+
+COMP = llm
+
+C_FILES = llm.c
+
+S_FILES = blob.S
+
+DIR = ${TOPDIR}/${COMP}
+COMP_SRC += ${S_FILES:%=${DIR}/%} ${C_FILES:%=${DIR}/%}

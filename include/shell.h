@@ -104,6 +104,7 @@ shellcmd xsh_kill(int, char *[]);
 shellcmd xsh_led(int, char *[]);
 shellcmd xsh_memdump(int, char *[]);
 shellcmd xsh_memstat(int, char *[]);
+shellcmd xsh_llm(int, char *[]);
 shellcmd xsh_nc(int, char *[]);
 shellcmd xsh_netstat(int, char *[]);
 shellcmd xsh_netup(int, char *[]);

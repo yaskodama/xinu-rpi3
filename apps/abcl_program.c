@@ -2977,7 +2977,10 @@ int vm_web_call(const char *path, const char *meth, const char *arg, char *out, 
       if (arg && arg[0]) { va[0].tag = V_INT; va[0].i = vm_intern(arg);
                            va[0].f = 0; va[0].s = 0; va[0].obj_id = 0; na = 1; }
       abcl_enqueue(VM_WEB_SINK, vm_web_actor[k], meth, na, va); }
-    for (n = 0; n < 40 && !vm_web_have; n++) sleep(50);   /* 最大 2 秒 */
+    /* 2 秒だと ai_call（実機のLLM推論）が終わる前に打ち切ってしまい、
+       空の応答が返る。推論を含む呼び出しを通すため 90 秒まで待つ。
+       返信が来た時点で抜けるので、普通のメソッドは従来どおり即座に返る。 */
+    for (n = 0; n < 1800 && !vm_web_have; n++) sleep(50);  /* 最大 90 秒 */
     { int p = 0; const char *s = vm_web_reply;
       while (s[p] && p < cap - 1) { out[p] = s[p]; p++; }
       out[p] = 0; }
@@ -3110,6 +3113,19 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     case 0x07: { extern syscall sleep(unsigned); long ms = VPOP(); if (ms > 0) sleep((unsigned)ms); } break; /* WAIT */
     case 0x08: { long v = sp > 0 ? stk[sp-1] : 0; VPUSH(v); } break; /* DUP */
     case 0x15: { long b = VPOP(), a = VPOP(); VPUSH(vm_concat(a, b)); } break;  /* CONCAT */
+    case 0x52: {                                                               /* AI_CALL */
+                 /* カーネルに焼き込んだ小型 LLM (stories260K) で推論する。
+                  * D-cache OFF・ソフト浮動小数点なので遅い。呼んだアクタは
+                  * その間止まる（他のアクタは動く）。 */
+                 extern int llm_run(const char *, int, char *, int, int);
+                 static char aip[128], aio[256];
+                 long pv = VPOP();
+                 vm_fmt_val(aip, sizeof aip, pv);
+                 kprintf("[vm] ai_call: %s\r\n", aip);
+                 aio[0] = 0;
+                 llm_run(aip, 24, aio, (int)sizeof aio - 1, 0);
+                 VPUSH(vm_intern(aio));
+               } break;
     case 0x50: { long p = VPOP(); vm_web_port = (int)p; } break;               /* WEBLISTEN */
     case 0x51: { long aid = VPOP(); long pv = VPOP();                          /* WEBEXPOSE */
                  if (vm_web_n < VM_WEB_MAX) {

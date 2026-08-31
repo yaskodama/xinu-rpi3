@@ -57,6 +57,7 @@ const struct centry commandtab[] = {
 #ifdef GPIO_BASE
     {"led", FALSE, xsh_led},
 #endif
+    {"llm",     FALSE, xsh_llm},
     {"memstat", FALSE, xsh_memstat},
     {"memdump", FALSE, xsh_memdump},
     {"mkdir", FALSE, xsh_mkdir},

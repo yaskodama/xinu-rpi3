@@ -25,6 +25,7 @@ DEFS     += -D_XINU_PLATFORM_ARM_RPI_ -D_XINU_PLATFORM_ARM_RPI3_
 
 # Embedded Xinu components to build into the kernel image
 APPCOMPS := apps      \
+            llm       \
             mailbox   \
             network   \
             shell     \
