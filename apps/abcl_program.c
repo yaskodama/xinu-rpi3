@@ -2888,6 +2888,22 @@ typedef struct { int name, n_fields, n_methods; vmmethod_t m[VM_MAX_METHODS]; } 
 static unsigned char vm_mod[VM_MODULE_MAX]; static int vm_mod_len = 0;
 static char          vm_strbuf[VM_STRBUF_MAX];
 static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
+
+/* 文字列の値は「0x40000000 | 文字列表の添字」というタグ付き整数で流れてくる。
+ * 見るのは印字のときだけで、フィールド・引数・送信・演算は整数のまま素通りする。
+ * ホスト VM (aice-avm の avm.ml vm_show) と同じ約束。 */
+#define VM_STR_TAG 0x40000000
+static void vm_fmt_val(char *out, int cap, long v)
+{
+    if ((v & VM_STR_TAG) != 0) {
+        int i = (int)(v & 0xffffff);
+        if (i >= 0 && i < vm_n_str) { int n = 0;
+            const char *s = vm_str[i];
+            while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
+            out[n] = 0; return; }
+    }
+    sprintf(out, "%ld", v);
+}
 static vmclass_t     vm_class[VM_MAX_CLASSES]; static int vm_n_class = 0;
 static int  vm_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
 static long vm_i32(const unsigned char *p) {
@@ -2981,13 +2997,18 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     case 0x07: { extern syscall sleep(unsigned); long ms = VPOP(); if (ms > 0) sleep((unsigned)ms); } break; /* WAIT */
     case 0x08: { long v = sp > 0 ? stk[sp-1] : 0; VPUSH(v); } break; /* DUP */
     case 0x42: { extern void vm_print(int, const char *); char ln[80]; long v = VPOP();
-                 sprintf(ln, "%ld", v); kprintf("[vm] a%d: %ld\r\n", self, v); vm_print(self, ln); } break;
+                 vm_fmt_val(ln, sizeof ln, v);
+                 kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
     case 0x44: { extern void vm_print(int, const char *);                       /* PRINTF fmt,nargs */
                  int fi = vm_u16(code + pc); pc += 2; int na = code[pc++], i, ai = 0;
                  long va[8]; if (na > 8) na = 8; for (i = na - 1; i >= 0; i--) va[i] = VPOP();
                  const char *f = (fi >= 0 && fi < vm_n_str) ? vm_str[fi] : "";
                  char ln[80]; int p = 0;
-                 while (*f && p < 76) { if (f[0] == '%' && f[1] == 'd') { if (ai < na) p += sprintf(ln + p, "%ld", va[ai++]); f += 2; }
+                 while (*f && p < 76) { if (f[0] == '%' && f[1] == 'd') {
+                                  if (ai < na) { char tmp[64]; int q = 0;
+                                                 vm_fmt_val(tmp, sizeof tmp, va[ai++]);
+                                                 while (tmp[q] && p < 76) ln[p++] = tmp[q++]; }
+                                  f += 2; }
                               else { ln[p++] = *f++; } }
                  ln[p] = 0; kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
     case 0x45: { extern void vm_line(int, int, int, int, int);                  /* LINE x1,y1,x2,y2,col */
