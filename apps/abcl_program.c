@@ -2892,17 +2892,56 @@ static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
 /* 文字列の値は「0x40000000 | 文字列表の添字」というタグ付き整数で流れてくる。
  * 見るのは印字のときだけで、フィールド・引数・送信・演算は整数のまま素通りする。
  * ホスト VM (aice-avm の avm.ml vm_show) と同じ約束。 */
-#define VM_STR_TAG 0x40000000
+#define VM_STR_TAG  0x40000000   /* 文字列の値であることを示す */
+#define VM_STR_HEAP 0x00800000   /* 立っていれば実行時ヒープ、落ちていればモジュールの文字列表 */
+#define VM_STR_MASK 0x007fffff
+
+/* 実行時に作られた文字列の置き場。連結（CONCAT）だけが使う。
+ * 回収は無い（この VM に GC は無い）ので、上限に達したら最後の枠を使い回す。
+ * ホスト VM (aice-avm の avm.ml) と同じ約束。 */
+#define VM_HEAP_STR_MAX 64
+#define VM_HEAP_BUF_MAX 2048
+static char vm_heapbuf[VM_HEAP_BUF_MAX];
+static int  vm_heap_off[VM_HEAP_STR_MAX];
+static int  vm_heap_n = 0, vm_heap_used = 0;
+
 static void vm_fmt_val(char *out, int cap, long v)
 {
     if ((v & VM_STR_TAG) != 0) {
-        int i = (int)(v & 0xffffff);
-        if (i >= 0 && i < vm_n_str) { int n = 0;
-            const char *s = vm_str[i];
+        int i = (int)(v & VM_STR_MASK);
+        const char *s = 0;
+        if ((v & VM_STR_HEAP) != 0) {
+            if (i >= 0 && i < vm_heap_n) s = &vm_heapbuf[vm_heap_off[i]];
+        } else if (i >= 0 && i < vm_n_str) s = vm_str[i];
+        if (s) { int n = 0;
             while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
             out[n] = 0; return; }
     }
     sprintf(out, "%ld", v);
+}
+
+/* a と b を文字列として並べ、ヒープに積んでタグ付き値を返す */
+static long vm_concat(long a, long b)
+{
+    char ta[96], tb[96];
+    int la, lb, need, off, i;
+    vm_fmt_val(ta, sizeof ta, a);
+    vm_fmt_val(tb, sizeof tb, b);
+    for (la = 0; ta[la]; la++) ;
+    for (lb = 0; tb[lb]; lb++) ;
+    need = la + lb + 1;
+    if (vm_heap_n >= VM_HEAP_STR_MAX || vm_heap_used + need > VM_HEAP_BUF_MAX) {
+        /* 溢れたら最後の枠を使い回す。黙って壊れないよう印を残す */
+        kprintf("[vm] string heap full\r\n");
+        return VM_STR_TAG | VM_STR_HEAP | (vm_heap_n > 0 ? vm_heap_n - 1 : 0);
+    }
+    off = vm_heap_used;
+    for (i = 0; i < la; i++) vm_heapbuf[off + i] = ta[i];
+    for (i = 0; i < lb; i++) vm_heapbuf[off + la + i] = tb[i];
+    vm_heapbuf[off + la + lb] = 0;
+    vm_heap_off[vm_heap_n] = off;
+    vm_heap_used += need;
+    return VM_STR_TAG | VM_STR_HEAP | (vm_heap_n++);
 }
 static vmclass_t     vm_class[VM_MAX_CLASSES]; static int vm_n_class = 0;
 static int  vm_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
@@ -2996,6 +3035,7 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     case 0x06: VPUSH(sender); break;                          /* SENDER */
     case 0x07: { extern syscall sleep(unsigned); long ms = VPOP(); if (ms > 0) sleep((unsigned)ms); } break; /* WAIT */
     case 0x08: { long v = sp > 0 ? stk[sp-1] : 0; VPUSH(v); } break; /* DUP */
+    case 0x15: { long b = VPOP(), a = VPOP(); VPUSH(vm_concat(a, b)); } break;  /* CONCAT */
     case 0x42: { extern void vm_print(int, const char *); char ln[80]; long v = VPOP();
                  vm_fmt_val(ln, sizeof ln, v);
                  kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
