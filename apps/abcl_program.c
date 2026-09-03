@@ -710,6 +710,7 @@ static void dispatch(int, int, const char*, value_t*, int);
 static int  alloc_obj(int class_id, int n_args, value_t* args);
 static void spawn_actor(int id);
 int         create_obj(int class_id, int n_args, value_t* args);
+int         create_obj_noinit(int class_id);
 thread      abcl_actor_main(int self_id);
 
 static int g_f0 = -1;
@@ -2945,6 +2946,64 @@ static char vm_web_path[VM_WEB_MAX][40];
 static int  vm_web_actor[VM_WEB_MAX];
 static int  vm_web_n = 0, vm_web_port = 0;
 
+/* ===== プログラムの出力を HTTP から読む =====
+ * Pi 3 の print はシリアルと画面へ出るだけで、外からは読めなかった。
+ * Pi 5 は POST /cc の応答に出力がそのまま返るので、ここが揃っていなかった
+ * ―― 同じプログラムを両機で走らせて突き合わせることができない。
+ * 直近の出力を輪バッファに控え、GET /api/console で返す。
+ * 形はホスト VM (aice-avm server.ml) と同じ {"total":N,"lines":[...]}。 */
+#define VM_CON_MAX   24
+#define VM_CON_LEN   96
+static char vm_con[VM_CON_MAX][VM_CON_LEN];
+static int  vm_con_head  = 0;      /* 次に書く位置                     */
+static int  vm_con_n     = 0;      /* 保持している本数（<= VM_CON_MAX）*/
+static int  vm_con_total = 0;      /* 起動からの通算（切り捨て分も含む）*/
+
+void vm_console_push(int self, const char *s)
+{
+    char *d = vm_con[vm_con_head];
+    int p = 0, i, v = self, q = 0;
+    char t[12];
+    d[p++] = 'a';
+    if (v < 0) { d[p++] = '-'; v = -v; }
+    if (0 == v) t[q++] = '0';
+    while (v > 0 && q < 11) { t[q++] = (char)('0' + (v % 10)); v /= 10; }
+    while (q > 0 && p < VM_CON_LEN - 3) d[p++] = t[--q];
+    d[p++] = ':'; d[p++] = ' ';
+    for (i = 0; s[i] && p < VM_CON_LEN - 1; i++) d[p++] = s[i];
+    d[p] = 0;
+    vm_con_head = (vm_con_head + 1) % VM_CON_MAX;
+    if (vm_con_n < VM_CON_MAX) vm_con_n++;
+    vm_con_total++;
+}
+
+int vm_console_json(char *out, int cap, int clear)
+{
+    int p = 0, i, k, first;
+    first = vm_con_head - vm_con_n;
+    if (first < 0) first += VM_CON_MAX;
+    p += sprintf(out + p, "{\"total\":%d,\"lines\":[", vm_con_total);
+    for (i = 0; i < vm_con_n; i++)
+    {
+        const char *s = vm_con[(first + i) % VM_CON_MAX];
+        if (p > cap - 140) break;          /* 入り切らない分は落とす */
+        if (i > 0) out[p++] = ',';
+        out[p++] = '"';
+        for (k = 0; s[k] && p < cap - 8; k++)
+        {
+            unsigned char ch = (unsigned char)s[k];
+            if ('"' == ch || '\\' == ch) { out[p++] = '\\'; out[p++] = (char)ch; }
+            else if (ch < 0x20)          { out[p++] = ' '; }
+            else                         { out[p++] = (char)ch; }
+        }
+        out[p++] = '"';
+    }
+    p += sprintf(out + p, "]}\r\n");
+    if (clear) { vm_con_head = 0; vm_con_n = 0; }
+    out[p] = 0;
+    return p;
+}
+
 /* HTTP から来た文字列を VM の値にする（ヒープに積む） */
 static long vm_intern(const char *s)
 {
@@ -3063,7 +3122,7 @@ const char *abcl_vm_class_name(int ci) {
 }
 int abcl_vm_spawn(int ci) {
   if (ci < 0 || ci >= vm_n_class) return -1;
-  int id = create_obj(VM_CLASS_BASE + ci, 0, NULL), i;
+  int id = create_obj_noinit(VM_CLASS_BASE + ci), i;
   if (id >= 0) for (i = 0; i < MAX_FIELDS; i++) { objects[id].fields[i].tag = V_INT; objects[id].fields[i].i = 0; }
   return id;
 }
@@ -3135,7 +3194,8 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
                              vm_web_path[vm_web_n-1], vm_web_actor[vm_web_n-1]); } } break;
     case 0x42: { extern void vm_print(int, const char *); char ln[80]; long v = VPOP();
                  vm_fmt_val(ln, sizeof ln, v);
-                 kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
+                 kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln);
+                 vm_console_push(self, ln); } break;
     case 0x44: { extern void vm_print(int, const char *);                       /* PRINTF fmt,nargs */
                  int fi = vm_u16(code + pc); pc += 2; int na = code[pc++], i, ai = 0;
                  long va[8]; if (na > 8) na = 8; for (i = na - 1; i >= 0; i--) va[i] = VPOP();
@@ -3147,7 +3207,8 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
                                                  while (tmp[q] && p < 76) ln[p++] = tmp[q++]; }
                                   f += 2; }
                               else { ln[p++] = *f++; } }
-                 ln[p] = 0; kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln); } break;
+                 ln[p] = 0; kprintf("[vm] a%d: %s\r\n", self, ln); vm_print(self, ln);
+                 vm_console_push(self, ln); } break;
     case 0x45: { extern void vm_line(int, int, int, int, int);                  /* LINE x1,y1,x2,y2,col */
                  long col = VPOP(), y2 = VPOP(), x2 = VPOP(), y1 = VPOP(), x1 = VPOP();
                  vm_line((int)x1, (int)y1, (int)x2, (int)y2, (int)col); } break;
@@ -3163,8 +3224,42 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
 #undef VPOP
 }
 /* HTTP entry: load a .avm, spawn its first class, kick it with "tick". */
+/* 新しいモジュールを載せる前に、前のモジュールのアクタを畳む。
+ *
+ * Pi 5 は /cc を投げるたびに前のアクター世界が置き換わる。Pi 3 は
+ * 古いアクタが Xinu スレッドのまま残るので、
+ *   ・プロセス表を食いつぶす（正典ガイド 10 本を順に流すと 9 本目の g9 で
+ *     新しいアクタが走らなくなり、そのあと HTTP ごと詰まった。実測）
+ *   ・mailbox の msgs[].method が、置き換えられた vm_mod を指したまま残る
+ * という二つの形で壊れる。同じ約束に揃える。
+ * 畳むのは VM のアクタ（class_id >= VM_CLASS_BASE）だけで、webactor など
+ * 常駐の C アクタには触らない。 */
+static void abcl_vm_kill_prev(void) {
+  int i, total = rcu_n_objects(), n = 0;
+  /* ★ kill() は使わない。アクタ・スレッドは spawn 命令の中で alloc_obj を
+   * 呼ぶ ―― そこで objects_mu を握っている最中に kill すると、以後の生成が
+   * 全部そこで止まり、webactor まで巻き込んで HTTP が詰まる（実測）。
+   * 印をつけて起こすだけにして、abcl_actor_main に自分でループを抜けさせる
+   * （abcl_rt_reset と同じ作法）。 */
+  for (i = 0; i < total; i++) {
+    if (objects[i].class_id < VM_CLASS_BASE) continue;
+    if (objects[i].dead || !objects[i].started) continue;
+    objects[i].dead = 1; n++;
+  }
+  for (i = 0; i < total; i++) {
+    if (objects[i].class_id < VM_CLASS_BASE) continue;
+    signal(objects[i].mbox.items);   /* 待っているものを起こす */
+  }
+  if (n > 0) {
+    sleep(100);                      /* ループを抜けるのを待つ */
+    kprintf("[vm] 前のモジュールのアクタ %d 体を畳んだ\r\n", n);
+  }
+  vm_web_n = 0;                      /* 公開ルートもプログラムと寿命を共にする */
+}
+
 int abcl_vm_loadrun(const unsigned char *buf, int len) {
   extern void vm_gfx_unsuppress(void);
+  abcl_vm_kill_prev();
   int base = abcl_vm_load(buf, len);
   if (base < 0) return -1;
   vm_gfx_unsuppress();                 /* a fresh send re-enables closed VM windows */
@@ -3215,7 +3310,7 @@ static void init_fields(int class_id, int self_id) {
   }
 }
 
-static int alloc_obj(int class_id, int n_args, value_t* args) {
+static int alloc_obj_ex(int class_id, int n_args, value_t* args, int auto_init) {
   int id;
   int i;
   /* RCU writer: reserve a slot index but DO NOT publish it yet.  Lock-free
@@ -3244,8 +3339,12 @@ static int alloc_obj(int class_id, int n_args, value_t* args) {
    * new count, so a reader that observes id+1 also sees a complete slot. */
   rcu_assign_pointer(n_objects, id + 1);
   signal(objects_mu);
-  enqueue(-1, id, "init", n_args, args);
+  if (auto_init) enqueue(-1, id, "init", n_args, args);
   return id;
+}
+
+static int alloc_obj(int class_id, int n_args, value_t* args) {
+  return alloc_obj_ex(class_id, n_args, args, 1);
 }
 
 static void spawn_actor(int id) {
@@ -3267,6 +3366,18 @@ static void spawn_actor(int id) {
 
 int create_obj(int class_id, int n_args, value_t* args) {
   int id = alloc_obj(class_id, n_args, args);
+  spawn_actor(id);
+  return id;
+}
+
+/* 自動 init を送らない生成。VM（.avm）のアクタ用。
+ * alloc_obj は生成のたびに引数 0 個の "init" を投げていた。組み込みの C
+ * アクタはそれを前提にしているが、VM のアクタでは前段（compile_avm）が
+ * init を明示的に送るので二重になる ―― g1 が `hello, AIPL` の前に
+ * `hello, 0` を出していたのがこれで、引数が 0 個の側が先に走っていた。
+ * 前段が「init があれば必ず一度送る」ようになったので、ここは送らない。 */
+int create_obj_noinit(int class_id) {
+  int id = alloc_obj_ex(class_id, 0, NULL, 0);
   spawn_actor(id);
   return id;
 }

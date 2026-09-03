@@ -806,6 +806,22 @@ thread webactor_server(int slot)
             }
             /* /api/x/<path>?method=&args=  — web_expose で公開したアクタを叩く。
              * /api/routes は公開済みの一覧。ホスト VM (aice-avm server.ml) と同じ形。 */
+            /* /api/console[?clear=1] — プログラムの出力を読む。
+             * Pi 5 は POST /cc の応答に出力が返るので、そこを揃えるための口。
+             * ホスト VM (aice-avm) と同じ {"total":N,"lines":[...]} を返す。 */
+            if (0 == strncmp(reqbuf, "GET /api/console", 16) ||
+                0 == strncmp(reqbuf, "POST /api/console", 17))
+            {
+                extern int vm_console_json(char *, int, int);
+                static char cj[1600];
+                int doclear = (NULL != strstr(reqbuf, "clear=1"));
+                int clen = vm_console_json(cj + 140, (int)sizeof cj - 140 - 1, doclear);
+                int hlen = sprintf(cj, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                                       "Content-Length: %d\r\n\r\n", clen);
+                memcpy(cj + hlen, cj + 140, clen);   /* hlen < 140、前方コピーなので安全 */
+                write(tcpdev, cj, hlen + clen);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             if (0 == strncmp(reqbuf, "GET /api/routes", 15) ||
                 0 == strncmp(reqbuf, "POST /api/routes", 16))
             {
