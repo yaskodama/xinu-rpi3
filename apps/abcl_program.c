@@ -2912,6 +2912,16 @@ static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
 #define VM_STR_HEAP 0x00800000   /* 立っていれば実行時ヒープ、落ちていればモジュールの文字列表 */
 #define VM_STR_MASK 0x007fffff
 
+/* 真偽値。0x20000000 のビットが立っていれば真偽値で、値は最下位ビット。
+ * 文字列と同じ「印字のときだけタグを見る」やり方だが、真偽値は
+ * ★条件判定でもタグを見なければならない★ ―― false = 0x20000000 は 0 ではないので、
+ * 素の JZ では偽と判定されない。必ず vm_falsy を通すこと。
+ * ホスト VM (aice-avm の avm.ml) と同じ約束。 */
+#define VM_BOOL_TAG 0x20000000
+#define vm_bool(b)     ((long)(VM_BOOL_TAG | ((b) ? 1 : 0)))
+#define vm_is_bool(v)  (((v) & VM_BOOL_TAG) != 0 && ((v) & VM_STR_TAG) == 0)
+#define vm_falsy(v)    (vm_is_bool(v) ? (((v) & 1) == 0) : ((v) == 0))
+
 /* 実行時に作られた文字列の置き場。連結（CONCAT）だけが使う。
  * 回収は無い（この VM に GC は無い）ので、上限に達したら最後の枠を使い回す。
  * ホスト VM (aice-avm の avm.ml) と同じ約束。 */
@@ -2923,6 +2933,12 @@ static int  vm_heap_n = 0, vm_heap_used = 0;
 
 static void vm_fmt_val(char *out, int cap, long v)
 {
+    if (vm_is_bool(v)) {
+        const char *s = ((v & 1) != 0) ? "true" : "false";
+        int n = 0;
+        while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
+        out[n] = 0; return;
+    }
     if ((v & VM_STR_TAG) != 0) {
         int i = (int)(v & VM_STR_MASK);
         const char *s = 0;
@@ -3154,14 +3170,14 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     case 0x12: { long b = VPOP(), a = VPOP(); VPUSH(a * b); } break;
     case 0x13: { long b = VPOP(), a = VPOP(); VPUSH(b ? a / b : 0); } break;
     case 0x14: { long b = VPOP(), a = VPOP(); VPUSH(b ? a % b : 0); } break;
-    case 0x20: { long b = VPOP(), a = VPOP(); VPUSH(a <  b); } break;
-    case 0x21: { long b = VPOP(), a = VPOP(); VPUSH(a <= b); } break;
-    case 0x22: { long b = VPOP(), a = VPOP(); VPUSH(a >  b); } break;
-    case 0x23: { long b = VPOP(), a = VPOP(); VPUSH(a >= b); } break;
-    case 0x24: { long b = VPOP(), a = VPOP(); VPUSH(a == b); } break;
-    case 0x25: { long b = VPOP(), a = VPOP(); VPUSH(a != b); } break;
+    case 0x20: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a <  b)); } break;
+    case 0x21: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a <= b)); } break;
+    case 0x22: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a >  b)); } break;
+    case 0x23: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a >= b)); } break;
+    case 0x24: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a == b)); } break;
+    case 0x25: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a != b)); } break;
     case 0x30: pc = vm_u16(code + pc); break;
-    case 0x31: { int t = vm_u16(code + pc); pc += 2; if (VPOP() == 0) pc = t; } break;
+    case 0x31: { int t = vm_u16(code + pc); pc += 2; long c = VPOP(); if (vm_falsy(c)) pc = t; } break;
     case 0x40: { int mn = vm_u16(code + pc); pc += 2; int na = code[pc++], i;
                  value_t va[8]; if (na > 8) na = 8;
                  for (i = na - 1; i >= 0; i--) { va[i].tag = V_INT; va[i].i = VPOP(); }
