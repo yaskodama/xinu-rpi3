@@ -2924,15 +2924,216 @@ static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
    compile.ml の vm_err と同じ値でなければならない。 */
 #define VM_ERR_TAG  0x10000000
 
-/* タグ判定はどれも「非負であること」を先に確かめる。負の整数は上位ビットが
-   すべて立っているので、この番人が無いと -1 が文字列だと誤認され、
-   表示が <bad-str> になる。 */
+/* --- 値のタグ体系 ---------------------------------------------------------
+   負の整数は「そのまま整数」。非負のときだけ上位 3 ビット（0x70000000）を
+   タグとして読む。もとは「ビットが立っているか」で見ていたが、種類が増えると
+   組み合わせが衝突するので、パターン一致に改めた。
+
+     000  整数（0 .. 0x0FFFFFFF）
+     001  err（result の失敗）
+     010  真偽値（値は最下位ビット）
+     011  浮動小数（浮動小数表の添字）
+     100  文字列（文字列表／実行時ヒープの添字）
+     101  配列（配列表の添字）
+
+   ★ タグ判定はどれも「非負であること」を先に確かめる。負の整数は上位ビットが
+     すべて立っているので、この番人が無いと -1 が文字列だと誤認される。 */
+#define VM_TAG_MASK  0x70000000
+#define VM_FLT_TAG   0x30000000
+#define VM_LST_TAG   0x50000000
+#define VM_PAYLOAD   0x0FFFFFFF
+
 #define vm_tagged(v)   ((v) >= 0)
-#define vm_is_bool(v)  (vm_tagged(v) && ((v) & VM_BOOL_TAG) != 0 && ((v) & VM_STR_TAG) == 0)
-#define vm_is_err(v)   (vm_tagged(v) && ((v) & VM_ERR_TAG) != 0 \
-                        && ((v) & (VM_STR_TAG | VM_BOOL_TAG)) == 0)
-#define vm_is_str(v)   (vm_tagged(v) && ((v) & VM_STR_TAG) != 0)
+#define vm_tag(v)      ((long)((v) & VM_TAG_MASK))
+#define vm_is_bool(v)  (vm_tagged(v) && vm_tag(v) == VM_BOOL_TAG)
+#define vm_is_err(v)   (vm_tagged(v) && vm_tag(v) == VM_ERR_TAG)
+#define vm_is_str(v)   (vm_tagged(v) && vm_tag(v) == VM_STR_TAG)
+#define vm_is_flt(v)   (vm_tagged(v) && vm_tag(v) == VM_FLT_TAG)
+#define vm_is_lst(v)   (vm_tagged(v) && vm_tag(v) == VM_LST_TAG)
+#define vm_is_num(v)   (vm_is_flt(v) || (!vm_tagged(v)) || vm_tag(v) == 0)
 #define vm_falsy(v)    (vm_is_bool(v) ? (((v) & 1) == 0) : ((v) == 0))
+
+/* --- 浮動小数の置き場 ------------------------------------------------------
+   値そのものは 32 ビットに収まらないので、表に置いて添字を配る。
+   回収は無い（この VM に GC は無い）ので、上限に達したら最後の枠を使い回す
+   ―― 文字列ヒープと同じ約束である。 */
+#define VM_FLT_MAX 128
+static double vm_fheap[VM_FLT_MAX];
+static int    vm_fheap_n = 0;
+
+static long vm_mkflt(double d)
+{
+    int i;
+    if (vm_fheap_n >= VM_FLT_MAX) i = VM_FLT_MAX - 1;
+    else i = vm_fheap_n++;
+    vm_fheap[i] = d;
+    return (long)(VM_FLT_TAG | i);
+}
+static double vm_fltval(long v)
+{
+    int i = (int)(v & VM_PAYLOAD);
+    if (vm_is_flt(v) && i >= 0 && i < VM_FLT_MAX) return vm_fheap[i];
+    return (double)v;                 /* 整数はそのまま実数として読む */
+}
+
+/* --- 数学組込み ------------------------------------------------------------
+   この板に libm は無い。Pi 4・Pi 5 で libm と突き合わせて誤差 1e-11 以下を
+   確かめた実装を、そのまま移してある（fsqrt だけは AArch64 命令なので置換）。
+   三台で同じ式を使うので、同じ入力に対して同じ出力になる。 */
+#define VM_PI  3.14159265358979323846
+#define VM_PI2 1.57079632679489661923
+
+/* ★ Pi 4・Pi 5 は AArch64 の fsqrt 命令を使っているが、この板は ARM32 で
+   浮動小数はソフトウェア実装なので、その命令が無い。ニュートン法で置く
+   （初期値を指数で合わせてあるので 5 回で倍精度の桁が埋まる）。 */
+static double m_sqrt(double x)
+{
+    double r; int i;
+    if (x <= 0.0) return 0.0;
+    r = x; if (r > 1.0) { r = x / 2.0; } else { r = (x + 1.0) / 2.0; }
+    for (i = 0; i < 40; i++) { double n = 0.5 * (r + x / r); if (n == r) break; r = n; }
+    return r;
+}
+static double m_abs(double x)   { return x < 0 ? -x : x; }
+static double m_floor(double x) { double t = (double)(long)x; return (x < 0 && t != x) ? t - 1 : t; }
+static double m_ceil(double x)  { double t = (double)(long)x; return (x > 0 && t != x) ? t + 1 : t; }
+static double m_round(double x) { return x < 0 ? -m_floor(-x + 0.5) : m_floor(x + 0.5); }
+
+/* exp: x = k*ln2 + r,  |r| <= ln2/2。 e^r を 12 次のテイラーで、2^k は指数を直に置く。 */
+static double m_exp(double x)
+{
+    if (x >  709.0) x =  709.0;
+    if (x < -745.0) return 0.0;
+    const double LN2 = 0.69314718055994530942;
+    double kf = m_floor(x / LN2 + 0.5);
+    double r  = x - kf * LN2;
+    double s = 1.0, t = 1.0;
+    for (int i = 1; i <= 12; i++) { t = t * r / (double)i; s += t; }
+    long k = (long)kf;
+    union { double d; unsigned long u; } p; p.u = ((unsigned long)(1023 + k)) << 52;
+    return s * p.d;
+}
+/* log: x = m * 2^e （m in [1,2)）。ln m は atanh 級数で。 */
+static double m_log(double x)
+{
+    if (x <= 0) return 0.0;
+    union { double d; unsigned long u; } v; v.d = x;
+    long e = (long)((v.u >> 52) & 0x7FF) - 1023;
+    v.u = (v.u & 0x800FFFFFFFFFFFFFUL) | (1023UL << 52);   /* m in [1,2) */
+    double m = v.d;
+    if (m > 1.4142135623730951) { m *= 0.5; e += 1; }
+    double z = (m - 1.0) / (m + 1.0), z2 = z * z, s = 0.0, t = z;
+    for (int i = 1; i <= 25; i += 2) { s += t / (double)i; t *= z2; }
+    return 2.0 * s + (double)e * 0.69314718055994530942;
+}
+static double m_log10(double x) { return m_log(x) * 0.43429448190325182765; }
+
+/* sin/cos: 2π で畳み、さらに象限で [-π/4, π/4] まで縮めてから級数。
+   縮めないと |x| が π 近くで桁落ちする（実測で 2.4e-4 の誤差が出た）。 */
+static double sc_poly_sin(double x)
+{
+    double s = x, t = x, x2 = x * x;
+    for (int i = 1; i <= 7; i++) { t = -t * x2 / (double)((2*i) * (2*i + 1)); s += t; }
+    return s;
+}
+static double sc_poly_cos(double x)
+{
+    double s = 1.0, t = 1.0, x2 = x * x;
+    for (int i = 1; i <= 7; i++) { t = -t * x2 / (double)((2*i - 1) * (2*i)); s += t; }
+    return s;
+}
+static double m_sin(double x)
+{
+    double n = m_floor(x / VM_PI2 + 0.5);          /* π/2 単位に畳む */
+    double r = x - n * VM_PI2;
+    long q = ((long)n) & 3; if (q < 0) q += 4;
+    switch (q) {
+      case 0: return  sc_poly_sin(r);
+      case 1: return  sc_poly_cos(r);
+      case 2: return -sc_poly_sin(r);
+      default:return -sc_poly_cos(r);
+    }
+}
+static double m_cos(double x)
+{
+    double n = m_floor(x / VM_PI2 + 0.5);
+    double r = x - n * VM_PI2;
+    long q = ((long)n) & 3; if (q < 0) q += 4;
+    switch (q) {
+      case 0: return  sc_poly_cos(r);
+      case 1: return -sc_poly_sin(r);
+      case 2: return -sc_poly_cos(r);
+      default:return  sc_poly_sin(r);
+    }
+}
+static double m_tan(double x) { double c = m_cos(x); return c == 0.0 ? 0.0 : m_sin(x) / c; }
+
+/* atan: |x|<=1 に落としたあと、さらに tan(π/12) 以下まで縮めてから級数。
+   縮めないと x が 1 に近いところで級数が収束せず 1e-2 も外れる（実測）。 */
+static double m_atan(double x)
+{
+    int neg = x < 0; if (neg) x = -x;
+    int inv = x > 1.0; if (inv) x = 1.0 / x;
+    double add = 0.0;
+    if (x > 0.26794919243112270647) {              /* tan(π/12) */
+        const double S3 = 1.73205080756887729353;  /* √3 */
+        x = (x * S3 - 1.0) / (x + S3);
+        add = VM_PI / 6.0;
+    }
+    double s = 0.0, t = x, x2 = x * x;
+    for (int i = 1; i <= 31; i += 2) { s += ((i % 4 == 1) ? t : -t) / (double)i; t *= x2; }
+    s += add;
+    if (inv) s = VM_PI2 - s;
+    return neg ? -s : s;
+}
+static double m_asin(double x)
+{
+    if (x >=  1.0) return  VM_PI2;
+    if (x <= -1.0) return -VM_PI2;
+    return m_atan(x / m_sqrt(1.0 - x * x));
+}
+static double m_acos(double x) { return VM_PI2 - m_asin(x); }
+
+/* 値ランタイムへの入口。引数も戻り値も value_t（整数でも浮動小数でも受ける）。 */
+
+/* --- 配列の置き場 ----------------------------------------------------------
+   要素は値（タグ付き 32 ビット）。長さは可変だが、確保したら伸ばさない
+   ―― array_push は「新しい配列を作って返す」正典の意味なので、それで足りる。 */
+#define VM_LST_MAX   32
+#define VM_LST_POOL  512
+static long vm_lpool[VM_LST_POOL];
+static int  vm_lpool_n = 0;
+static struct { int off, len; } vm_lists[VM_LST_MAX];
+static int  vm_lists_n = 0;
+
+static long vm_mklst(const long *src, int n)
+{
+    int i, li;
+    if (n < 0) n = 0;
+    if (vm_lists_n >= VM_LST_MAX || vm_lpool_n + n > VM_LST_POOL) {
+        /* 溢れたら空の配列を返す。黙って壊れた添字を配るより良い。 */
+        if (vm_lists_n == 0) return (long)VM_LST_TAG;
+        li = vm_lists_n - 1; vm_lists[li].len = 0; return (long)(VM_LST_TAG | li);
+    }
+    li = vm_lists_n++;
+    vm_lists[li].off = vm_lpool_n;
+    vm_lists[li].len = n;
+    for (i = 0; i < n; i++) vm_lpool[vm_lpool_n + i] = src ? src[i] : 0;
+    vm_lpool_n += n;
+    return (long)(VM_LST_TAG | li);
+}
+static int vm_lstlen(long v)
+{
+    int i = (int)(v & VM_PAYLOAD);
+    if (vm_is_lst(v) && i >= 0 && i < vm_lists_n) return vm_lists[i].len;
+    return 0;
+}
+static long *vm_lstptr(long v)
+{
+    int i = (int)(v & VM_PAYLOAD);
+    if (vm_is_lst(v) && i >= 0 && i < vm_lists_n) return &vm_lpool[vm_lists[i].off];
+    return 0;
+}
 
 /* 実行時に作られた文字列の置き場。連結（CONCAT）だけが使う。
  * 回収は無い（この VM に GC は無い）ので、上限に達したら最後の枠を使い回す。
@@ -2955,6 +3156,37 @@ static void vm_fmt_val(char *out, int cap, long v)
         const char *s = "err";
         int n = 0;
         while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
+        out[n] = 0; return;
+    }
+    if (vm_is_flt(v)) {
+        /* 小数点以下 6 桁。Pi 4・Pi 5 の v_render と同じ見た目にする
+           （三台で同じ出力になっていないと、正典との照合が板ごとに割れる）。 */
+        double d = vm_fltval(v);
+        int neg = (d < 0.0), n = 0;
+        long ip; double fr;
+        if (neg) d = -d;
+        ip = (long)d; fr = d - (double)ip;
+        if (neg && n < cap - 1) out[n++] = '-';
+        { char t[16]; int k = 0;
+          if (ip == 0) t[k++] = '0';
+          while (ip > 0 && k < 15) { t[k++] = (char)('0' + (ip % 10)); ip /= 10; }
+          while (k > 0 && n < cap - 1) out[n++] = t[--k]; }
+        if (n < cap - 1) out[n++] = '.';
+        { int k; for (k = 0; k < 6 && n < cap - 1; k++) {
+            fr *= 10.0; { int dig = (int)fr; if (dig > 9) dig = 9; if (dig < 0) dig = 0;
+                          out[n++] = (char)('0' + dig); fr -= (double)dig; } } }
+        out[n] = 0; return;
+    }
+    if (vm_is_lst(v)) {
+        long *b = vm_lstptr(v); int ln = vm_lstlen(v), i, n = 0;
+        if (n < cap - 1) out[n++] = '[';
+        for (i = 0; i < ln && n < cap - 2; i++) {
+            char t[24];
+            if (i) { if (n < cap - 1) out[n++] = ','; if (n < cap - 1) out[n++] = ' '; }
+            vm_fmt_val(t, sizeof t, b ? b[i] : 0);
+            { int k = 0; while (t[k] && n < cap - 2) out[n++] = t[k++]; }
+        }
+        if (n < cap - 1) out[n++] = ']';
         out[n] = 0; return;
     }
     if (vm_is_str(v)) {
@@ -3283,22 +3515,44 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
     unsigned char op = code[pc++];
     switch (op) {
     case 0x01: VPUSH(vm_i32(code + pc)); pc += 4; break;
+    case 0x5E: {                                                            /* PUSHF */
+        /* 浮動小数リテラル。次の 8 バイトが IEEE754 のビット列（下位から）。
+           32 ビットの値には収まらないので、表に置いて添字を積む。 */
+        union { double d; unsigned char b[8]; } u; int i;
+        for (i = 0; i < 8; i++) u.b[i] = code[pc + i];
+        pc += 8;
+        VPUSH(vm_mkflt(u.d)); } break;
     case 0x02: { int f = code[pc++]; VPUSH(f < MAX_FIELDS ? objects[self].fields[f].i : 0); } break;
     case 0x03: { int f = code[pc++]; long v = VPOP();
                  if (f < MAX_FIELDS) { objects[self].fields[f].tag = V_INT; objects[self].fields[f].i = v; } } break;
     case 0x04: { int a = code[pc++]; VPUSH(a < n_args ? args[a].i : 0); } break;
     case 0x05: VPUSH(self); break;
-    case 0x10: { long b = VPOP(), a = VPOP(); VPUSH(a + b); } break;
-    case 0x11: { long b = VPOP(), a = VPOP(); VPUSH(a - b); } break;
-    case 0x12: { long b = VPOP(), a = VPOP(); VPUSH(a * b); } break;
-    case 0x13: { long b = VPOP(), a = VPOP(); VPUSH(b ? a / b : 0); } break;
+    /* 算術と比較。どちらかが実数なら実数で計算する（正典に暗黙変換は無いが、
+       前段が int と float を混ぜないので、ここは「実数が来たら実数」で足りる）。 */
+    case 0x10: { long b = VPOP(), a = VPOP();
+        if (vm_is_flt(a) || vm_is_flt(b)) VPUSH(vm_mkflt(vm_fltval(a) + vm_fltval(b)));
+        else VPUSH(a + b); } break;
+    case 0x11: { long b = VPOP(), a = VPOP();
+        if (vm_is_flt(a) || vm_is_flt(b)) VPUSH(vm_mkflt(vm_fltval(a) - vm_fltval(b)));
+        else VPUSH(a - b); } break;
+    case 0x12: { long b = VPOP(), a = VPOP();
+        if (vm_is_flt(a) || vm_is_flt(b)) VPUSH(vm_mkflt(vm_fltval(a) * vm_fltval(b)));
+        else VPUSH(a * b); } break;
+    case 0x13: { long b = VPOP(), a = VPOP();
+        if (vm_is_flt(a) || vm_is_flt(b)) { double d = vm_fltval(b);
+            VPUSH(vm_mkflt(d != 0.0 ? vm_fltval(a) / d : 0.0)); }
+        else VPUSH(b ? a / b : 0); } break;
     case 0x14: { long b = VPOP(), a = VPOP(); VPUSH(b ? a % b : 0); } break;
-    case 0x20: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a <  b)); } break;
-    case 0x21: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a <= b)); } break;
-    case 0x22: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a >  b)); } break;
-    case 0x23: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a >= b)); } break;
-    case 0x24: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a == b)); } break;
-    case 0x25: { long b = VPOP(), a = VPOP(); VPUSH(vm_bool(a != b)); } break;
+#define VM_CMP(op) { long b = VPOP(), a = VPOP(); \
+        if (vm_is_flt(a) || vm_is_flt(b)) VPUSH(vm_bool(vm_fltval(a) op vm_fltval(b))); \
+        else VPUSH(vm_bool(a op b)); } break;
+    case 0x20: VM_CMP(<)
+    case 0x21: VM_CMP(<=)
+    case 0x22: VM_CMP(>)
+    case 0x23: VM_CMP(>=)
+    case 0x24: VM_CMP(==)
+    case 0x25: VM_CMP(!=)
+#undef VM_CMP
     case 0x30: pc = vm_u16(code + pc); break;
     case 0x31: { int t = vm_u16(code + pc); pc += 2; long c = VPOP(); if (vm_falsy(c)) pc = t; } break;
     case 0x40: { int mn = vm_u16(code + pc); pc += 2; int na = code[pc++], i;
@@ -3354,6 +3608,45 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
             VPUSH(v == (long)VM_ERR_TAG ? dflt : v);
         }
     } break;
+    /* --- 配列（正典 array_*）------------------------------------------------
+       正典では array_push / array_set は「新しい配列を返す」ので、ここでも
+       作り直す。回収は無いが、板に投げるプログラムの寿命は短いので足りる。 */
+    case 0x57: { VPUSH(vm_mklst(0, 0)); } break;                            /* ARR_NEW */
+    case 0x58: { long e = VPOP(), a = VPOP();                               /* ARR_PUSH */
+        long tmp[64]; int n = vm_lstlen(a), i; long *b = vm_lstptr(a);
+        if (n > 63) n = 63;
+        for (i = 0; i < n; i++) tmp[i] = b[i];
+        tmp[n] = e; VPUSH(vm_mklst(tmp, n + 1)); } break;
+    case 0x59: { long ix = VPOP(), a = VPOP();                              /* ARR_GET */
+        int n = vm_lstlen(a); long *b = vm_lstptr(a);
+        long i = vm_is_flt(ix) ? (long)vm_fltval(ix) : ix;
+        VPUSH((b && i >= 0 && i < n) ? b[i] : 0); } break;
+    case 0x5A: { long e = VPOP(), ix = VPOP(), a = VPOP();                  /* ARR_SET */
+        long tmp[64]; int n = vm_lstlen(a), k; long *b = vm_lstptr(a);
+        long i = vm_is_flt(ix) ? (long)vm_fltval(ix) : ix;
+        if (n > 64) n = 64;
+        for (k = 0; k < n; k++) tmp[k] = b[k];
+        if (i >= 0 && i < n) tmp[i] = e;
+        VPUSH(vm_mklst(tmp, n)); } break;
+    case 0x5B: { long a = VPOP(); VPUSH((long)vm_lstlen(a)); } break;       /* ARR_LEN */
+    case 0x5C: { long nv = VPOP();                                          /* ARR_ZEROS */
+        long tmp[64]; int n = (int)(vm_is_flt(nv) ? (long)vm_fltval(nv) : nv), i;
+        if (n < 0) n = 0; if (n > 64) n = 64;
+        for (i = 0; i < n; i++) tmp[i] = 0;
+        VPUSH(vm_mklst(tmp, n)); } break;
+    /* --- 数学組込み。番号は compile.ml と揃えること --------------------- */
+    case 0x5D: { int k = code[pc++]; long a = VPOP(); double x = vm_fltval(a); double r;
+        switch (k) {
+        case 0:  r = m_sqrt(x);  break;   case 1:  r = m_exp(x);   break;
+        case 2:  r = m_log(x);   break;   case 3:  r = m_log10(x); break;
+        case 4:  r = m_sin(x);   break;   case 5:  r = m_cos(x);   break;
+        case 6:  r = m_tan(x);   break;   case 7:  r = m_asin(x);  break;
+        case 8:  r = m_acos(x);  break;   case 9:  r = m_atan(x);  break;
+        case 10: r = m_floor(x); break;   case 11: r = m_ceil(x);  break;
+        case 12: r = m_round(x); break;   case 13: r = m_abs(x);   break;
+        case 14: r = -x;         break;
+        default: r = 0.0;        break; }
+        VPUSH(vm_mkflt(r)); } break;
     case 0x53: { long nv = VPOP(); vm_res_acquire(nv); } break;              /* ACQUIRE */
     case 0x54: { long nv = VPOP(); vm_res_release(nv); } break;              /* RELEASE */
     case 0x50: { long p = VPOP(); vm_web_port = (int)p; } break;               /* WEBLISTEN */

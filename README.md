@@ -257,7 +257,7 @@ Notes:
 
 ### How much of AIPL runs here
 
-The canonical language is split into 25 features. **22 of 25 run** on this
+The canonical language is split into 25 features. **23 of 25 run** on this
 board. The front end is on the Mac (`compile.ml`), so a change there needs no
 reflash; only the last four rows below needed one.
 
@@ -280,7 +280,7 @@ reflash; only the last four rows below needed one.
 | `float` and float literals | **no** | VM values are 32-bit tagged integers |
 | Arrays (`array_*`) | **no** | likewise — needs a new value representation |
 | Math builtins (`sqrt` etc.) | **no** | likewise |
-| `call` / calling one's own method | **no** | the VM has no call instruction |
+| The `call` statement | yes | a builtin called as a statement inside a method |
 | `spawn("Class","name")` | yes | the new actor id goes into the published table under that name |
 | `remote("host:port","actor")` | yes | over UDP/9010, using the Xinu UDP device layer |
 
