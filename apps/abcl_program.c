@@ -2919,7 +2919,19 @@ static const char   *vm_str[VM_STR_MAX]; static int vm_n_str = 0;
  * ホスト VM (aice-avm の avm.ml) と同じ約束。 */
 #define VM_BOOL_TAG 0x20000000
 #define vm_bool(b)     ((long)(VM_BOOL_TAG | ((b) ? 1 : 0)))
-#define vm_is_bool(v)  (((v) & VM_BOOL_TAG) != 0 && ((v) & VM_STR_TAG) == 0)
+
+/* result<tau> の失敗を表す予約値。`else` を書かない期限がこれを返す。
+   compile.ml の vm_err と同じ値でなければならない。 */
+#define VM_ERR_TAG  0x10000000
+
+/* タグ判定はどれも「非負であること」を先に確かめる。負の整数は上位ビットが
+   すべて立っているので、この番人が無いと -1 が文字列だと誤認され、
+   表示が <bad-str> になる。 */
+#define vm_tagged(v)   ((v) >= 0)
+#define vm_is_bool(v)  (vm_tagged(v) && ((v) & VM_BOOL_TAG) != 0 && ((v) & VM_STR_TAG) == 0)
+#define vm_is_err(v)   (vm_tagged(v) && ((v) & VM_ERR_TAG) != 0 \
+                        && ((v) & (VM_STR_TAG | VM_BOOL_TAG)) == 0)
+#define vm_is_str(v)   (vm_tagged(v) && ((v) & VM_STR_TAG) != 0)
 #define vm_falsy(v)    (vm_is_bool(v) ? (((v) & 1) == 0) : ((v) == 0))
 
 /* 実行時に作られた文字列の置き場。連結（CONCAT）だけが使う。
@@ -2939,7 +2951,13 @@ static void vm_fmt_val(char *out, int cap, long v)
         while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
         out[n] = 0; return;
     }
-    if ((v & VM_STR_TAG) != 0) {
+    if (vm_is_err(v)) {
+        const char *s = "err";
+        int n = 0;
+        while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
+        out[n] = 0; return;
+    }
+    if (vm_is_str(v)) {
         int i = (int)(v & VM_STR_MASK);
         const char *s = 0;
         if ((v & VM_STR_HEAP) != 0) {
@@ -3097,6 +3115,55 @@ static long vm_concat(long a, long b)
 }
 static vmclass_t     vm_class[VM_MAX_CLASSES]; static int vm_n_class = 0;
 static int  vm_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
+/* --- 資源の名前つき錠 ------------------------------------------------------
+   名前は文字列リテラルなので数は少ない。線形探索で足りる。
+   同じアクタが二度取っても止まらないよう、持ち主を覚えて再入を許す
+   （正典の検査器が二重取得を静的に弾くので、ここは保険）。 */
+#define VM_RES_MAX 16
+static struct { char name[24]; semaphore sem; tid_typ owner; int depth; } vm_res[VM_RES_MAX];
+static int vm_res_n = 0;
+
+static int vm_res_find(const char *nm)
+{
+    int i;
+    for (i = 0; i < vm_res_n; i++)
+        if (strncmp(vm_res[i].name, nm, sizeof vm_res[0].name - 1) == 0) return i;
+    if (vm_res_n >= VM_RES_MAX) return -1;
+    i = vm_res_n++;
+    { int k = 0; while (nm[k] && k < (int)sizeof vm_res[0].name - 1) { vm_res[i].name[k] = nm[k]; k++; }
+      vm_res[i].name[k] = 0; }
+    vm_res[i].sem = semcreate(1);
+    vm_res[i].owner = BADTID;
+    vm_res[i].depth = 0;
+    return i;
+}
+
+static void vm_res_acquire(long nv)
+{
+    char nm[24];
+    int i;
+    vm_fmt_val(nm, sizeof nm, nv);
+    i = vm_res_find(nm);
+    if (i < 0) return;                      /* 表が溢れた: 錠なしで通す */
+    if (vm_res[i].owner == gettid()) { vm_res[i].depth++; return; }
+    if (vm_res[i].sem != SYSERR) wait(vm_res[i].sem);
+    vm_res[i].owner = gettid();
+    vm_res[i].depth = 1;
+}
+
+static void vm_res_release(long nv)
+{
+    char nm[24];
+    int i;
+    vm_fmt_val(nm, sizeof nm, nv);
+    i = vm_res_find(nm);
+    if (i < 0) return;
+    if (vm_res[i].owner != gettid()) return;   /* 取っていない資源の release */
+    if (--vm_res[i].depth > 0) return;
+    vm_res[i].owner = BADTID;
+    if (vm_res[i].sem != SYSERR) signal(vm_res[i].sem);
+}
+
 static long vm_i32(const unsigned char *p) {
   return (long)(int)((unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24)); }
 
@@ -3201,6 +3268,12 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
                  llm_run(aip, 24, aio, (int)sizeof aio - 1, 0);
                  VPUSH(vm_intern(aio));
                } break;
+    /* ACQUIRE name / RELEASE name — 資源の名前つき錠。
+       対と取得順序の検査は正典の型検査器が担う。ここが持つのは実行時の
+       排他だけ。Pi3 ではアクタが本物の Xinu プロセスなので、名前ごとに
+       セマフォを張らないと acquire の意味が無い。 */
+    case 0x53: { long nv = VPOP(); vm_res_acquire(nv); } break;              /* ACQUIRE */
+    case 0x54: { long nv = VPOP(); vm_res_release(nv); } break;              /* RELEASE */
     case 0x50: { long p = VPOP(); vm_web_port = (int)p; } break;               /* WEBLISTEN */
     case 0x51: { long aid = VPOP(); long pv = VPOP();                          /* WEBEXPOSE */
                  if (vm_web_n < VM_WEB_MAX) {

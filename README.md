@@ -254,6 +254,44 @@ Notes:
   exactly; g9's ordering can differ because actors here are real processes.
   See chapter 39 of the AIPL user's guide (`~/aios/abclcp/docs/`).
 
+
+### How much of AIPL runs here
+
+The canonical language is split into 25 features. **20 of 25 run** on this
+board. The front end is on the Mac (`compile.ml`), so a change there needs no
+reflash; only the last four rows below needed one.
+
+| Feature | Runs | Notes |
+|---|---|---|
+| `class` / `method` / `var` / fields | yes | |
+| `new` / `init` / `send` / `send!` | yes | `new` always calls `init` |
+| `now` / `future` / `await` / deadlines | yes | by **continuation splitting** |
+| `select` / `case` / `timeout` | yes | `case` names must be real methods |
+| Booleans and comparisons | yes | printed as `true` / `false` |
+| Strings and `++` | yes | |
+| `wait(ms)` | yes | |
+| `web_listen` / `web_expose` | yes | |
+| `ai_call` | yes | on-board model; nothing leaves the box |
+| Deadline without `else` (`result<t>`) | yes | failure is a reserved value; no new instruction |
+| `is_ok` / `value` | yes | lowered to a comparison and a branch |
+| `replyto` / `answer` / parameter type `reply` | yes | a reply destination *is* an actor id (`__snd`) |
+| `acquire` / `release` | yes | VM instructions `0x53`/`0x54`; a named semaphore per resource |
+| Type / effect / level annotations | accepted, discarded | checked on the canonical side (`tc`) |
+| `float` and float literals | **no** | VM values are 32-bit tagged integers |
+| Arrays (`array_*`) | **no** | likewise — needs a new value representation |
+| Math builtins (`sqrt` etc.) | **no** | likewise |
+| `call` / calling one's own method | **no** | the VM has no call instruction |
+| `remote("host","actor")` | **no** | unsupported |
+
+`acquire` here is a **real named semaphore**, not just bookkeeping: actors on
+this board are real Xinu processes, so two of them can genuinely contend. Same
+owner re-entry is allowed (the canonical checker rejects a double acquire
+statically anyway), and a `release` of a resource one does not hold is ignored.
+
+Tag discipline, for anyone touching `vm_fmt_val`: the string / bool / err tags
+live in bits 30, 29 and 28, and **every tag test first checks that the value is
+non-negative**. Without that guard `-1` matches every tag at once.
+
 ## A few useful HTTP routes
 
     GET  /api/mmu                          MMU SCTLR / TTBR0
