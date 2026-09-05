@@ -60,6 +60,34 @@ static int parse_hostport(const char *h, struct netaddr *ip, ushort *port)
     return (SYSERR == dot2ipv4(host, ip)) ? -1 : 0;
 }
 
+/* ---- 応答の控え（at-most-once） ------------------------------------------
+   要求は再送する（UDP なので落ちる）。素朴に作ると相手のメソッドが二度走る。
+   (送り主 IP, reqid) で最後の答えを覚え、同じものが来たら実行せずに返す。 */
+#define ANS_MAX 4
+static struct { uchar ip[4]; int id; char val[192]; uchar used; } g_ans[ANS_MAX];
+static int g_ans_next;
+
+static const char *ans_lookup(const uchar *ip, int id)
+{
+    int i;
+    for (i = 0; i < ANS_MAX; i++)
+        if (g_ans[i].used && g_ans[i].id == id
+         && g_ans[i].ip[0]==ip[0] && g_ans[i].ip[1]==ip[1]
+         && g_ans[i].ip[2]==ip[2] && g_ans[i].ip[3]==ip[3])
+            return g_ans[i].val;
+    return 0;
+}
+static void ans_store(const uchar *ip, int id, const char *val)
+{
+    int i = g_ans_next, k;
+    g_ans_next = (g_ans_next + 1) % ANS_MAX;
+    for (k = 0; k < 4; k++) g_ans[i].ip[k] = ip[k];
+    g_ans[i].id = id;
+    for (k = 0; val[k] && k < (int)sizeof g_ans[0].val - 1; k++) g_ans[i].val[k] = val[k];
+    g_ans[i].val[k] = 0;
+    g_ans[i].used = 1;
+}
+
 /* ---- 計器 ----------------------------------------------------------------
    番人が黙っているとき、どこまで進んだのかを外から読む。
    「板が生きている」ことと「電文が通っている」ことは別なので、
@@ -102,8 +130,12 @@ static int remote_xfer(const char *hostport, const char *actor, const char *meth
 
     if (timeout_ms <= 0) { rc = 0; goto out_close; }   /* 返事を待たない送信 */
 
+    /* ★ UDP の要求応答なので再送する。落ちた一発をそのまま待てば期限切れに
+       なる。相手は (送り主, reqid) の控えを持つので二度は走らない。 */
     control(dev, UDP_CTRL_SETFLAG, UDP_FLAG_NOBLOCK, 0);
+    { int since_tx = 0;
     while (waited < timeout_ms) {
+        if (since_tx >= 200) { write(dev, q, n); since_tx = 0; }
         n = read(dev, rbuf, sizeof rbuf - 1);
         if (n > 0) {
             rbuf[n] = 0;
@@ -119,8 +151,8 @@ static int remote_xfer(const char *hostport, const char *actor, const char *meth
             }
             continue;                    /* 自分宛でない返事。読み飛ばす */
         }
-        sleep(5); waited += 5;
-    }
+        sleep(5); waited += 5; since_tx += 5;
+    } }
     rc = -2;                             /* 期限切れ */
 out_close:
     close(dev);
@@ -199,6 +231,21 @@ thread aipl_remote_daemon(void)
             meth[k] = 0;
             if (p[q] == ' ') q++;
 
+            /* 同じ要求の再送なら、走らせずに前の答えを返す */
+            { const char *prev = ans_lookup((const uchar *)src.addr, id);
+              if (prev) {
+                  int at = 0;
+                  at = put(reply, at, sizeof reply, "R ");
+                  { char nb[16]; sprintf(nb, "%d", id); at = put(reply, at, sizeof reply, nb); }
+                  at = put(reply, at, sizeof reply, " ");
+                  at = put(reply, at, sizeof reply, prev);
+                  at = put(reply, at, sizeof reply, "\n");
+                  control(dev, UDP_CTRL_BIND, srcpt, (long)&src);
+                  write(dev, reply, at);
+                  control(dev, UDP_CTRL_BIND, 0, (long)NULL);
+                  continue;
+              } }
+
             /* 公開名は "/echo" のように '/' 始まりで登録されている。
                電文では '/' を書かせないので、両方の書き方を試す。 */
             { char withslash[42]; withslash[0] = '/';
@@ -207,6 +254,8 @@ thread aipl_remote_daemon(void)
               if (!vm_remote_call(actor, meth, p + q, val, sizeof val)
                && !vm_remote_call(withslash, meth, p + q, val, sizeof val))
                   put(val, 0, sizeof val, "err"); }
+
+            ans_store((const uchar *)src.addr, id, val);
 
             { int at = 0;
               at = put(reply, at, sizeof reply, "R ");
