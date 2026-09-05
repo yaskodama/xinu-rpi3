@@ -216,9 +216,51 @@ Backup kernels (in case a deploy bricks):
     /Users/kodamay/tftpboot/kernel.img.pre-kexec-bak  # MMU on, no /kexec
     /Users/kodamay/tftpboot/kernel.img                # current build
 
+## Running AIPL on this board
+
+AIPL programs run here as `.avm` bytecode interpreted by an in-kernel VM.
+Unlike the Pi 4 and Pi 5 (which carry the front end on the board and accept
+raw AIPL over `POST /cc`), the Pi 3 is fed a **pre-compiled module** from the
+Mac. **No kernel reflash is needed** — the module loads into the running kernel.
+
+    # 1. AIPL -> .avm  (Mac side; ~/projects/aice-avm)
+    ./_build/default/compile_avm.exe prog.aipl prog.avm
+
+    # 2. check the values on the host VM first (it has /api/console)
+    ./_build/default/server.exe 8099 --no-open
+    curl --data-binary @prog.avm "http://127.0.0.1:8099/actor/loadvm?ask=0"
+
+    # 3. send it to the board (port 8080; ?ask=0 is REQUIRED)
+    curl --data-binary @prog.avm "http://192.168.3.50:8080/actor/loadvm?ask=0"
+    loadvm: body=168 accepted=1 spawned actor id=1
+
+    # 4. read what it printed
+    curl "http://192.168.3.50:8080/api/console"
+    {"total":3,"lines":["a2: hello, AIPL","a2: tick 1","a2: tick 2"]}
+
+Notes:
+
+- **`?ask=0` is required.** Without it `loadvm` never answers and the board
+  looks dead.
+- **One module at a time.** Loading a new one folds away the previous
+  program's actors and clears its exposed routes.
+- **Leave ~8 s between requests.** Back-to-back HTTP can wedge the server
+  (the kernel itself stays alive).
+- `web_expose` publishes an actor: `GET /api/x/<path>?method=&args=`.
+- `ai_call(prompt)` runs a small model baked into the kernel (Karpathy
+  `stories260K`), 2–6 s per call, producing the same text as the Pi 4, Pi 5
+  and the Mac reference implementation. Nothing leaves the board.
+- Nine of the ten canonical guide samples match the canonical implementation
+  exactly; g9's ordering can differ because actors here are real processes.
+  See chapter 39 of the AIPL user's guide (`~/aios/abclcp/docs/`).
+
 ## A few useful HTTP routes
 
     GET  /api/mmu                          MMU SCTLR / TTBR0
+    GET  /api/console[?clear=1]            program output (print) as JSON
+    GET  /api/routes                       paths published with web_expose
+    GET  /api/x/<path>?method=&args=       call an exposed actor
+    POST /actor/loadvm?ask=0               body = .avm module; load + run
     GET  /api/actors                       AIPL actor inventory
     GET  /api/threads                      kernel thread table
     GET  /api/memstat                      free memory
