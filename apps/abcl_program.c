@@ -3080,6 +3080,41 @@ int vm_web_call(const char *path, const char *meth, const char *arg, char *out, 
     return 1;
 }
 
+/* remote(...) から呼ばれる版。vm_web_call との違いは引数の扱いだけで、
+ * 数字だけの文字列は整数値として渡す（正典の `now remote(...).step(3)` は
+ * 整数を取る。文字列のまま渡すと相手側の x * 2 が意味をなさない）。 */
+int vm_remote_call(const char *path, const char *meth, const char *arg,
+                   char *out, int cap)
+{
+    extern syscall sleep(unsigned);
+    int i, k = -1, n;
+    for (i = 0; i < vm_web_n; i++) {
+        const char *a = vm_web_path[i], *b = path; int same = 1;
+        while (*a || *b) { if (*a != *b) { same = 0; break; } a++; b++; }
+        if (same) { k = i; break; }
+    }
+    if (k < 0) return 0;
+    vm_web_have = 0; vm_web_reply[0] = 0;
+    { value_t va[1]; int na = 0;
+      if (arg && arg[0]) {
+          int neg = (arg[0] == '-'), j = neg ? 1 : 0, digits = 0;
+          long v = 0;
+          for (; arg[j]; j++) {
+              if (arg[j] < '0' || arg[j] > '9') { digits = -1; break; }
+              v = v * 10 + (arg[j] - '0'); digits++;
+          }
+          va[0].tag = V_INT; va[0].f = 0; va[0].s = 0; va[0].obj_id = 0;
+          va[0].i = (digits > 0) ? (neg ? -v : v) : vm_intern(arg);
+          na = 1;
+      }
+      abcl_enqueue(VM_WEB_SINK, vm_web_actor[k], meth, na, va); }
+    for (n = 0; n < 600 && !vm_web_have; n++) sleep(50);   /* 最大 30 秒 */
+    { int p = 0; const char *s = vm_web_reply;
+      while (s[p] && p < cap - 1) { out[p] = s[p]; p++; }
+      out[p] = 0; }
+    return 1;
+}
+
 /* 公開済みの経路の一覧 */
 int vm_web_list(char *out, int cap)
 {
@@ -3162,6 +3197,27 @@ static void vm_res_release(long nv)
     if (--vm_res[i].depth > 0) return;
     vm_res[i].owner = BADTID;
     if (vm_res[i].sem != SYSERR) signal(vm_res[i].sem);
+}
+
+/* 相手が描いた文字列を値に読み直す。型は運んでいない ―― 正典の型検査器が
+   両側の型を合わせている前提で成り立つ約束である。 */
+extern int  aipl_remote_send(const char *, const char *, const char *, const char *);
+extern int  aipl_remote_call(const char *, const char *, const char *, const char *,
+                             int, char *, int);
+static long vm_remote_value(const char *t)
+{
+    int i = 0, neg = 0, digits = 0; long v = 0;
+    if (!t || !t[0]) return vm_intern("");
+    if (t[0]=='t'&&t[1]=='r'&&t[2]=='u'&&t[3]=='e'&&t[4]==0)  return vm_bool(1);
+    if (t[0]=='f'&&t[1]=='a'&&t[2]=='l'&&t[3]=='s'&&t[4]=='e'&&t[5]==0) return vm_bool(0);
+    if (t[0]=='e'&&t[1]=='r'&&t[2]=='r'&&t[3]==0) return (long)VM_ERR_TAG;
+    if (t[0] == '-') { neg = 1; i = 1; }
+    for (; t[i]; i++) {
+        if (t[i] < '0' || t[i] > '9') { digits = -1; break; }
+        v = v * 10 + (t[i] - '0'); digits++;
+    }
+    if (digits > 0) return neg ? -v : v;
+    return vm_intern(t);
 }
 
 static long vm_i32(const unsigned char *p) {
@@ -3272,6 +3328,32 @@ void abcl_vm_dispatch(int self, int sender, const char *method, value_t *args, i
        対と取得順序の検査は正典の型検査器が担う。ここが持つのは実行時の
        排他だけ。Pi3 ではアクタが本物の Xinu プロセスなので、名前ごとに
        セマフォを張らないと acquire の意味が無い。 */
+    /* REMOTE_SEND host actor meth arg / REMOTE_CALL host actor meth arg ms
+       ―― 他ノードのアクターへ。運びかたは apps/aipl_remote.c（UDP/9010）。
+       押す順は前段（compile.ml）と揃えること。 */
+    case 0x55: {                                                            /* REMOTE_SEND */
+        char h[48], a[40], m[40], g[96];
+        long ag = VPOP(), me = VPOP(), ac = VPOP(), ho = VPOP();
+        vm_fmt_val(h, sizeof h, ho); vm_fmt_val(a, sizeof a, ac);
+        vm_fmt_val(m, sizeof m, me); vm_fmt_val(g, sizeof g, ag);
+        aipl_remote_send(h, a, m, g);
+    } break;
+    case 0x56: {                                                            /* REMOTE_CALL */
+        /* 既定値も命令が受け取る。else を書かなければ前段が err を積むので、
+           そのまま result<tau> になる ―― 期限切れの扱いが一箇所に閉じる。
+           押した順は host, actor, meth, arg, ms, else なので逆に取る。 */
+        char h[48], a[40], m[40], g[96], r[192];
+        long dflt = VPOP(), ms = VPOP(), ag = VPOP(), me = VPOP(), ac = VPOP(), ho = VPOP();
+        vm_fmt_val(h, sizeof h, ho); vm_fmt_val(a, sizeof a, ac);
+        vm_fmt_val(m, sizeof m, me); vm_fmt_val(g, sizeof g, ag);
+        if (aipl_remote_call(h, a, m, g, (int)ms, r, sizeof r) != 0) VPUSH(dflt);
+        else {
+            /* 相手が "err" を返した場合も失敗として扱う（宛先が無い・メソッドが
+               無い）。期限切れと同じ扱いにしないと else が効かない穴が残る。 */
+            long v = vm_remote_value(r);
+            VPUSH(v == (long)VM_ERR_TAG ? dflt : v);
+        }
+    } break;
     case 0x53: { long nv = VPOP(); vm_res_acquire(nv); } break;              /* ACQUIRE */
     case 0x54: { long nv = VPOP(); vm_res_release(nv); } break;              /* RELEASE */
     case 0x50: { long p = VPOP(); vm_web_port = (int)p; } break;               /* WEBLISTEN */

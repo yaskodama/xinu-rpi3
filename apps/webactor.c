@@ -3798,6 +3798,16 @@ thread webactor_autostart(void)
         abcl_rpc_tcp_start(5555);   /* Mac <-> Xinu RPC over ethernet */
     }
 
+    /* AIPL の remote("host:port","actor") の受け口（UDP/9010）。
+       Pi 4・Pi 5 と同じ電文を話す。 */
+    {
+        extern thread aipl_remote_daemon(void);
+        tid_typ rt = create((void *)aipl_remote_daemon, 8192, INITPRIO,
+                            "aiplremote", 0);
+        if (SYSERR == (int)rt) kprintf("[remote] create failed\r\n");
+        else ready(rt, RESCHED_NO);
+    }
+
     /* Also start the simple HTTP server on 8080 so /reboot, /sd-test, and
      * other Mac-side recovery tools are available without needing the AIPL
      * RPC protocol.  Without this, port 8080 stays closed and the only
