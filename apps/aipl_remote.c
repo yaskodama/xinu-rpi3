@@ -167,6 +167,26 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
                      const char *arg, int timeout_ms, char *out, int cap)
 { return remote_xfer(hostport, actor, meth, arg, timeout_ms > 0 ? timeout_ms : 2000, out, cap); }
 
+/* 応答を返す。
+   ★ 番人の装置は UDP_FLAG_PASSIVE で開いている。その装置の udpWrite は
+     「擬似ヘッダ＋UDP ヘッダ＋本文」を要求し、本文だけ渡すと長さ検査で
+     SYSERR になる（実機で reply=0 のまま応答が出ていなかったのはこれ）。
+     返信は素の装置を1本開いて出す。局所ポートは任意でよい ―― 相手は
+     reqid で突き合わせるので、返りの送信元ポートは見ていない。 */
+static int reply_to(const struct netaddr *dst, ushort dstpt, const char *msg, int len)
+{
+    int dev, rc = -1;
+    dev = udpAlloc();
+    if (SYSERR == dev) return -1;
+    if (SYSERR == open(dev, &netiftab[0].ip, (struct netaddr *)dst, 0, dstpt)) {
+        udptab[dev - UDP0].state = UDP_FREE;
+        return -1;
+    }
+    if (SYSERR != write(dev, (void *)msg, len)) rc = 0;
+    close(dev);
+    return rc;
+}
+
 /* ---- 受け口の番人 --------------------------------------------------------
  * UDP/9010 に常駐して、来た要求をこの板の公開アクターへ渡す。
  * PASSIVE で開くと、読んだ塊の先頭に送り主の擬似ヘッダが付いてくるので、
@@ -240,9 +260,7 @@ thread aipl_remote_daemon(void)
                   at = put(reply, at, sizeof reply, " ");
                   at = put(reply, at, sizeof reply, prev);
                   at = put(reply, at, sizeof reply, "\n");
-                  control(dev, UDP_CTRL_BIND, srcpt, (long)&src);
-                  write(dev, reply, at);
-                  control(dev, UDP_CTRL_BIND, 0, (long)NULL);
+                  reply_to(&src, srcpt, reply, at);
                   continue;
               } }
 
@@ -263,9 +281,7 @@ thread aipl_remote_daemon(void)
               at = put(reply, at, sizeof reply, " ");
               at = put(reply, at, sizeof reply, val);
               at = put(reply, at, sizeof reply, "\n");
-              control(dev, UDP_CTRL_BIND, srcpt, (long)&src);
-              if (SYSERR != write(dev, reply, at)) g_n_reply++;
-              control(dev, UDP_CTRL_BIND, 0, (long)NULL); } }
+              if (0 == reply_to(&src, srcpt, reply, at)) g_n_reply++; } }
         }
     }
     return OK;
