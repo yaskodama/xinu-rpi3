@@ -257,7 +257,7 @@ Notes:
 
 ### How much of AIPL runs here
 
-The canonical language is split into 25 features. **20 of 25 run** on this
+The canonical language is split into 25 features. **21 of 25 run** on this
 board. The front end is on the Mac (`compile.ml`), so a change there needs no
 reflash; only the last four rows below needed one.
 
@@ -281,7 +281,27 @@ reflash; only the last four rows below needed one.
 | Arrays (`array_*`) | **no** | likewise — needs a new value representation |
 | Math builtins (`sqrt` etc.) | **no** | likewise |
 | `call` / calling one's own method | **no** | the VM has no call instruction |
-| `remote("host","actor")` | **no** | unsupported |
+| `remote("host:port","actor")` | yes | over UDP/9010, using the Xinu UDP device layer |
+
+`remote(...)` is carried over UDP/9010 with the same one-line ASCII datagram
+the Pi 4, the Pi 5 and the Mac host VM speak, so a program here can call an
+actor another node published with `web_expose`:
+
+```
+var d = now remote("192.168.3.101", "echo").say(21) timeout 2000 else -1;
+send remote("192.168.3.50", "echo").say(5);
+```
+
+Unlike the Pi 4 and the Pi 5 — whose TCP is listen-only, so they build their
+frames by hand — this board has the real Xinu network stack, so it just uses
+`udpAlloc` / `open` / `read` / `write`. The receiving end is a daemon process
+on UDP 9010, opened `PASSIVE` so the sender's pseudo-header comes with each
+read and the reply needs no ARP and no peer table. The sending end takes a
+different local port: two devices on the same local port make the demux
+ambiguous, and the peer answers to the request's source port anyway.
+VM instructions `0x55` (REMOTE_SEND) and `0x56` (REMOTE_CALL); `0x56` also
+takes the default value, so a deadline without `else` yields `err` and the
+timeout case stays in one place.
 
 `acquire` here is a **real named semaphore**, not just bookkeeping: actors on
 this board are real Xinu processes, so two of them can genuinely contend. Same

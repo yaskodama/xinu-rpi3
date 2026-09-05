@@ -152,9 +152,13 @@ thread aipl_remote_daemon(void)
         { struct udpPseudoHdr *ph = (struct udpPseudoHdr *)buf;
           struct udpPkt *pkt = (struct udpPkt *)(buf + sizeof(struct udpPseudoHdr));
           struct netaddr src;
-          ushort srcpt = net2hs(pkt->srcPort);
+          /* ★ udpRecv が srcPort / dstPort / len を「受け取った時点で」ホスト順へ
+                直してから積んでいる（network/udp/udpRecv.c）。ここで net2hs を
+                かけると二度入れ替わって長さが化け、番人は黙って読み捨てる ――
+                実機で Pi 3 だけが応答しなかったのはこれ。 */
+          ushort srcpt = pkt->srcPort;
           char *p = (char *)pkt->data;
-          int plen = net2hs(pkt->len) - UDP_HDR_LEN;
+          int plen = (int)pkt->len - UDP_HDR_LEN;
           if (plen < 2) continue;
           p[(plen < (int)(sizeof buf - sizeof(struct udpPseudoHdr) - UDP_HDR_LEN - 1))
             ? plen : 0] = 0;

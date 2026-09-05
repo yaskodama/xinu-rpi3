@@ -809,6 +809,21 @@ thread webactor_server(int slot)
             /* /api/console[?clear=1] — プログラムの出力を読む。
              * Pi 5 は POST /cc の応答に出力が返るので、そこを揃えるための口。
              * ホスト VM (aice-avm) と同じ {"total":N,"lines":[...]} を返す。 */
+            /* いま走っているカーネルの版を名乗る。
+               ★ 焼いたあと「HTTP が応答した」を「再起動した」と取り違えて、
+                  古いカーネルに向かって実験を続けたことがある。板が生きて
+                  いることと、焼いたものが走っていることは別である。 */
+            if (0 == strncmp(reqbuf, "GET /version", 12))
+            {
+                extern const char *kernel_build_id(void);
+                static char vb[256];
+                int blen = sprintf(vb + 140, "build %s\r\n", kernel_build_id());
+                int hlen = sprintf(vb, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                                       "Content-Length: %d\r\n\r\n", blen);
+                memcpy(vb + hlen, vb + 140, blen);
+                write(tcpdev, vb, hlen + blen);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             if (0 == strncmp(reqbuf, "GET /api/console", 16) ||
                 0 == strncmp(reqbuf, "POST /api/console", 17))
             {

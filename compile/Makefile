@@ -313,6 +313,12 @@ $(KERNARC): $(COMP_OBJ) $(CONF_OBJ) ../system/unistd.o
 
 objects: $(COMP_OBJ)
 
+# 版を名乗るファイルだけは毎回コンパイルし直す。そうしないと
+# __DATE__ / __TIME__ が古いままになり、GET /version が嘘をつく。
+.PHONY: FORCE
+FORCE:
+../apps/kversion.o: FORCE
+
 %.o: %.c
 	@echo -e "\tCompiling" $@
 	$(CC) $(DEPFLAGS) $(CFLAGS) -g -o $@ $<
