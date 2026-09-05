@@ -60,6 +60,18 @@ static int parse_hostport(const char *h, struct netaddr *ip, ushort *port)
     return (SYSERR == dot2ipv4(host, ip)) ? -1 : 0;
 }
 
+/* ---- 計器 ----------------------------------------------------------------
+   番人が黙っているとき、どこまで進んだのかを外から読む。
+   「板が生きている」ことと「電文が通っている」ことは別なので、
+   推測でコードを直す前にここを見る。GET /version が出す。 */
+static long g_state = 0;   /* 0=未起動 1=udpAlloc失敗 2=open失敗 3=待ち受け中 */
+static unsigned long g_n_read, g_n_short, g_n_notq, g_n_q, g_n_reply, g_n_tx_q;
+static long g_last_n = -1, g_last_plen = -1, g_last_c0 = -1;
+void aipl_remote_stats(long *o)
+{ o[0]=g_state; o[1]=(long)g_n_read; o[2]=(long)g_n_short; o[3]=(long)g_n_notq;
+  o[4]=(long)g_n_q; o[5]=(long)g_n_reply; o[6]=(long)g_n_tx_q;
+  o[7]=g_last_n; o[8]=g_last_plen; o[9]=g_last_c0; }
+
 /* ---- 送り側 -------------------------------------------------------------- */
 static int g_next_id = 1;
 
@@ -86,6 +98,7 @@ static int remote_xfer(const char *hostport, const char *actor, const char *meth
     if (g_next_id > 1000000) g_next_id = 1;
     n = build_q(q, sizeof q, id, actor, meth, arg);
     if (SYSERR == write(dev, q, n)) goto out_close;
+    g_n_tx_q++;
 
     if (timeout_ms <= 0) { rc = 0; goto out_close; }   /* 返事を待たない送信 */
 
@@ -136,17 +149,20 @@ thread aipl_remote_daemon(void)
         sleep(500);
     }
     dev = udpAlloc();
-    if (SYSERR == dev) { kprintf("[remote] udpAlloc failed\r\n"); return SYSERR; }
+    if (SYSERR == dev) { g_state = 1; kprintf("[remote] udpAlloc failed\r\n"); return SYSERR; }
     if (SYSERR == open(dev, &netiftab[0].ip, NULL, AIPL_PORT, 0)) {
+        g_state = 2;
         kprintf("[remote] open(:%d) failed\r\n", AIPL_PORT);
         udptab[dev - UDP0].state = UDP_FREE; return SYSERR;
     }
     control(dev, UDP_CTRL_SETFLAG, UDP_FLAG_PASSIVE, 0);
+    g_state = 3;
     kprintf("[remote] AIPL remote listening on UDP %d\r\n", AIPL_PORT);
 
     for (;;) {
         n = read(dev, buf, sizeof buf - 1);
-        if (n <= (int)sizeof(struct udpPseudoHdr)) continue;
+        g_n_read++; g_last_n = n;
+        if (n <= (int)sizeof(struct udpPseudoHdr)) { g_n_short++; continue; }
         buf[n] = 0;
 
         { struct udpPseudoHdr *ph = (struct udpPseudoHdr *)buf;
@@ -159,7 +175,8 @@ thread aipl_remote_daemon(void)
           ushort srcpt = pkt->srcPort;
           char *p = (char *)pkt->data;
           int plen = (int)pkt->len - UDP_HDR_LEN;
-          if (plen < 2) continue;
+          g_last_plen = plen;
+          if (plen < 2) { g_n_short++; continue; }
           p[(plen < (int)(sizeof buf - sizeof(struct udpPseudoHdr) - UDP_HDR_LEN - 1))
             ? plen : 0] = 0;
           { int k = 0; while (p[k]) { if (p[k]=='\n'||p[k]=='\r') { p[k]=0; break; } k++; } }
@@ -167,7 +184,9 @@ thread aipl_remote_daemon(void)
           src.type = NETADDR_IPv4; src.len = IPv4_ADDR_LEN;
           memcpy(src.addr, ph->srcIp, IPv4_ADDR_LEN);
 
-          if (!(p[0] == 'Q' && p[1] == ' ')) continue;
+          g_last_c0 = (long)(unsigned char)p[0];
+          if (!(p[0] == 'Q' && p[1] == ' ')) { g_n_notq++; continue; }
+          g_n_q++;
 
           { int q = 2, id = 0, k;
             char actor[40], meth[40], val[192], reply[224];
@@ -196,7 +215,7 @@ thread aipl_remote_daemon(void)
               at = put(reply, at, sizeof reply, val);
               at = put(reply, at, sizeof reply, "\n");
               control(dev, UDP_CTRL_BIND, srcpt, (long)&src);
-              write(dev, reply, at);
+              if (SYSERR != write(dev, reply, at)) g_n_reply++;
               control(dev, UDP_CTRL_BIND, 0, (long)NULL); } }
         }
     }

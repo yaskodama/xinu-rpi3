@@ -816,8 +816,13 @@ thread webactor_server(int slot)
             if (0 == strncmp(reqbuf, "GET /version", 12))
             {
                 extern const char *kernel_build_id(void);
-                static char vb[256];
-                int blen = sprintf(vb + 140, "build %s\r\n", kernel_build_id());
+                static char vb[512];
+                extern void aipl_remote_stats(long *o);
+                long st[10];
+                aipl_remote_stats(st);
+                int blen = sprintf(vb + 140,
+                    "build %s\r\nremote state=%ld read=%ld short=%ld notq=%ld q=%ld reply=%ld tx_q=%ld last_n=%ld last_plen=%ld last_c0=%ld\r\n",
+                    kernel_build_id(), st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9]);
                 int hlen = sprintf(vb, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
                                        "Content-Length: %d\r\n\r\n", blen);
                 memcpy(vb + hlen, vb + 140, blen);
