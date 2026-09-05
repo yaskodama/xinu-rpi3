@@ -303,6 +303,19 @@ VM instructions `0x55` (REMOTE_SEND) and `0x56` (REMOTE_CALL); `0x56` also
 takes the default value, so a deadline without `else` yields `err` and the
 timeout case stays in one place.
 
+Two things cost a day here and are worth writing down. `udpRecv` converts
+`srcPort` / `dstPort` / `len` to host order **before** it buffers the packet,
+so a second `net2hs` in the daemon corrupts the length and the request is
+dropped in silence. And a device opened `PASSIVE` cannot be written with a
+bare payload: its `udpWrite` wants pseudo-header + UDP header + payload and
+rejects anything shorter than 20 bytes. The reply therefore goes out on a
+separate, ordinary device (`reply_to`); the peer matches on the request id, so
+the source port of the reply does not matter.
+
+Measured, all four implementations calling each other (`say(21)` → `42`):
+the Pi 3, the Pi 4, the Pi 5 and the Mac host VM each reach the other three,
+and an unreachable host falls to the `else` value.
+
 `acquire` here is a **real named semaphore**, not just bookkeeping: actors on
 this board are real Xinu processes, so two of them can genuinely contend. Same
 owner re-entry is allowed (the canonical checker rejects a double acquire
