@@ -253,6 +253,8 @@ thread main(void)
      * web->AIPL-actor bridge (apps/webactor.c) — no manual netup/webactor. */
     {
         extern thread webactor_autostart(void);
+        { extern thread browser_main(void);            /* 機内ブラウザ: 10 秒後に airilab.app */
+          ready(create((void *)browser_main, 65536, INITPRIO, "browser", 0), RESCHED_NO); }
         ready(create((void *)webactor_autostart, 8192, INITPRIO, "webauto", 0),
               RESCHED_NO);
     }

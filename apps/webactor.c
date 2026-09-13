@@ -829,6 +829,36 @@ thread webactor_server(int slot)
                 write(tcpdev, vb, hlen + blen);
                 close(tcpdev); web_cur_tcpdev = -1; continue;
             }
+            /* /browse[?url=U&lang=ja|en&raw=1] — 機内ブラウザ（apps/browser.c）。
+             * url は保留にして専用スレッドが取りに行く（応答は "queued"）。 */
+            if (0 == strncmp(reqbuf, "GET /browse", 11))
+            {
+                extern const char *browser_url(void), *browser_text(void), *browser_note(void), *browser_raw(void);
+                extern int  browser_text_len(void), browser_status(void), browser_raw_len(void), browser_netinfo(char *, int);
+                extern void browser_request_url(const char *); extern void browser_request_lang(int);
+                static char bb[20000];
+                { const char *q = strstr(reqbuf, "url=");
+                  if (q && q < strstr(reqbuf, "\r\n")) {
+                      char u[256]; int k = 0; q += 4;
+                      while (*q && *q != ' ' && *q != '&' && k < 255) {
+                          if (*q == '%' && q[1] && q[2]) { int h1 = q[1] <= '9' ? q[1]-'0' : (q[1]|32)-'a'+10, h2 = q[2] <= '9' ? q[2]-'0' : (q[2]|32)-'a'+10; u[k++] = (char)(h1*16+h2); q += 3; }
+                          else u[k++] = *q++; }
+                      u[k] = 0; browser_request_url(u); } }
+                { const char *q = strstr(reqbuf, "lang="); if (q && q < strstr(reqbuf, "\r\n")) browser_request_lang(q[5] == 'j' || q[5] == 'J'); }
+                int raw = (NULL != strstr(reqbuf, "raw=1"));
+                char nb[200]; browser_netinfo(nb, sizeof nb);
+                int blen = sprintf(bb + 160, "url= %s\nstatus= %d  note= %s\nbytes= %d  text= %d\nnet= %s\n----\n",
+                                   browser_url(), browser_status(), browser_note(), browser_raw_len(), browser_text_len(), nb);
+                { const char *b = raw ? browser_raw() : browser_text();
+                  int n = raw ? browser_raw_len() : browser_text_len();
+                  int cap = (int)sizeof bb - 160 - blen - 8; if (n > cap) n = cap;
+                  memcpy(bb + 160 + blen, b, n); blen += n; bb[160 + blen++] = '\n'; }
+                int hlen = sprintf(bb, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                                       "Content-Length: %d\r\n\r\n", blen);
+                memcpy(bb + hlen, bb + 160, blen);
+                write(tcpdev, bb, hlen + blen);
+                close(tcpdev); web_cur_tcpdev = -1; continue;
+            }
             if (0 == strncmp(reqbuf, "GET /api/console", 16) ||
                 0 == strncmp(reqbuf, "POST /api/console", 17))
             {

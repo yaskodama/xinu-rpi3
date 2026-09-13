@@ -384,6 +384,41 @@ void draw_string_at(int px, int py, const char *s,
 
 /* Like draw_glyph_at but each 8x8 font pixel becomes an sc x sc block, so text
  * can be scaled up (sc=1 == normal).  Used by the presentation window. */
+/* 任意の点字形を描く（16 ドット日本語フォント用。apps/jpfont.c）。rows は h 行、
+ * 各行 (w+7)/8 バイト、上位ビットが左。transparent=1 なら背景を塗らない。
+ * draw_glyph_at と同じく視野・切り取り矩形を守る。 */
+void draw_bitmap_glyph(int px, int py, const unsigned char *rows, int w, int h,
+                       unsigned int fg, unsigned int bg, int scale, int transparent)
+{
+    if (!fb_ready) return;
+    if (scale < 1) scale = 1;
+    int bpr = (w + 7) / 8;
+    int sx0 = px - view_x, sy0 = py - view_y;
+    if (sx0 >= (int)fb_width || sy0 >= (int)fb_height) return;
+    if (sx0 + w * scale <= 0 || sy0 + h * scale <= 0) return;
+    if (gv_predraw_rect) gv_predraw_rect(sx0, sy0, w * scale, h * scale);
+    for (int gy = 0; gy < h; gy++) {
+        const unsigned char *r = rows + gy * bpr;
+        for (int sy = 0; sy < scale; sy++) {
+            int rsy = sy0 + gy * scale + sy;
+            if (rsy < 0 || rsy >= (int)fb_height) continue;
+            if (rsy < clip_y0 || rsy >= clip_y1) continue;
+            unsigned int *line = (unsigned int *)(fb_base + rsy * fb_pitch);
+            for (int gx = 0; gx < w; gx++) {
+                int on = r[gx >> 3] & (0x80 >> (gx & 7));
+                if (!on && transparent) continue;
+                unsigned int col = on ? fg : bg;
+                for (int sxx = 0; sxx < scale; sxx++) {
+                    int rsx = sx0 + gx * scale + sxx;
+                    if (rsx < 0 || rsx >= (int)fb_width) continue;
+                    if (rsx < clip_x0 || rsx >= clip_x1) continue;
+                    line[rsx] = col;
+                }
+            }
+        }
+    }
+}
+
 void draw_glyph_scaled(int px, int py, char c, unsigned int fg, unsigned int bg, int sc)
 {
     if (!fb_ready || sc < 1) return;

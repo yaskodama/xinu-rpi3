@@ -567,6 +567,11 @@ static struct shcon shc[NSHELL];
 static void wm_raise(window_t *w);
 static int  g_need_full;
 static window_t *window_at_point(int sx, int sy);   /* topmost window @point */
+/* 他のスレッド（機内ブラウザ）から「描き直して」と頼む口。 */
+void gwm_request_repaint(void) { g_need_full = 1; }
+static window_t browser_win;                          /* 機内ブラウザ（apps/browser.c） */
+extern void browser_draw_window(window_t *w, unsigned int frame);
+extern int  browser_click(window_t *w, int lx, int ly);
 void gwm_feed_key(int c);                            /* route a key to focus  */
 /* BASIC windows live in bui[] (full defs in the BASIC section); these
  * accessors let wm_close_window() dismiss one like a shell window. */
@@ -1086,6 +1091,13 @@ static void wm_drag_tick(void)
     if (left && !prev_left) {
         if (pres_click(cursor_x, cursor_y)) { prev_left = left; return; }
         if (dev_click(cursor_x, cursor_y))  { prev_left = left; return; }
+    }
+    /* 機内ブラウザの窓: リンク／[EN]／頁送り。窓の左上からの座標で渡す。 */
+    if (left && !prev_left && window_at_point(cursor_x, cursor_y) == &browser_win) {
+        if (browser_click(&browser_win, cursor_x + vp_x - browser_win.x, cursor_y + vp_y - browser_win.y)) {
+            active_win = &browser_win; wm_raise(&browser_win);
+            prev_left = left; return;
+        }
     }
     /* Soft keyboard: a click on a key delivers the character to the active
      * (last-focused) text window WITHOUT stealing focus.  We inject it into
@@ -3973,6 +3985,19 @@ thread gwm_main(void)
     /* The wine glass is drawn statically at boot and only spins when the
      * `wine` xsh command is run — keeping the WiFi responder thread fed
      * (a continuous animation starved it).  g_wine_active stays 0 here. */
+
+    /* 機内ブラウザの窓（xinu-rpi5 から移植）。airilab.app を起動時に出す。最後に足すので最前面。 */
+    browser_win.x = 300;
+    browser_win.y = 30;
+    browser_win.width  = 700;
+    browser_win.height = 600;
+    title_set(&browser_win, "Browser (airilab.app)");
+    browser_win.chrome_color = 0xFF60FFC0U;
+    browser_win.title_bg     = 0xFF105040U;
+    browser_win.title_fg     = 0xFFFFFFFFU;
+    browser_win.content_bg   = 0xFF0A0E14U;
+    browser_win.draw_content = browser_draw_window;
+    wm_add(&browser_win);
 
     wm_run();   /* never returns */
     return OK;  /* unreachable — keeps the compiler happy */
