@@ -187,15 +187,33 @@ static int browser_fetch1(const char *url)
     for (int i = 0; e2[i]; i++)       req[n++] = e2[i];
     if (SYSERR == write(dev, req, n)) { close(dev); b_cpy(br_note, "送れません", sizeof br_note); br_status = -3; return -3; }
 
-    /* 相手が閉じるまで読む（Connection: close）。read は届くまで待つ。 */
+    /* ★ Xinu の tcpRead は「頼んだ長さが揃うまで」戻らない。相手の FIN が先に
+       届いて残りが頼んだ長さより短いと、永久に待つ（実機で 40,960 バイトで止まった）。
+       なのでヘッダは 1 バイトずつ読んで Content-Length を知り、本文は「残り」を
+       超えない長さで読む。Content-Length が無ければ 1 バイトずつ閉じるまで。 */
     br_page_len = 0;
-    for (;;) {
-        int room = BR_RXCAP - 1 - br_page_len;
-        if (room <= 0) break;
-        int got = read(dev, br_page + br_page_len, (uint)(room > 4096 ? 4096 : room));
-        if (got <= 0) break;
-        br_page_len += got;
-    }
+    { int hdr_done = 0;
+      while (br_page_len < BR_RXCAP - 1 && !hdr_done) {
+          int got = read(dev, br_page + br_page_len, 1);
+          if (got <= 0) break;
+          br_page_len += got;
+          if (br_page_len >= 4 && br_page[br_page_len-4]=='\r' && br_page[br_page_len-3]=='\n' &&
+              br_page[br_page_len-2]=='\r' && br_page[br_page_len-1]=='\n') hdr_done = 1;
+      }
+      long want = hdr_done ? br_content_length(br_page, br_page_len) : -1;
+      if (hdr_done && want >= 0) {
+          long remain = want;
+          while (remain > 0 && br_page_len < BR_RXCAP - 1) {
+              int room = BR_RXCAP - 1 - br_page_len;
+              int ask = remain > 4096 ? 4096 : (int)remain; if (ask > room) ask = room;
+              int got = read(dev, br_page + br_page_len, (uint)ask);
+              if (got <= 0) break;
+              br_page_len += got; remain -= got;
+          }
+      } else if (hdr_done) {
+          for (;;) { if (br_page_len >= BR_RXCAP - 1) break;
+                     int got = read(dev, br_page + br_page_len, 1); if (got <= 0) break; br_page_len += got; }
+      } }
     close(dev);
     br_page[br_page_len] = 0;
     if (br_page_len <= 0) { b_cpy(br_note, "本文が空です", sizeof br_note); br_status = 0; return 0; }
